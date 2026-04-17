@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -70,6 +71,22 @@ def _ensure_ssl_certs() -> None:
             return
 
 _ensure_ssl_certs()
+
+
+def _construct_ai_agent(agent_cls, **kwargs):
+    """Instantiate AIAgent compatibly across mixed gateway/run_agent versions."""
+    try:
+        sig = inspect.signature(agent_cls.__init__)
+    except Exception:
+        return agent_cls(**kwargs)
+
+    params = sig.parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return agent_cls(**kwargs)
+
+    supported = {name for name in params if name != "self"}
+    filtered = {key: value for key, value in kwargs.items() if key in supported}
+    return agent_cls(**filtered)
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -976,6 +993,31 @@ class GatewayRunner:
         route["request_overrides"] = overrides
         return route
 
+    def _apply_message_route_overrides(self, turn_route: dict, route_overrides: Optional[dict]) -> dict:
+        """Apply adapter-supplied per-message model/runtime overrides."""
+        if not isinstance(route_overrides, dict):
+            return turn_route
+
+        runtime = dict(turn_route.get("runtime") or {})
+        if route_overrides.get("model"):
+            turn_route["model"] = route_overrides["model"]
+        for key in ("provider", "api_mode", "command", "credential_pool"):
+            if route_overrides.get(key) is not None:
+                runtime[key] = route_overrides[key]
+        if route_overrides.get("args") is not None:
+            runtime["args"] = list(route_overrides.get("args") or [])
+        turn_route["runtime"] = runtime
+        return turn_route
+
+    def _refresh_runtime_adapter_context(self) -> None:
+        """Keep cross-platform delivery helpers aligned with live adapters."""
+        self.delivery_router.adapters = self.adapters
+        try:
+            from tools.send_message_tool import set_runtime_adapter_context
+            set_runtime_adapter_context(self.adapters, asyncio.get_running_loop())
+        except Exception:
+            pass
+
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
 
@@ -1001,7 +1043,7 @@ class GatewayRunner:
                 await adapter.disconnect()
             finally:
                 self.adapters.pop(adapter.platform, None)
-                self.delivery_router.adapters = self.adapters
+                self._refresh_runtime_adapter_context()
 
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
@@ -1759,6 +1801,7 @@ class GatewayRunner:
                        "WEIXIN_ALLOWED_USERS",
                        "BLUEBUBBLES_ALLOWED_USERS",
                        "QQ_ALLOWED_USERS",
+                       "AOPS_ALLOWED_USERS",
                        "GATEWAY_ALLOWED_USERS")
         )
         _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
@@ -1773,7 +1816,8 @@ class GatewayRunner:
                        "WECOM_CALLBACK_ALLOW_ALL_USERS",
                        "WEIXIN_ALLOW_ALL_USERS",
                        "BLUEBUBBLES_ALLOW_ALL_USERS",
-                       "QQ_ALLOW_ALL_USERS")
+                       "QQ_ALLOW_ALL_USERS",
+                       "AOPS_ALLOW_ALL_USERS")
         )
         if not _any_allowlist and not _allow_all:
             logger.warning(
@@ -1952,7 +1996,7 @@ class GatewayRunner:
             logger.info("Gateway will continue running for cron job execution.")
         
         # Update delivery router with adapters
-        self.delivery_router.adapters = self.adapters
+        self._refresh_runtime_adapter_context()
         
         self._running = True
         self._update_runtime_status("running")
@@ -2199,7 +2243,7 @@ class GatewayRunner:
                     if success:
                         self.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
-                        self.delivery_router.adapters = self.adapters
+                        self._refresh_runtime_adapter_context()
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
                             platform.value,
@@ -2334,6 +2378,11 @@ class GatewayRunner:
             self._background_tasks.clear()
 
             self.adapters.clear()
+            try:
+                from tools.send_message_tool import clear_runtime_adapter_context
+                clear_runtime_adapter_context()
+            except Exception:
+                pass
             self._running_agents.clear()
             self._pending_messages.clear()
             self._pending_approvals.clear()
@@ -2441,6 +2490,13 @@ class GatewayRunner:
                 logger.warning("WhatsApp: Node.js not installed or bridge not configured")
                 return None
             return WhatsAppAdapter(config)
+
+        elif platform == Platform.AOPS:
+            from gateway.platforms.aops import AopsAdapter, check_aops_requirements
+            if not check_aops_requirements():
+                logger.warning("AOPS: aiohttp not installed")
+                return None
+            return AopsAdapter(config)
         
         elif platform == Platform.SLACK:
             from gateway.platforms.slack import SlackAdapter, check_slack_requirements
@@ -2584,6 +2640,58 @@ class GatewayRunner:
         if not user_id:
             return False
 
+        if source.platform == Platform.AOPS:
+            adapter = self.adapters.get(Platform.AOPS)
+            aops_cfg = self.config.platforms.get(Platform.AOPS)
+            extra = getattr(aops_cfg, "extra", {}) if aops_cfg else {}
+            dm_policy = str(
+                getattr(adapter, "dm_policy", None)
+                or extra.get("dm_policy")
+                or os.getenv("AOPS_DM_POLICY", "open")
+            ).strip().lower() or "open"
+            allow_from = getattr(adapter, "allow_from", None)
+            if allow_from is None:
+                raw_allow_from = extra.get("allow_from") or os.getenv("AOPS_ALLOW_FROM")
+                if isinstance(raw_allow_from, str):
+                    allow_from = [item.strip() for item in raw_allow_from.split(",") if item.strip()]
+                elif isinstance(raw_allow_from, (list, tuple, set)):
+                    allow_from = [str(item).strip() for item in raw_allow_from if str(item).strip()]
+                else:
+                    allow_from = []
+
+            if source.chat_type != "dm":
+                return True
+            if dm_policy == "disabled":
+                return False
+            if dm_policy == "open":
+                return True
+            if self.pairing_store.is_approved("aops", user_id):
+                return True
+
+            compat_allow_all = any(
+                os.getenv(key, "").lower() in ("true", "1", "yes")
+                for key in ("AOPS_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS")
+            )
+            compat_allowed = set(allow_from or [])
+            compat_allowed.update(
+                uid.strip()
+                for uid in os.getenv("AOPS_ALLOWED_USERS", "").split(",")
+                if uid.strip()
+            )
+            compat_allowed.update(
+                uid.strip()
+                for uid in os.getenv("GATEWAY_ALLOWED_USERS", "").split(",")
+                if uid.strip()
+            )
+            if compat_allow_all or "*" in compat_allowed:
+                return True
+            if user_id in compat_allowed:
+                return True
+            if dm_policy == "allowlist":
+                return False
+            if dm_policy == "pairing":
+                return False
+
         platform_env_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
             Platform.DISCORD: "DISCORD_ALLOWED_USERS",
@@ -2601,6 +2709,7 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
+            Platform.AOPS: "AOPS_ALLOWED_USERS",
         }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
@@ -2619,6 +2728,7 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
+            Platform.AOPS: "AOPS_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
@@ -3871,6 +3981,7 @@ class GatewayRunner:
                 session_key=session_key,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                route_overrides=event.route_overrides,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -5687,7 +5798,8 @@ class GatewayRunner:
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
             def run_sync():
-                agent = AIAgent(
+                agent = _construct_ai_agent(
+                    AIAgent,
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
@@ -5868,7 +5980,8 @@ class GatewayRunner:
             )
 
             def run_sync():
-                agent = AIAgent(
+                agent = _construct_ai_agent(
+                    AIAgent,
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=8,
@@ -8066,6 +8179,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        route_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -8138,9 +8252,20 @@ class GatewayRunner:
                 default=True,
             )
         )
+
+        try:
+            from gateway.platforms.aops import AopsAdapter, AopsLiveReplyBridge
+        except Exception:
+            AopsAdapter = None  # type: ignore[assignment]
+            AopsLiveReplyBridge = None  # type: ignore[assignment]
+
+        _platform_adapter = self.adapters.get(source.platform)
+        _is_aops_adapter = bool(AopsAdapter and isinstance(_platform_adapter, AopsAdapter))
+        if _is_aops_adapter:
+            tool_progress_enabled = tool_progress_enabled and bool(getattr(_platform_adapter, "push_tool_calls", True))
         
         # Queue for progress messages (thread-safe)
-        progress_queue = queue.Queue() if tool_progress_enabled else None
+        progress_queue = queue.Queue() if tool_progress_enabled and not _is_aops_adapter else None
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -8384,6 +8509,9 @@ class GatewayRunner:
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        if _is_aops_adapter and event_message_id:
+            _status_thread_metadata = dict(_status_thread_metadata or {})
+            _status_thread_metadata["reply_to"] = event_message_id
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter:
@@ -8483,47 +8611,58 @@ class GatewayRunner:
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
-            if _want_stream_deltas or _want_interim_consumer:
+            if _is_aops_adapter or _want_stream_deltas or _want_interim_consumer:
                 try:
-                    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
-                        # Platforms that don't support editing sent messages
-                        # (e.g. QQ, WeChat) should skip streaming entirely —
-                        # without edit support, the consumer sends a partial
-                        # first message that can never be updated, resulting in
-                        # duplicate messages (partial + final).
-                        _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                        if not _adapter_supports_edit:
-                            raise RuntimeError("skip streaming for non-editable platform")
-                        _effective_cursor = _scfg.cursor
-                        # Some Matrix clients render the streaming cursor
-                        # as a visible tofu/white-box artifact.  Keep
-                        # streaming text on Matrix, but suppress the cursor.
-                        if source.platform == Platform.MATRIX:
-                            _effective_cursor = ""
-                        _consumer_cfg = StreamConsumerConfig(
-                            edit_interval=_scfg.edit_interval,
-                            buffer_threshold=_scfg.buffer_threshold,
-                            cursor=_effective_cursor,
-                        )
-                        _stream_consumer = GatewayStreamConsumer(
-                            adapter=_adapter,
-                            chat_id=source.chat_id,
-                            config=_consumer_cfg,
-                            metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
-                        )
-                        if _want_stream_deltas:
-                            _stream_delta_cb = _stream_consumer.on_delta
-                        stream_consumer_holder[0] = _stream_consumer
+                        if _is_aops_adapter and AopsLiveReplyBridge is not None:
+                            _stream_consumer = AopsLiveReplyBridge(
+                                _adapter,
+                                chat_id=source.chat_id,
+                                reply_to_id=event_message_id,
+                                run_id=session_id,
+                            )
+                            if _want_stream_deltas:
+                                _stream_delta_cb = _stream_consumer.on_delta
+                            stream_consumer_holder[0] = _stream_consumer
+                        else:
+                            from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                            # Platforms that don't support editing sent messages
+                            # (e.g. QQ, WeChat) should skip streaming entirely —
+                            # without edit support, the consumer sends a partial
+                            # first message that can never be updated, resulting in
+                            # duplicate messages (partial + final).
+                            _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
+                            if not _adapter_supports_edit:
+                                raise RuntimeError("skip streaming for non-editable platform")
+                            _effective_cursor = _scfg.cursor
+                            # Some Matrix clients render the streaming cursor
+                            # as a visible tofu/white-box artifact.  Keep
+                            # streaming text on Matrix, but suppress the cursor.
+                            if source.platform == Platform.MATRIX:
+                                _effective_cursor = ""
+                            _consumer_cfg = StreamConsumerConfig(
+                                edit_interval=_scfg.edit_interval,
+                                buffer_threshold=_scfg.buffer_threshold,
+                                cursor=_effective_cursor,
+                            )
+                            _stream_consumer = GatewayStreamConsumer(
+                                adapter=_adapter,
+                                chat_id=source.chat_id,
+                                config=_consumer_cfg,
+                                metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
+                            )
+                            if _want_stream_deltas:
+                                _stream_delta_cb = _stream_consumer.on_delta
+                            stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if _stream_consumer is not None:
-                    if already_streamed:
+                    if already_streamed and hasattr(_stream_consumer, "on_segment_break"):
                         _stream_consumer.on_segment_break()
-                    else:
+                    if hasattr(_stream_consumer, "on_commentary"):
                         _stream_consumer.on_commentary(text)
                     return
                 if already_streamed or not _status_adapter or not str(text or "").strip():
@@ -8541,6 +8680,7 @@ class GatewayRunner:
                     logger.debug("interim_assistant_callback error: %s", _e)
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._apply_message_route_overrides(turn_route, route_overrides)
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -8569,7 +8709,8 @@ class GatewayRunner:
 
             if agent is None:
                 # Config changed or first message — create fresh agent
-                agent = AIAgent(
+                agent = _construct_ai_agent(
+                    AIAgent,
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
@@ -8601,11 +8742,14 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            if _is_aops_adapter and _stream_consumer is not None and tool_progress_enabled:
+                agent.tool_progress_callback = _stream_consumer.on_tool_progress
+            else:
+                agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
-            agent.status_callback = _status_callback_sync
+            agent.status_callback = None if _is_aops_adapter else _status_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides")
@@ -8831,12 +8975,23 @@ class GatewayRunner:
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
 
+            # Return final response, or a message if something went wrong
+            final_response = result.get("final_response")
+
+            _stream_error_text = None
+            if _stream_consumer is not None and _is_aops_adapter:
+                if result.get("failed"):
+                    _stream_error_text = result.get("error") or final_response or "Agent run failed"
+                    _stream_consumer.send_error(_stream_error_text, conversation_ended=True)
+                else:
+                    _stream_final_text = final_response
+                    if not _stream_final_text:
+                        _stream_final_text = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
+                    _stream_consumer.send_final(_stream_final_text, conversation_ended=True)
+
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
                 _stream_consumer.finish()
-            
-            # Return final response, or a message if something went wrong
-            final_response = result.get("final_response")
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
@@ -8958,7 +9113,7 @@ class GatewayRunner:
         
         # Start progress message sender if enabled
         progress_task = None
-        if tool_progress_enabled:
+        if tool_progress_enabled and not _is_aops_adapter:
             progress_task = asyncio.create_task(send_progress_messages())
 
         # Start stream consumer task — polls for consumer creation since it
@@ -9417,7 +9572,8 @@ class GatewayRunner:
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
-                    channel_prompt=pending_event.channel_prompt,
+                    channel_prompt=pending_event.channel_prompt if pending_event else None,
+                    route_overrides=pending_event.route_overrides if pending_event else None,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
@@ -9468,6 +9624,10 @@ class GatewayRunner:
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
+        if _is_aops_adapter and _sc and isinstance(response, dict):
+            if getattr(_sc, "final_response_sent", False):
+                response["already_sent"] = True
+                return response
         if _sc and isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"

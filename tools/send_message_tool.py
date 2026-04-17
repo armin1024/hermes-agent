@@ -5,16 +5,22 @@ Sends a message to a user or channel on any connected messaging platform
 human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
 import ssl
 import time
+from threading import Lock
 
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+_runtime_context_lock = Lock()
+_runtime_adapters = {}
+_runtime_loop = None
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
@@ -46,6 +52,27 @@ def _sanitize_error_text(text) -> str:
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
+
+
+def set_runtime_adapter_context(adapters, loop) -> None:
+    """Expose live gateway adapters to send_message_tool."""
+    global _runtime_adapters, _runtime_loop
+    with _runtime_context_lock:
+        _runtime_adapters = dict(adapters or {})
+        _runtime_loop = loop
+
+
+def clear_runtime_adapter_context() -> None:
+    """Clear live gateway adapter context on gateway shutdown."""
+    global _runtime_adapters, _runtime_loop
+    with _runtime_context_lock:
+        _runtime_adapters = {}
+        _runtime_loop = None
+
+
+def _get_runtime_adapter_context():
+    with _runtime_context_lock:
+        return dict(_runtime_adapters), _runtime_loop
 
 
 SEND_MESSAGE_SCHEMA = {
@@ -163,6 +190,7 @@ def _handle_send(args):
         "weixin": Platform.WEIXIN,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "aops": Platform.AOPS,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -246,6 +274,8 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
+    if platform_name == "aops" and target_ref and not any(ch.isspace() for ch in target_ref):
+        return target_ref, None, True
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
     # Matrix room IDs (start with !) and user IDs (start with @) are explicit
@@ -345,6 +375,33 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         _feishu_available = False
 
     media_files = media_files or []
+
+    if platform == Platform.AOPS:
+        runtime_adapters, runtime_loop = _get_runtime_adapter_context()
+        runtime_adapter = runtime_adapters.get(Platform.AOPS)
+        if runtime_adapter is None or runtime_loop is None or not getattr(runtime_loop, "is_running", lambda: False)():
+            return {
+                "error": (
+                    "AOPS send_message requires an active Hermes gateway WebSocket connection. "
+                    "Start `hermes gateway` with AOPS enabled and try again."
+                )
+            }
+        if media_files:
+            return {"error": "AOPS send_message does not support native media delivery"}
+        metadata = {"thread_id": thread_id} if thread_id else None
+        future = asyncio.run_coroutine_threadsafe(
+            runtime_adapter.send(chat_id, message, metadata=metadata),
+            runtime_loop,
+        )
+        result = future.result(timeout=30)
+        if not getattr(result, "success", False):
+            return {"error": getattr(result, "error", "AOPS send failed")}
+        return {
+            "success": True,
+            "platform": "aops",
+            "chat_id": chat_id,
+            "message_id": getattr(result, "message_id", None),
+        }
 
     if platform == Platform.SLACK and message:
         try:

@@ -24,6 +24,16 @@ class TestHomeChannelRoundtrip:
         assert restored.chat_id == "999"
         assert restored.name == "general"
 
+    def test_from_dict_uses_default_platform_when_missing(self):
+        restored = HomeChannel.from_dict(
+            {"chat_id": "999", "name": "general"},
+            default_platform=Platform.AOPS,
+        )
+
+        assert restored.platform == Platform.AOPS
+        assert restored.chat_id == "999"
+        assert restored.name == "general"
+
 
 class TestPlatformConfigRoundtrip:
     def test_to_dict_from_dict(self):
@@ -51,6 +61,23 @@ class TestPlatformConfigRoundtrip:
         restored = PlatformConfig.from_dict(d)
         assert restored.enabled is False
         assert restored.token is None
+
+    def test_from_dict_backfills_home_channel_platform(self):
+        restored = PlatformConfig.from_dict(
+            {
+                "enabled": True,
+                "token": "tok_123",
+                "home_channel": {
+                    "chat_id": "user-001",
+                    "name": "Home",
+                },
+            },
+            platform=Platform.AOPS,
+        )
+
+        assert restored.home_channel is not None
+        assert restored.home_channel.platform == Platform.AOPS
+        assert restored.home_channel.chat_id == "user-001"
 
 
 class TestGetConnectedPlatforms:

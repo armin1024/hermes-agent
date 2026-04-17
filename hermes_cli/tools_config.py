@@ -448,6 +448,8 @@ def _get_enabled_platforms() -> List[str]:
         enabled.append("whatsapp")
     if get_env_value("QQ_APP_ID"):
         enabled.append("qqbot")
+    if get_env_value("AOPS_BOT_TOKEN") and get_env_value("AOPS_BASE_URL"):
+        enabled.append("aops")
     return enabled
 
 

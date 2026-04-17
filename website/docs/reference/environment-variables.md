@@ -291,6 +291,16 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `MATRIX_AUTO_THREAD` | Auto-create threads for room messages (default: `true`) |
 | `MATRIX_DM_MENTION_THREADS` | Create a thread when bot is `@mentioned` in a DM (default: `false`) |
 | `MATRIX_RECOVERY_KEY` | Recovery key for cross-signing verification after device key rotation. Recommended for E2EE setups with cross-signing enabled. |
+| `AOPS_BOT_TOKEN` | Bot token for the AOPS gateway |
+| `AOPS_BASE_URL` | Base URL of the AOPS server (for example `https://aops.example.com`) |
+| `AOPS_HOME_CHANNEL` | Default AOPS chat ID for proactive delivery |
+| `AOPS_PUSH_TOOL_CALLS` | Emit AOPS native tool-progress events (`true`/`false`, default: `true`) |
+| `AOPS_DM_POLICY` | AOPS DM auth mode: `open`, `allowlist`, `pairing`, or `disabled` |
+| `AOPS_ALLOW_FROM` | Comma-separated AOPS user IDs allowed when `AOPS_DM_POLICY=allowlist` |
+| `AOPS_TRUSTED_AGENT_KEY_FROM` | Comma-separated AOPS user IDs allowed to activate inbound `agentKey` route overrides (`*` allowed) |
+| `AOPS_ALLOWED_USERS` | Compatibility allowlist for AOPS user IDs |
+| `AOPS_ALLOW_ALL_USERS` | Compatibility allow-all flag for AOPS (`true`/`false`) |
+| `AOPS_PROXY` | Optional proxy URL used for AOPS REST + WebSocket connections |
 | `HASS_TOKEN` | Home Assistant Long-Lived Access Token (enables HA platform + tools) |
 | `HASS_URL` | Home Assistant URL (default: `http://homeassistant.local:8123`) |
 | `WEBHOOK_ENABLED` | Enable the webhook platform adapter (`true`/`false`) |
