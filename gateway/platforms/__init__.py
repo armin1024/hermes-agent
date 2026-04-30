@@ -12,6 +12,11 @@ from .base import BasePlatformAdapter, MessageEvent, SendResult
 from .qqbot import QQAdapter
 from .yuanbao import YuanbaoAdapter
 
+try:
+    from .aops import AopsAdapter
+except ImportError:
+    AopsAdapter = None
+
 __all__ = [
     "BasePlatformAdapter",
     "MessageEvent",
@@ -19,3 +24,5 @@ __all__ = [
     "QQAdapter",
     "YuanbaoAdapter",
 ]
+if AopsAdapter is not None:
+    __all__.append("AopsAdapter")

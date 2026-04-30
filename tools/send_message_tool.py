@@ -347,6 +347,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     # Matrix room IDs (start with !) and user IDs (start with @) are explicit
     if platform_name == "matrix" and (target_ref.startswith("!") or target_ref.startswith("@")):
         return target_ref, None, True
+    # AOPS channel/user identifiers are opaque strings; treat a single
+    # whitespace-free token as an explicit target.
+    if platform_name == "aops" and target_ref and target_ref.strip() == target_ref and not any(ch.isspace() for ch in target_ref):
+        return target_ref, None, True
     return None, None, False
 
 
@@ -429,7 +433,12 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk):
                 from gateway.platforms.base import SendResult
                 result = await adapter.send(chat_id=chat_id, content=chunk)
                 if result.success:
-                    return {"success": True, "message_id": result.message_id}
+                    return {
+                        "success": True,
+                        "platform": platform.value,
+                        "chat_id": chat_id,
+                        "message_id": result.message_id,
+                    }
                 return {"error": f"Adapter send failed: {result.error}"}
     except Exception as e:
         return {"error": f"Plugin platform send failed: {e}"}

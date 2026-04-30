@@ -1372,6 +1372,22 @@ class GatewayRunner:
         route["request_overrides"] = overrides or {}
         return route
 
+    def _apply_message_route_overrides(self, turn_route: dict, route_overrides: Optional[dict]) -> dict:
+        """Apply adapter-supplied per-message model/runtime overrides."""
+        if not isinstance(route_overrides, dict):
+            return turn_route
+
+        runtime = dict(turn_route.get("runtime") or {})
+        if route_overrides.get("model"):
+            turn_route["model"] = route_overrides["model"]
+        for key in ("provider", "api_mode", "command", "credential_pool"):
+            if route_overrides.get(key) is not None:
+                runtime[key] = route_overrides[key]
+        if route_overrides.get("args") is not None:
+            runtime["args"] = list(route_overrides.get("args") or [])
+        turn_route["runtime"] = runtime
+        return turn_route
+
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
 
@@ -2405,6 +2421,7 @@ class GatewayRunner:
             "BLUEBUBBLES_ALLOWED_USERS",
             "QQ_ALLOWED_USERS",
             "YUANBAO_ALLOWED_USERS",
+            "AOPS_ALLOWED_USERS",
             "GATEWAY_ALLOWED_USERS",
         )
         _builtin_allow_all_vars = (
@@ -2420,6 +2437,7 @@ class GatewayRunner:
             "BLUEBUBBLES_ALLOW_ALL_USERS",
             "QQ_ALLOW_ALL_USERS",
             "YUANBAO_ALLOW_ALL_USERS",
+            "AOPS_ALLOW_ALL_USERS",
         )
         # Also pick up plugin-registered platforms — each entry can declare
         # its own allowed_users_env / allow_all_env, so the warning stays
@@ -3349,6 +3367,13 @@ class GatewayRunner:
                 logger.warning("WhatsApp: Node.js not installed or bridge not configured")
                 return None
             return WhatsAppAdapter(config)
+
+        elif platform == Platform.AOPS:
+            from gateway.platforms.aops import AopsAdapter, check_aops_requirements
+            if not check_aops_requirements():
+                logger.warning("AOPS: aiohttp not installed")
+                return None
+            return AopsAdapter(config)
         
         elif platform == Platform.SLACK:
             from gateway.platforms.slack import SlackAdapter, check_slack_requirements
@@ -3498,6 +3523,55 @@ class GatewayRunner:
         if not user_id:
             return False
 
+        if source.platform == Platform.AOPS:
+            adapter = self.adapters.get(Platform.AOPS)
+            aops_cfg = self.config.platforms.get(Platform.AOPS)
+            extra = getattr(aops_cfg, "extra", {}) if aops_cfg else {}
+            dm_policy = str(
+                getattr(adapter, "dm_policy", None)
+                or extra.get("dm_policy")
+                or os.getenv("AOPS_DM_POLICY", "open")
+            ).strip().lower() or "open"
+            allow_from = getattr(adapter, "allow_from", None)
+            if allow_from is None:
+                raw_allow_from = extra.get("allow_from") or os.getenv("AOPS_ALLOW_FROM")
+                if isinstance(raw_allow_from, str):
+                    allow_from = [item.strip() for item in raw_allow_from.split(",") if item.strip()]
+                elif isinstance(raw_allow_from, (list, tuple, set)):
+                    allow_from = [str(item).strip() for item in raw_allow_from if str(item).strip()]
+                else:
+                    allow_from = []
+
+            if user_id in set(allow_from or []):
+                return True
+            if dm_policy == "disabled":
+                return False
+            if dm_policy == "open":
+                return True
+            if self.pairing_store.is_approved("aops", user_id):
+                return True
+
+            compat_allow_all = any(
+                os.getenv(key, "").lower() in ("true", "1", "yes")
+                for key in ("AOPS_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS")
+            )
+            compat_allowed = set(allow_from or [])
+            compat_allowed.update(
+                uid.strip()
+                for uid in os.getenv("AOPS_ALLOWED_USERS", "").split(",")
+                if uid.strip()
+            )
+            compat_allowed.update(
+                uid.strip()
+                for uid in os.getenv("GATEWAY_ALLOWED_USERS", "").split(",")
+                if uid.strip()
+            )
+            if dm_policy == "allowlist":
+                return compat_allow_all or user_id in compat_allowed
+            if dm_policy == "pairing":
+                return compat_allow_all or user_id in compat_allowed
+            return False
+
         platform_env_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
             Platform.DISCORD: "DISCORD_ALLOWED_USERS",
@@ -3516,6 +3590,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            Platform.AOPS: "AOPS_ALLOWED_USERS",
         }
         platform_group_user_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -3542,6 +3617,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+            Platform.AOPS: "AOPS_ALLOW_ALL_USERS",
         }
 
         # Plugin platforms: check the registry for auth env var names
@@ -3727,6 +3803,7 @@ class GatewayRunner:
                 Platform.WEIXIN:   "WEIXIN_ALLOWED_USERS",
                 Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
                 Platform.QQBOT:    "QQ_ALLOWED_USERS",
+                Platform.AOPS:     "AOPS_ALLOWED_USERS",
             }
             platform_group_env_map = {
                 Platform.TELEGRAM: (
@@ -5390,6 +5467,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                route_overrides=event.route_overrides,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -10599,6 +10677,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        route_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -10683,6 +10762,16 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        try:
+            from gateway.platforms.aops import AopsAdapter, AopsLiveReplyBridge
+        except Exception:
+            AopsAdapter = None  # type: ignore[assignment]
+            AopsLiveReplyBridge = None  # type: ignore[assignment]
+
+        _platform_adapter = self.adapters.get(source.platform)
+        _is_aops_adapter = bool(AopsAdapter and isinstance(_platform_adapter, AopsAdapter))
+        if _is_aops_adapter:
+            tool_progress_enabled = tool_progress_enabled and bool(getattr(_platform_adapter, "push_tool_calls", True))
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
@@ -10695,7 +10784,7 @@ class GatewayRunner:
         )
         
         # Queue for progress messages (thread-safe)
-        progress_queue = queue.Queue() if tool_progress_enabled else None
+        progress_queue = queue.Queue() if tool_progress_enabled and not _is_aops_adapter else None
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -11046,6 +11135,9 @@ class GatewayRunner:
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        if _is_aops_adapter and event_message_id:
+            _status_thread_metadata = dict(_status_thread_metadata or {})
+            _status_thread_metadata["reply_to"] = event_message_id
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -11148,58 +11240,70 @@ class GatewayRunner:
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
-            if _want_stream_deltas or _want_interim_consumer:
+            if _is_aops_adapter or _want_stream_deltas or _want_interim_consumer:
                 try:
-                    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
-                        # Platforms that don't support editing sent messages
-                        # (e.g. QQ, WeChat) should skip streaming entirely —
-                        # without edit support, the consumer sends a partial
-                        # first message that can never be updated, resulting in
-                        # duplicate messages (partial + final).
-                        _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                        if not _adapter_supports_edit:
-                            raise RuntimeError("skip streaming for non-editable platform")
-                        _effective_cursor = _scfg.cursor
-                        # Some Matrix clients render the streaming cursor
-                        # as a visible tofu/white-box artifact.  Keep
-                        # streaming text on Matrix, but suppress the cursor.
-                        _buffer_only = False
-                        if source.platform == Platform.MATRIX:
-                            _effective_cursor = ""
-                            _buffer_only = True
-                        # Fresh-final applies to Telegram only — other
-                        # platforms either edit in place cheaply or don't
-                        # have the edit-timestamp-stays-stale problem.
-                        # (Ported from openclaw/openclaw#72038.)
-                        _fresh_final_secs = (
-                            float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
-                            if source.platform == Platform.TELEGRAM
-                            else 0.0
-                        )
-                        _consumer_cfg = StreamConsumerConfig(
-                            edit_interval=_scfg.edit_interval,
-                            buffer_threshold=_scfg.buffer_threshold,
-                            cursor=_effective_cursor,
-                            buffer_only=_buffer_only,
-                            fresh_final_after_seconds=_fresh_final_secs,
-                        )
-                        _stream_consumer = GatewayStreamConsumer(
-                            adapter=_adapter,
-                            chat_id=source.chat_id,
-                            config=_consumer_cfg,
-                            metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
-                            on_new_message=(
-                                (lambda: progress_queue.put(("__reset__",)))
-                                if progress_queue is not None
-                                else None
-                            ),
-                        )
-                        if _want_stream_deltas:
+                        if _is_aops_adapter and AopsLiveReplyBridge is not None:
+                            _stream_consumer = AopsLiveReplyBridge(
+                                _adapter,
+                                chat_id=source.chat_id,
+                                reply_to_id=event_message_id,
+                                run_id=session_id,
+                            )
+
                             def _stream_delta_cb(text: str) -> None:
                                 if _run_still_current():
                                     _stream_consumer.on_delta(text)
+                        else:
+                            from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                            # Platforms that don't support editing sent messages
+                            # (e.g. QQ, WeChat) should skip streaming entirely —
+                            # without edit support, the consumer sends a partial
+                            # first message that can never be updated, resulting in
+                            # duplicate messages (partial + final).
+                            _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
+                            if not _adapter_supports_edit:
+                                raise RuntimeError("skip streaming for non-editable platform")
+                            _effective_cursor = _scfg.cursor
+                            # Some Matrix clients render the streaming cursor
+                            # as a visible tofu/white-box artifact.  Keep
+                            # streaming text on Matrix, but suppress the cursor.
+                            _buffer_only = False
+                            if source.platform == Platform.MATRIX:
+                                _effective_cursor = ""
+                                _buffer_only = True
+                            # Fresh-final applies to Telegram only — other
+                            # platforms either edit in place cheaply or don't
+                            # have the edit-timestamp-stays-stale problem.
+                            # (Ported from openclaw/openclaw#72038.)
+                            _fresh_final_secs = (
+                                float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
+                                if source.platform == Platform.TELEGRAM
+                                else 0.0
+                            )
+                            _consumer_cfg = StreamConsumerConfig(
+                                edit_interval=_scfg.edit_interval,
+                                buffer_threshold=_scfg.buffer_threshold,
+                                cursor=_effective_cursor,
+                                buffer_only=_buffer_only,
+                                fresh_final_after_seconds=_fresh_final_secs,
+                            )
+                            _stream_consumer = GatewayStreamConsumer(
+                                adapter=_adapter,
+                                chat_id=source.chat_id,
+                                config=_consumer_cfg,
+                                metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
+                                on_new_message=(
+                                    (lambda: progress_queue.put(("__reset__",)))
+                                    if progress_queue is not None
+                                    else None
+                                ),
+                            )
+                            if _want_stream_deltas:
+                                def _stream_delta_cb(text: str) -> None:
+                                    if _run_still_current():
+                                        _stream_consumer.on_delta(text)
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
@@ -11228,6 +11332,7 @@ class GatewayRunner:
                     logger.debug("interim_assistant_callback error: %s", _e)
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._apply_message_route_overrides(turn_route, route_overrides)
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -11297,11 +11402,14 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            if _is_aops_adapter and _stream_consumer is not None and tool_progress_enabled:
+                agent.tool_progress_callback = _stream_consumer.on_tool_progress
+            else:
+                agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
-            agent.status_callback = _status_callback_sync
+            agent.status_callback = None if _is_aops_adapter else _status_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
@@ -11640,7 +11748,7 @@ class GatewayRunner:
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
-            if _stream_consumer is not None:
+            if _stream_consumer is not None and not _is_aops_adapter:
                 _stream_consumer.finish()
             
             # Return final response, or a message if something went wrong
@@ -11661,6 +11769,10 @@ class GatewayRunner:
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                if _stream_consumer is not None and _is_aops_adapter:
+                    if result.get("failed"):
+                        _stream_consumer.send_error(error_msg or "Agent run failed", conversation_ended=True)
+                    _stream_consumer.finish()
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -11710,6 +11822,17 @@ class GatewayRunner:
                     if has_voice_directive:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
+
+            if _stream_consumer is not None and _is_aops_adapter:
+                if result.get("failed"):
+                    _stream_consumer.send_error(result.get("error") or final_response or "Agent run failed", conversation_ended=True)
+                else:
+                    _stream_consumer.send_final(
+                        final_response or "",
+                        conversation_ended=True,
+                        content=result.get("content") or [],
+                    )
+                _stream_consumer.finish()
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).
@@ -11785,7 +11908,7 @@ class GatewayRunner:
         
         # Start progress message sender if enabled
         progress_task = None
-        if tool_progress_enabled:
+        if tool_progress_enabled and not _is_aops_adapter:
             progress_task = asyncio.create_task(send_progress_messages())
 
         # Start stream consumer task — polls for consumer creation since it
@@ -12316,6 +12439,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    route_overrides=getattr(pending_event, "route_overrides", None) if pending_event else None,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task

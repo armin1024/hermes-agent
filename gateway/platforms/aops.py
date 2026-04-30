@@ -7,11 +7,12 @@ import json
 import logging
 import os
 import queue
+import threading
 import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -32,10 +33,13 @@ from gateway.platforms.base import (
     proxy_kwargs_for_aiohttp,
     resolve_proxy_url,
 )
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
 _RECONNECT_BACKOFF = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
+_AOPS_WIRE_LOG_RETENTION_DAYS = 7
+_AOPS_WIRE_LOG_LOCK = threading.Lock()
 _DONE = object()
 _SEGMENT_BREAK = object()
 _COMMENTARY = object()
@@ -109,6 +113,82 @@ def _build_ws_url(base_url: str) -> str:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _format_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _format_local(dt: datetime) -> str:
+    local_dt = dt.astimezone()
+    tz_label = os.getenv("HERMES_TIMEZONE", "").strip() or local_dt.tzname() or local_dt.strftime("%z")
+    return f"{local_dt.strftime('%Y-%m-%d %H:%M:%S')} {tz_label}".strip()
+
+
+def _extract_aops_wire_fields(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    data_record = data if isinstance(data, dict) else {}
+    return {
+        "event": payload.get("event"),
+        "messageId": data_record.get("messageId") or data_record.get("id"),
+        "seq": data_record.get("seq"),
+        "phase": data_record.get("phase"),
+        "kind": data_record.get("kind"),
+        "channelId": data_record.get("channelId") or data_record.get("conversationId"),
+        "replyToId": data_record.get("replyToId"),
+        "runId": data_record.get("runId"),
+        "userId": data_record.get("userId") or data_record.get("ownerUserId"),
+        "agentKey": data_record.get("agentKey") or data_record.get("agentId"),
+    }
+
+
+def _cleanup_aops_wire_logs(log_dir: Path, *, now: datetime) -> None:
+    cutoff = now.astimezone(timezone.utc).date() - timedelta(days=_AOPS_WIRE_LOG_RETENTION_DAYS - 1)
+    for path in log_dir.glob("aops-wire-*.log"):
+        raw_date = path.stem.removeprefix("aops-wire-")
+        try:
+            log_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if log_date < cutoff:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _write_aops_wire_log(
+    *,
+    level: str,
+    direction: str,
+    action: str,
+    payload: Any = None,
+    error: str | None = None,
+) -> None:
+    now = datetime.now(timezone.utc)
+    log_dir = get_hermes_home() / "logs" / "aops"
+    record = {
+        "ts": _format_utc(now),
+        "localTime": _format_local(now),
+        "level": level,
+        "direction": direction,
+        "action": action,
+        **_extract_aops_wire_fields(payload),
+        "payload": payload,
+    }
+    if error:
+        record["error"] = error
+    try:
+        with _AOPS_WIRE_LOG_LOCK:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            _cleanup_aops_wire_logs(log_dir, now=now)
+            log_path = log_dir / f"aops-wire-{now.date().isoformat()}.log"
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:
+        logger.debug("AOPS wire log write failed: %s", exc)
 
 
 @dataclass
@@ -265,6 +345,14 @@ class AopsLiveReplyBridge:
 
     async def _emit_tool(self, payload: dict[str, Any]) -> None:
         event_type = str(payload.get("event_type") or "").strip()
+        if event_type in ("reasoning.available", "_thinking"):
+            self.adapter._log_wire(
+                "info",
+                direction="drop",
+                action="tool_progress.dropped",
+                payload=payload,
+            )
+            return
         tool_name = str(payload.get("tool_name") or "").strip() or None
         preview = str(payload.get("preview") or "").strip() or None
         is_error = bool(payload.get("is_error"))
@@ -273,20 +361,10 @@ class AopsLiveReplyBridge:
             phase = "result"
         elif event_type == "tool.started":
             phase = "start"
-        elif event_type == "reasoning.available":
-            phase = "result"
-        elif event_type == "_thinking":
-            phase = "result"
         tool_text = preview
         if not tool_text:
             if phase == "start" and tool_name:
                 tool_text = f"calling tool: {tool_name}"
-            elif event_type == "reasoning.available":
-                tool_text = "reasoning available"
-            elif event_type == "_thinking":
-                tool_text = tool_name or "thinking"
-        if not tool_name and event_type in ("reasoning.available", "_thinking"):
-            tool_name = "_thinking"
         if not tool_name and not tool_text:
             return
         await self._ensure_started()
@@ -424,6 +502,23 @@ class AopsAdapter(BasePlatformAdapter):
     def _request_kwargs(self) -> tuple[dict[str, Any], dict[str, Any]]:
         return proxy_kwargs_for_aiohttp(self._proxy_url)
 
+    def _log_wire(
+        self,
+        level: str,
+        *,
+        direction: str,
+        action: str,
+        payload: Any = None,
+        error: str | None = None,
+    ) -> None:
+        _write_aops_wire_log(
+            level=level,
+            direction=direction,
+            action=action,
+            payload=payload,
+            error=error,
+        )
+
     async def connect(self) -> bool:
         if not AIOHTTP_AVAILABLE:
             self._set_fatal_error("aops_missing_dependency", "AOPS startup failed: aiohttp not installed", retryable=True)
@@ -486,9 +581,21 @@ class AopsAdapter(BasePlatformAdapter):
         )
         self._ws = ws
         await self._ws.send_json({"action": "auth", "token": self.config.token})
+        self._log_wire(
+            "info",
+            direction="out",
+            action="ws.auth_sent",
+            payload={"event": "auth", "authSent": True},
+        )
         self._connected_event.set()
         await self._report_agents(request_kwargs=request_kwargs)
         logger.info("[%s] Connected to %s as %s", self.name, self._base_url, self._bot_id or "unknown")
+        self._log_wire(
+            "info",
+            direction="state",
+            action="ws.connected",
+            payload={"event": "connected", "baseUrl": self._base_url, "botId": self._bot_id or "unknown"},
+        )
 
     async def _fetch_bot_me(self, *, request_kwargs: dict[str, Any]) -> dict[str, Any]:
         if not self._session:
@@ -560,6 +667,12 @@ class AopsAdapter(BasePlatformAdapter):
                     return
                 self._connected_event.clear()
                 logger.warning("[%s] AOPS socket error: %s", self.name, exc)
+                self._log_wire(
+                    "warning",
+                    direction="state",
+                    action="ws.socket_error",
+                    error=str(exc),
+                )
                 delay = _RECONNECT_BACKOFF[min(attempt, len(_RECONNECT_BACKOFF) - 1)]
                 attempt += 1
                 await asyncio.sleep(delay)
@@ -568,6 +681,12 @@ class AopsAdapter(BasePlatformAdapter):
                     attempt = 0
                 except Exception as reconnect_exc:
                     logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)
+                    self._log_wire(
+                        "warning",
+                        direction="state",
+                        action="ws.reconnect_failed",
+                        error=str(reconnect_exc),
+                    )
 
     async def _read_events(self) -> None:
         if not self._ws:
@@ -577,9 +696,39 @@ class AopsAdapter(BasePlatformAdapter):
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
                 if payload:
+                    self._log_wire("info", direction="in", action="ws.receive", payload=payload)
+                    if await self._handle_ws_control_event(payload):
+                        continue
                     await self._dispatch_payload(payload)
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                self._log_wire(
+                    "warning",
+                    direction="in",
+                    action="ws.closed",
+                    payload={
+                        "event": "closed",
+                        "type": str(msg.type),
+                        "data": getattr(msg, "data", None),
+                    },
+                )
                 raise RuntimeError("AOPS websocket closed")
+
+    async def _handle_ws_control_event(self, payload: dict[str, Any]) -> bool:
+        event = str(payload.get("event") or "").strip().lower()
+        if event != "ping":
+            return False
+        pong = {
+            "event": "pong",
+            "data": {
+                "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            },
+        }
+        async with self._send_lock:
+            if not self._ws or self._ws.closed:
+                raise RuntimeError("AOPS websocket not connected")
+            await self._ws.send_json(pong)
+        self._log_wire("info", direction="out", action="ws.send", payload=pong)
+        return True
 
     def _parse_json(self, raw: str) -> Optional[dict[str, Any]]:
         try:
@@ -735,6 +884,7 @@ class AopsAdapter(BasePlatformAdapter):
 
     async def send_reply_event(self, data: dict[str, Any]) -> SendResult:
         payload = {"event": "message_reply", "data": data}
+        self._log_wire("info", direction="out", action="ws.send", payload=payload)
         return await self._send_payload(payload, channel_id=str(data.get("channelId") or ""))
 
     async def send(

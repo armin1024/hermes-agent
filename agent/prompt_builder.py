@@ -406,6 +406,13 @@ PLATFORM_HINTS = {
         "in your response. Images (.jpg, .png, .webp) are uploaded and displayed "
         "inline, audio files as voice messages, and other files as attachments."
     ),
+    "aops": (
+        "You are connected through AOPS, an operations platform chat channel. "
+        "AOPS supports streamed text replies, tool status updates, and structured "
+        "approval payloads, but you should not assume rich markdown rendering or "
+        "native media attachment support. Keep formatting simple and text-first. "
+        "Tool activity and approvals may be surfaced separately by the channel."
+    ),
     "weixin": (
         "You are on Weixin/WeChat. Markdown formatting is supported, so you may use it when "
         "it improves readability, but keep the message compact and chat-friendly. You can send media files natively: "

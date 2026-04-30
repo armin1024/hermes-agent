@@ -2747,6 +2747,26 @@ _PLATFORMS = [
         ],
     },
     {
+        "key": "aops",
+        "label": "AOPS",
+        "emoji": "🛠",
+        "token_var": "AOPS_BOT_TOKEN",
+        "setup_instructions": [
+            "1. Obtain an AOPS bot token from your AOPS administrator",
+            "2. Confirm the AOPS base URL, for example https://aops.example.com",
+            "3. Hermes connects outbound to AOPS over WebSocket plus REST metadata APIs",
+            "4. Use config.yaml for advanced AOPS settings such as dm_policy, allow_from, trusted_agent_key_from, and agent_routes",
+        ],
+        "vars": [
+            {"name": "AOPS_BOT_TOKEN", "prompt": "Bot token", "password": True,
+             "help": "The bearer token Hermes uses to authenticate to AOPS."},
+            {"name": "AOPS_BASE_URL", "prompt": "Base URL (e.g. https://aops.example.com)", "password": False,
+             "help": "The base URL for the AOPS REST and WebSocket endpoints."},
+            {"name": "AOPS_HOME_CHANNEL", "prompt": "Home channel ID (optional, for cron/notifications)", "password": False,
+             "help": "Channel ID for scheduled results and notifications."},
+        ],
+    },
+    {
         "key": "yuanbao",
         "label": "Yuanbao",
         "emoji": "💎",
@@ -2875,6 +2895,13 @@ def _platform_status(platform: dict) -> str:
         if val and token:
             return "configured"
         if val or token:
+            return "partially configured"
+        return "not configured"
+    if platform.get("key") == "aops":
+        base_url = get_env_value("AOPS_BASE_URL")
+        if val and base_url:
+            return "configured"
+        if val or base_url:
             return "partially configured"
         return "not configured"
     if val:

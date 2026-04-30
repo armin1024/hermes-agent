@@ -1,7 +1,9 @@
 import asyncio
+import json
 import sys
 import threading
 import types
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,7 +18,6 @@ from gateway.session import SessionSource
 from tools.send_message_tool import (
     _parse_target_ref,
     _send_to_platform,
-    clear_runtime_adapter_context,
 )
 import toolsets
 
@@ -59,9 +60,16 @@ class _FakeWebSocket:
     def __init__(self):
         self.sent = []
         self.closed = False
+        self.messages = []
+        self.on_receive = None
 
     async def send_json(self, payload):
         self.sent.append(payload)
+
+    async def receive(self):
+        if self.on_receive:
+            self.on_receive()
+        return self.messages.pop(0)
 
     async def close(self):
         self.closed = True
@@ -123,6 +131,18 @@ def _make_runner(platform: Platform = Platform.AOPS, extra=None):
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = False
     return runner
+
+
+def _read_aops_wire_records(hermes_home):
+    files = sorted((hermes_home / "logs" / "aops").glob("aops-wire-*.log"))
+    records = []
+    for path in files:
+        records.extend(
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    return records
 
 
 def test_platform_aops_registered():
@@ -203,6 +223,153 @@ async def test_aops_connect_calls_bot_me_and_ws_auth(monkeypatch):
     report_url, report_kwargs = fake_session.post_calls[0]
     assert report_url.endswith("/api/v1/bot/agents/report")
     assert report_kwargs["json"]["source"] == "hermes"
+
+
+@pytest.mark.asyncio
+async def test_aops_read_events_replies_to_server_ping(monkeypatch, tmp_path):
+    fake_aiohttp = types.SimpleNamespace(
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    fake_ws = _FakeWebSocket()
+    fake_ws.messages = [
+        SimpleNamespace(
+            type="TEXT",
+            data=json.dumps({
+                "event": "ping",
+                "message": "heartbeat",
+                "data": {"ts": "2026-04-28T07:58:00Z", "timeoutMs": 30000},
+            }),
+        )
+    ]
+    fake_ws.on_receive = lambda: setattr(adapter, "_running", False)
+    adapter._ws = fake_ws
+    adapter._running = True
+    adapter._dispatch_payload = AsyncMock()
+
+    await adapter._read_events()
+
+    assert len(fake_ws.sent) == 1
+    assert fake_ws.sent[0]["event"] == "pong"
+    assert fake_ws.sent[0]["data"]["ts"].endswith("Z")
+    adapter._dispatch_payload.assert_not_awaited()
+    records = _read_aops_wire_records(tmp_path)
+    assert [record["action"] for record in records] == ["ws.receive", "ws.send"]
+    assert records[0]["direction"] == "in"
+    assert records[0]["event"] == "ping"
+    assert records[0]["payload"]["message"] == "heartbeat"
+    assert records[1]["direction"] == "out"
+    assert records[1]["event"] == "pong"
+    assert records[1]["ts"].endswith("Z")
+    assert records[1]["localTime"]
+
+
+@pytest.mark.asyncio
+async def test_aops_read_events_dispatches_message_posted_after_ping_support(monkeypatch, tmp_path):
+    fake_aiohttp = types.SimpleNamespace(
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    fake_ws = _FakeWebSocket()
+    payload = {
+        "event": "message_posted",
+        "data": {
+            "id": "msg-1",
+            "userId": "user-001",
+            "userName": "Alice",
+            "text": "check cpu",
+            "channelId": "user-001",
+            "channelType": "direct",
+            "timestamp": "2026-04-09T08:00:00.000Z",
+        },
+    }
+    fake_ws.messages = [SimpleNamespace(type="TEXT", data=json.dumps(payload))]
+    fake_ws.on_receive = lambda: setattr(adapter, "_running", False)
+    adapter._ws = fake_ws
+    adapter._running = True
+    adapter.handle_message = AsyncMock()
+
+    await adapter._read_events()
+
+    assert fake_ws.sent == []
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_id == "msg-1"
+    assert event.text == "check cpu"
+
+
+@pytest.mark.asyncio
+async def test_aops_read_events_ignores_unknown_event_without_pong(monkeypatch, tmp_path):
+    fake_aiohttp = types.SimpleNamespace(
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    fake_ws = _FakeWebSocket()
+    fake_ws.messages = [SimpleNamespace(type="TEXT", data=json.dumps({"event": "presence_updated"}))]
+    fake_ws.on_receive = lambda: setattr(adapter, "_running", False)
+    adapter._ws = fake_ws
+    adapter._running = True
+    adapter.handle_message = AsyncMock()
+
+    await adapter._read_events()
+
+    assert fake_ws.sent == []
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_aops_wire_log_keeps_recent_seven_days(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    log_dir = tmp_path / "logs" / "aops"
+    log_dir.mkdir(parents=True)
+    today = datetime.now(timezone.utc).date()
+    old_log = log_dir / f"aops-wire-{(today - timedelta(days=8)).isoformat()}.log"
+    recent_log = log_dir / f"aops-wire-{(today - timedelta(days=6)).isoformat()}.log"
+    old_log.write_text('{"old": true}\n', encoding="utf-8")
+    recent_log.write_text('{"recent": true}\n', encoding="utf-8")
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._log_wire(
+        "info",
+        direction="out",
+        action="ws.send",
+        payload={
+            "event": "message_reply",
+            "data": {
+                "messageId": "botmsg-1",
+                "seq": 2,
+                "phase": "end",
+                "kind": "final",
+                "channelId": "conv-1",
+                "replyToId": "msg-1",
+                "runId": "run-1",
+                "text": "完整正文",
+            },
+        },
+    )
+
+    assert not old_log.exists()
+    assert recent_log.exists()
+    records = _read_aops_wire_records(tmp_path)
+    current = next(record for record in records if record.get("messageId") == "botmsg-1")
+    assert current["ts"].endswith("Z")
+    assert current["localTime"]
+    assert current["event"] == "message_reply"
+    assert current["seq"] == 2
+    assert current["phase"] == "end"
+    assert current["kind"] == "final"
+    assert current["channelId"] == "conv-1"
+    assert current["replyToId"] == "msg-1"
+    assert current["runId"] == "run-1"
+    assert current["payload"]["data"]["text"] == "完整正文"
 
 
 def test_message_posted_maps_to_message_event_and_agent_route():
@@ -318,6 +485,60 @@ async def test_aops_bridge_emits_segmented_stream_events():
 
 
 @pytest.mark.asyncio
+async def test_aops_bridge_drops_internal_thinking_progress(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    bridge = AopsLiveReplyBridge(adapter, chat_id="user-001", reply_to_id="msg-1", run_id="run-1")
+
+    await bridge._emit_tool({
+        "event_type": "reasoning.available",
+        "tool_name": "_thinking",
+        "preview": "测试收到。我是 数智运维专家。",
+        "args": None,
+    })
+    await bridge._emit_tool({
+        "event_type": "_thinking",
+        "tool_name": None,
+        "preview": "internal state",
+        "args": {},
+    })
+
+    adapter.send_reply_event.assert_not_awaited()
+    records = _read_aops_wire_records(tmp_path)
+    assert [record["action"] for record in records] == [
+        "tool_progress.dropped",
+        "tool_progress.dropped",
+    ]
+    assert all(record["direction"] == "drop" for record in records)
+    assert records[0]["payload"]["event_type"] == "reasoning.available"
+    assert records[0]["payload"]["preview"] == "测试收到。我是 数智运维专家。"
+    assert records[0]["ts"].endswith("Z")
+    assert records[0]["localTime"]
+
+
+@pytest.mark.asyncio
+async def test_aops_bridge_still_emits_real_tool_progress():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    bridge = AopsLiveReplyBridge(adapter, chat_id="user-001", reply_to_id="msg-1", run_id="run-1")
+
+    await bridge._emit_tool({
+        "event_type": "tool.started",
+        "tool_name": "exec",
+        "preview": "pwd",
+        "args": {},
+    })
+
+    adapter.send_reply_event.assert_awaited()
+    events = [call.args[0] for call in adapter.send_reply_event.await_args_list]
+    assert [event["phase"] for event in events] == ["start", "tool"]
+    assert events[1]["kind"] == "tool"
+    assert events[1]["tool"]["name"] == "exec"
+    assert events[1]["text"] == "pwd"
+
+
+@pytest.mark.asyncio
 async def test_send_exec_approval_puts_approval_in_end_content(monkeypatch):
     monkeypatch.setattr("gateway.platforms.aops.time.time", lambda: 1760000000)
     adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
@@ -393,31 +614,22 @@ def test_aops_target_ref_is_explicit_without_whitespace():
 
 
 @pytest.mark.asyncio
-async def test_send_to_platform_aops_requires_live_runtime():
-    clear_runtime_adapter_context()
+async def test_send_to_platform_aops_requires_live_runtime(monkeypatch):
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: None)
     result = await _send_to_platform(
         Platform.AOPS,
         PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}),
         "user-001",
         "hello",
     )
-    assert "active Hermes gateway WebSocket connection" in result["error"]
+    assert "No live adapter for platform 'aops'" in result["error"]
 
 
 @pytest.mark.asyncio
 async def test_send_to_platform_aops_uses_runtime_adapter(monkeypatch):
     fake_adapter = SimpleNamespace(send=AsyncMock(return_value=SendResult(success=True, message_id="m-1")))
-    fake_loop = SimpleNamespace(is_running=lambda: True)
-
-    class _FakeFuture:
-        def result(self, timeout=None):
-            return SendResult(success=True, message_id="m-1")
-
-    monkeypatch.setattr("tools.send_message_tool._get_runtime_adapter_context", lambda: ({Platform.AOPS: fake_adapter}, fake_loop))
-    def _fake_run_coroutine_threadsafe(coro, loop):
-        coro.close()
-        return _FakeFuture()
-    monkeypatch.setattr("tools.send_message_tool.asyncio.run_coroutine_threadsafe", _fake_run_coroutine_threadsafe)
+    fake_runner = SimpleNamespace(adapters={Platform.AOPS: fake_adapter})
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: fake_runner)
 
     result = await _send_to_platform(
         Platform.AOPS,
