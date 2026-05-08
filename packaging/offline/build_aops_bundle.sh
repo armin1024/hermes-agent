@@ -6,6 +6,10 @@ export COPYFILE_DISABLE=1
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  PYTHON_BIN="python3"
+fi
 
 BASE_BUNDLE="${1:-}"
 OUTPUT_DIR="${2:-$REPO_ROOT/dist}"
@@ -20,7 +24,7 @@ if [[ ! -f "$BASE_BUNDLE" ]]; then
   exit 1
 fi
 
-VERSION="$(python3 - <<'PY' "$REPO_ROOT"
+VERSION="$("$PYTHON_BIN" - <<'PY' "$REPO_ROOT"
 from pathlib import Path
 import re
 import sys
@@ -108,8 +112,8 @@ for rel in "${RUNTIME_FILES[@]}"; do
   printf '%s\n' "$rel" >> "$MANIFEST_PATH"
 done
 
-python3 "$SCRIPT_DIR/web_dist_overlay.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
-python3 "$SCRIPT_DIR/verify_overlay_imports.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
+"$PYTHON_BIN" "$SCRIPT_DIR/web_dist_overlay.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
+"$PYTHON_BIN" "$SCRIPT_DIR/verify_overlay_imports.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
 
 cat > "$BUNDLE_DIR/examples/config.aops.example.yaml" <<'EOF'
 platforms:
@@ -153,7 +157,7 @@ EOF
 cp "$SCRIPT_DIR/install_aops_offline.sh" "$BUNDLE_DIR/install.sh"
 chmod +x "$BUNDLE_DIR/install.sh"
 
-python3 "$SCRIPT_DIR/render_bundle_readme.py" \
+"$PYTHON_BIN" "$SCRIPT_DIR/render_bundle_readme.py" \
   "$SCRIPT_DIR/README_aops_bundle.md" \
   "$BUNDLE_DIR/README.md" \
   "$OUTPUT_NAME" \
