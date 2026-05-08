@@ -28,6 +28,7 @@ if not match:
 print(match.group(1))
 PY
 )"
+GIT_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
 
 mkdir -p "$OUTPUT_DIR"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-aops-bundle.XXXXXX")"
@@ -53,9 +54,9 @@ fi
 BUNDLE_DIR="$WORK_DIR/$TOP_LEVEL"
 TARGET_NAME="offline-bundle-v${VERSION}-aops"
 if [[ "$(basename "$BASE_BUNDLE")" =~ linux-x86_64 ]]; then
-  OUTPUT_NAME="hermes-aops-offline-bundle-v${VERSION}-linux-x86_64.tar.gz"
+  OUTPUT_NAME="hermes-aops-offline-bundle-v${VERSION}-${GIT_SHA}-linux-x86_64.tar.gz"
 else
-  OUTPUT_NAME="hermes-aops-offline-bundle-v${VERSION}.tar.gz"
+  OUTPUT_NAME="hermes-aops-offline-bundle-v${VERSION}-${GIT_SHA}.tar.gz"
 fi
 
 mv "$BUNDLE_DIR" "$WORK_DIR/$TARGET_NAME"
@@ -66,6 +67,7 @@ mkdir -p "$BUNDLE_DIR/overlay" "$BUNDLE_DIR/examples"
 RUNTIME_FILES=(
   "agent/prompt_builder.py"
   "cron/scheduler.py"
+  "gateway/aops_commands.py"
   "gateway/config.py"
   "gateway/platforms/__init__.py"
   "gateway/platforms/aops.py"
@@ -77,6 +79,7 @@ RUNTIME_FILES=(
   "hermes_cli/status.py"
   "hermes_cli/tools_config.py"
   "tools/send_message_tool.py"
+  "tools/skills_hub.py"
   "toolsets.py"
 )
 
@@ -109,6 +112,7 @@ platforms:
       push_tool_calls: true
       dm_policy: open
       allow_from: ["user-001"]
+      blocked_commands: ["gateway"]
       trusted_agent_key_from: ["*"]
       agent_routes:
         main:
@@ -129,6 +133,8 @@ AOPS_PUSH_TOOL_CALLS=true
 AOPS_DM_POLICY=open
 AOPS_ALLOW_FROM=user-001
 AOPS_TRUSTED_AGENT_KEY_FROM=*
+AOPS_BLOCKED_COMMANDS=gateway
+CLAWHUB_REGISTRY=http://clawhub.ai
 EOF
 
 cp "$SCRIPT_DIR/install_aops_offline.sh" "$BUNDLE_DIR/install.sh"

@@ -12,6 +12,7 @@ import pytest
 import gateway.run as gateway_run
 from agent.prompt_builder import PLATFORM_HINTS
 from gateway.config import GatewayConfig, Platform, PlatformConfig, _apply_env_overrides
+from gateway.platforms.base import MessageEvent
 from gateway.platforms.aops import AopsAdapter, AopsLiveReplyBridge, SendResult
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -127,10 +128,25 @@ def _make_runner(platform: Platform = Platform.AOPS, extra=None):
     runner.delivery_router = SimpleNamespace(adapters={})
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
+    runner.hooks.emit_collect = AsyncMock(return_value=[])
     runner.hooks.loaded_hooks = []
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = False
     return runner
+
+
+def _make_aops_event(text: str) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        source=SessionSource(
+            platform=Platform.AOPS,
+            user_id="user-001",
+            chat_id="user-001",
+            user_name="AOPS User",
+            chat_type="dm",
+        ),
+        message_id="msg-1",
+    )
 
 
 def _read_aops_wire_records(hermes_home):
@@ -606,6 +622,79 @@ def test_aops_dm_policy_auth_open_allowlist_pairing_disabled(monkeypatch):
 
     disabled_runner = _make_runner(extra={"dm_policy": "disabled"})
     assert disabled_runner._is_user_authorized(source) is False
+
+
+@pytest.mark.asyncio
+async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path):
+    import tools.skills_tool as skills_tool
+
+    skills_root = tmp_path / "skills"
+    skill_dir = skills_root / "ops" / "restart-service"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: Restart Service\n"
+        "description: Restart a service safely.\n"
+        "homepage: https://example.com/restart-service\n"
+        "---\n"
+        "# Restart Service\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/skills"))
+
+    payload = json.loads(result)
+    assert payload["schemaVersion"] == "local-command-list.v1"
+    assert payload["type"] == "skills.list"
+    assert payload["itemType"] == "skill"
+    assert payload["count"] == 1
+    assert payload["items"][0]["id"] == "ops/restart-service"
+    assert payload["items"][0]["name"] == "Restart Service"
+    assert payload["items"][0]["homepage"] == "https://example.com/restart-service"
+
+
+@pytest.mark.asyncio
+async def test_aops_blocked_command_is_rejected_and_hidden_from_help():
+    runner = _make_runner(extra={"dm_policy": "open", "blocked_commands": ["gateway"]})
+
+    blocked = await runner._handle_message(_make_aops_event("/gateway status"))
+    help_text = await runner._handle_message(_make_aops_event("/help"))
+
+    assert "blocked by AOPS config" in blocked
+    assert "`/gateway" not in help_text
+    assert "alias: `/gateway`" not in help_text
+    assert "`/skills <args...>`" in help_text
+
+
+@pytest.mark.asyncio
+async def test_aops_cli_only_command_uses_cli_bridge(monkeypatch):
+    from gateway import aops_commands
+
+    bridge = AsyncMock(return_value="bridge output")
+    monkeypatch.setattr(aops_commands, "run_cli_bridge", bridge)
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event("/skills search kubernetes")
+
+    result = await runner._handle_message(event)
+
+    assert result == "bridge output"
+    bridge.assert_awaited_once_with(event, runner.config)
+
+
+def test_clawhub_base_url_uses_registry_env(monkeypatch):
+    import importlib
+    import tools.skills_hub as skills_hub
+
+    monkeypatch.setenv("CLAWHUB_REGISTRY", "http://clawhub.internal")
+    reloaded = importlib.reload(skills_hub)
+    try:
+        assert reloaded.ClawHubSource.BASE_URL == "http://clawhub.internal/api/v1"
+    finally:
+        monkeypatch.delenv("CLAWHUB_REGISTRY", raising=False)
+        importlib.reload(skills_hub)
 
 
 def test_aops_target_ref_is_explicit_without_whitespace():

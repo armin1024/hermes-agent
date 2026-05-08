@@ -4391,6 +4391,17 @@ class GatewayRunner:
         # don't depend on the exact alias the user typed.
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
+        raw_command_args = event.get_command_args().strip() if command else ""
+
+        if command and source.platform == Platform.AOPS:
+            from gateway import aops_commands as _aops_commands
+
+            if _aops_commands.is_blocked(self.config, command, raw_command_args, canonical):
+                return _aops_commands.block_message(command)
+
+            local_reply = _aops_commands.maybe_local_command(event)
+            if local_reply is not None:
+                return local_reply
 
         # Fire the ``command:<canonical>`` hook for any recognized slash
         # command — built-in OR plugin-registered. Handlers can return a
@@ -4622,6 +4633,12 @@ class GatewayRunner:
                     return str(result) if result else None
             except Exception as e:
                 logger.debug("Plugin command dispatch failed (non-fatal): %s", e)
+
+        if command and source.platform == Platform.AOPS:
+            from gateway import aops_commands as _aops_commands
+
+            if _aops_commands.is_cli_bridge_command(command):
+                return await _aops_commands.run_cli_bridge(event, self.config)
 
         # Skill slash commands: /skill-name loads the skill and sends to agent.
         # resolve_skill_command_key() handles the Telegram underscore/hyphen
@@ -6411,9 +6428,15 @@ class GatewayRunner:
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
         from hermes_cli.commands import gateway_help_lines
+        help_lines = gateway_help_lines()
+        if event.source.platform == Platform.AOPS:
+            from gateway import aops_commands as _aops_commands
+
+            help_lines = _aops_commands.filter_help_lines(help_lines, self.config)
+            help_lines.extend(["", "🧰 **CLI Commands via AOPS**", *_aops_commands.aops_cli_help_lines(self.config)])
         lines = [
             "📖 **Hermes Commands**\n",
-            *gateway_help_lines(),
+            *help_lines,
         ]
         try:
             from agent.skill_commands import get_skill_commands
@@ -6445,6 +6468,11 @@ class GatewayRunner:
 
         # Build combined entry list: built-in commands + skill commands
         entries = list(gateway_help_lines())
+        if event.source.platform == Platform.AOPS:
+            from gateway import aops_commands as _aops_commands
+
+            entries = _aops_commands.filter_help_lines(entries, self.config)
+            entries.extend(["", "🧰 **CLI Commands via AOPS**", *_aops_commands.aops_cli_help_lines(self.config)])
         try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()

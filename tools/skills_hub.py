@@ -1584,7 +1584,8 @@ class ClawHubSource(SkillSource):
     their vetting is insufficient (341 malicious skills found Feb 2026).
     """
 
-    BASE_URL = "https://clawhub.ai/api/v1"
+    registry = os.environ.get("CLAWHUB_REGISTRY", "http://clawhub.ai")
+    BASE_URL = f"{registry}/api/v1"
 
     def source_id(self) -> str:
         return "clawhub"
@@ -1754,7 +1755,8 @@ class ClawHubSource(SkillSource):
                 return results
 
         # Empty query or catalog fallback failure: use the lightweight listing API.
-        cache_key = f"clawhub_search_listing_v1_{hashlib.md5(query.encode()).hexdigest()}_{limit}"
+        registry_hash = hashlib.md5(self.BASE_URL.encode()).hexdigest()
+        cache_key = f"clawhub_search_listing_v1_{registry_hash}_{hashlib.md5(query.encode()).hexdigest()}_{limit}"
         cached = _read_index_cache(cache_key)
         if cached is not None:
             return self._finalize_search_results(
@@ -1860,7 +1862,8 @@ class ClawHubSource(SkillSource):
         )
 
     def _search_catalog(self, query: str, limit: int = 10) -> List[SkillMeta]:
-        cache_key = f"clawhub_search_catalog_v1_{hashlib.md5(f'{query}|{limit}'.encode()).hexdigest()}"
+        registry_hash = hashlib.md5(self.BASE_URL.encode()).hexdigest()
+        cache_key = f"clawhub_search_catalog_v1_{registry_hash}_{hashlib.md5(f'{query}|{limit}'.encode()).hexdigest()}"
         cached = _read_index_cache(cache_key)
         if cached is not None:
             return [SkillMeta(**s) for s in cached][:limit]
@@ -1874,7 +1877,8 @@ class ClawHubSource(SkillSource):
         return results
 
     def _load_catalog_index(self) -> List[SkillMeta]:
-        cache_key = "clawhub_catalog_v1"
+        registry_hash = hashlib.md5(self.BASE_URL.encode()).hexdigest()
+        cache_key = f"clawhub_catalog_v1_{registry_hash}"
         cached = _read_index_cache(cache_key)
         if cached is not None:
             return [SkillMeta(**s) for s in cached]
