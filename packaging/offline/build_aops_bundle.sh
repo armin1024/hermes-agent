@@ -165,8 +165,9 @@ chmod +x "$BUNDLE_DIR/install.sh"
   "$VERSION" \
   "$GIT_SHA"
 
-# Final sweep so the output tarball cannot contain AppleDouble debris.
-find "$BUNDLE_DIR" \( -name '._*' -o -name '__MACOSX' \) -exec rm -rf {} +
+# Final sweep so the output tarball cannot contain AppleDouble debris or Python cache files.
+find "$BUNDLE_DIR" \( -name '._*' -o -name '__MACOSX' -o -name '__pycache__' \) -exec rm -rf {} +
+find "$BUNDLE_DIR" -name '*.pyc' -delete
 
 tar -czf "$OUTPUT_DIR/$OUTPUT_NAME" -C "$WORK_DIR" "$TARGET_NAME"
 
