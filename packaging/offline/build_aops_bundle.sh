@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Prevent macOS tar/cp from emitting AppleDouble metadata files like `._*`.
+export COPYFILE_DISABLE=1
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
@@ -63,6 +66,9 @@ if [[ "$(basename "$BUNDLE_DIR")" != "$TARGET_NAME" ]]; then
   mv "$BUNDLE_DIR" "$WORK_DIR/$TARGET_NAME"
   BUNDLE_DIR="$WORK_DIR/$TARGET_NAME"
 fi
+
+# Drop macOS metadata noise from the extracted bundle before overlaying files.
+find "$WORK_DIR" \( -name '._*' -o -name '__MACOSX' \) -exec rm -rf {} +
 
 mkdir -p "$BUNDLE_DIR/overlay" "$BUNDLE_DIR/examples"
 
@@ -158,6 +164,9 @@ if version is None:
 readme = template.replace("__BUNDLE_NAME__", bundle_dir.name)
 bundle_dir.joinpath("README.md").write_text(readme, encoding="utf-8")
 PY
+
+# Final sweep so the output tarball cannot contain AppleDouble debris.
+find "$BUNDLE_DIR" \( -name '._*' -o -name '__MACOSX' \) -exec rm -rf {} +
 
 tar -czf "$OUTPUT_DIR/$OUTPUT_NAME" -C "$WORK_DIR" "$TARGET_NAME"
 
