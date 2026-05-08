@@ -59,8 +59,10 @@ else
   OUTPUT_NAME="hermes-aops-offline-bundle-v${VERSION}-${GIT_SHA}.tar.gz"
 fi
 
-mv "$BUNDLE_DIR" "$WORK_DIR/$TARGET_NAME"
-BUNDLE_DIR="$WORK_DIR/$TARGET_NAME"
+if [[ "$(basename "$BUNDLE_DIR")" != "$TARGET_NAME" ]]; then
+  mv "$BUNDLE_DIR" "$WORK_DIR/$TARGET_NAME"
+  BUNDLE_DIR="$WORK_DIR/$TARGET_NAME"
+fi
 
 mkdir -p "$BUNDLE_DIR/overlay" "$BUNDLE_DIR/examples"
 
