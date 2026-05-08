@@ -92,6 +92,7 @@ export default defineConfig({
   build: {
     outDir: "../hermes_cli/web_dist",
     emptyOutDir: true,
+    manifest: true,
   },
   server: {
     proxy: {

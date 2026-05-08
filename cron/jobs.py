@@ -36,11 +36,13 @@ except ImportError:
 HERMES_DIR = get_hermes_home().resolve()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
+HISTORY_FILE = CRON_DIR / "history.jsonl"
 
 # In-process lock protecting load_jobs→modify→save_jobs cycles.
 # Required when tick() runs jobs in parallel threads — without this,
 # concurrent mark_job_run / advance_next_run calls can clobber each other.
 _jobs_file_lock = threading.Lock()
+_history_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
@@ -94,6 +96,21 @@ def ensure_dirs():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     _secure_dir(CRON_DIR)
     _secure_dir(OUTPUT_DIR)
+
+
+def _history_file_path() -> Path:
+    """Return the effective cron history file path.
+
+    Tests and callers often monkeypatch ``CRON_DIR`` without also patching the
+    module-level ``HISTORY_FILE`` constant. When the constant still points at
+    the default home directory, prefer the current ``CRON_DIR/history.jsonl``.
+    An explicit ``HISTORY_FILE`` monkeypatch continues to win.
+    """
+    history_path = Path(HISTORY_FILE)
+    expected_default = Path(CRON_DIR) / "history.jsonl"
+    if history_path.name == "history.jsonl" and history_path.parent != Path(CRON_DIR):
+        return expected_default
+    return history_path
 
 
 # =============================================================================
@@ -338,33 +355,54 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 # Job CRUD Operations
 # =============================================================================
 
-def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
+def _read_jobs_payload() -> Dict[str, Any]:
+    """Read the raw jobs payload from disk."""
     ensure_dirs()
     if not JOBS_FILE.exists():
-        return []
+        return {"jobs": [], "updated_at": None}
     
     try:
         with open(JOBS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            return data.get("jobs", [])
+            return {
+                "jobs": data.get("jobs", []),
+                "updated_at": data.get("updated_at"),
+            }
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         try:
             with open(JOBS_FILE, 'r', encoding='utf-8') as f:
                 data = json.loads(f.read(), strict=False)
                 jobs = data.get("jobs", [])
+                updated_at = data.get("updated_at")
                 if jobs:
                     # Auto-repair: rewrite with proper escaping
                     save_jobs(jobs)
                     logger.warning("Auto-repaired jobs.json (had invalid control characters)")
-                return jobs
+                return {"jobs": jobs, "updated_at": updated_at}
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
             raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
     except IOError as e:
         logger.error("IOError reading jobs.json: %s", e)
         raise RuntimeError(f"Failed to read cron database: {e}") from e
+
+
+def load_jobs_payload() -> Dict[str, Any]:
+    """Load the full jobs payload, including the file-level updated_at."""
+    payload = _read_jobs_payload()
+    payload["jobs"] = [_apply_skill_fields(job) for job in payload.get("jobs", [])]
+    return payload
+
+
+def get_jobs_updated_at() -> Optional[str]:
+    """Return the file-level updated_at for jobs.json."""
+    return _read_jobs_payload().get("updated_at")
+
+
+def load_jobs() -> List[Dict[str, Any]]:
+    """Load all jobs from storage."""
+    return load_jobs_payload().get("jobs", [])
 
 
 def save_jobs(jobs: List[Dict[str, Any]]):
@@ -384,6 +422,132 @@ def save_jobs(jobs: List[Dict[str, Any]]):
         except OSError:
             pass
         raise
+
+
+def _touch_job_updated_at(job: Dict[str, Any], when: Optional[str] = None) -> None:
+    """Set a job's updated_at timestamp in-place."""
+    job["updated_at"] = when or _hermes_now().isoformat()
+
+
+def _history_sort_key(entry: Dict[str, Any]) -> str:
+    return str(
+        entry.get("finished_at")
+        or entry.get("timestamp")
+        or entry.get("started_at")
+        or ""
+    )
+
+
+def _truncate_history_preview(text: Optional[str], limit: int = 280) -> Optional[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    compact = " ".join(raw.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "…"
+
+
+def append_cron_history(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Append one structured cron history entry to the JSONL log."""
+    ensure_dirs()
+    history_file = _history_file_path()
+    timestamp = entry.get("timestamp") or _hermes_now().isoformat()
+    payload = {"timestamp": timestamp, **entry}
+
+    line = json.dumps(payload, ensure_ascii=False)
+    with _history_file_lock:
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        _secure_file(history_file)
+    return payload
+
+
+def record_job_history(
+    job: Dict[str, Any],
+    *,
+    success: bool,
+    output_file: Optional[Union[str, Path]] = None,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    final_response: Optional[str] = None,
+    started_at: Optional[str] = None,
+    finished_at: Optional[str] = None,
+    silent: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Record one execution result for a cron job."""
+    finished_ts = finished_at or _hermes_now().isoformat()
+    status = "ok" if success else "error"
+    output_path = str(output_file) if output_file else None
+    schedule = job.get("schedule") or {}
+    schedule_kind = schedule.get("kind") if isinstance(schedule, dict) else None
+    deliver = job.get("deliver")
+    if isinstance(deliver, list):
+        deliver = ",".join(str(item).strip() for item in deliver if str(item).strip()) or None
+
+    return append_cron_history(
+        {
+            "job_id": job.get("id"),
+            "job_name": job.get("name"),
+            "status": status,
+            "success": success,
+            "schedule_kind": schedule_kind,
+            "deliver": deliver,
+            "started_at": started_at,
+            "finished_at": finished_ts,
+            "scheduled_for": job.get("next_run_at"),
+            "last_run_at": job.get("last_run_at"),
+            "output_file": output_path,
+            "error": error,
+            "delivery_error": delivery_error,
+            "silent": silent,
+            "response_preview": _truncate_history_preview(final_response),
+        }
+    )
+
+
+def query_cron_history(
+    *,
+    job_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: Optional[int] = 50,
+) -> List[Dict[str, Any]]:
+    """Query structured cron history entries from newest to oldest."""
+    ensure_dirs()
+    history_file = _history_file_path()
+    if not history_file.exists():
+        return []
+
+    normalized_status = str(status).strip().lower() if status else None
+    entries: List[Dict[str, Any]] = []
+    with open(history_file, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning("Skipping malformed cron history line %d", line_no)
+                continue
+            if job_id and entry.get("job_id") != job_id:
+                continue
+            if normalized_status and str(entry.get("status", "")).lower() != normalized_status:
+                continue
+            entries.append(entry)
+
+    entries.sort(key=_history_sort_key, reverse=True)
+    if limit is None:
+        return entries
+    return entries[: max(int(limit), 0)]
+
+
+def get_job_history(job_id: str, limit: Optional[int] = 20) -> List[Dict[str, Any]]:
+    """Return execution history for a single job, newest first."""
+    return query_cron_history(job_id=job_id, limit=limit)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -531,6 +695,7 @@ def create_job(
         "paused_at": None,
         "paused_reason": None,
         "created_at": now,
+        "updated_at": now,
         "next_run_at": compute_next_run(parsed_schedule),
         "last_run_at": None,
         "last_status": None,
@@ -609,6 +774,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
             updated["next_run_at"] = compute_next_run(updated["schedule"])
 
+        _touch_job_updated_at(updated)
         jobs[i] = updated
         save_jobs(jobs)
         return _apply_skill_fields(jobs[i])
@@ -692,6 +858,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
+                _touch_job_updated_at(job, now)
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
@@ -771,6 +938,7 @@ def advance_next_run(job_id: str) -> bool:
                 new_next = compute_next_run(job["schedule"], now)
                 if new_next and new_next != job.get("next_run_at"):
                     job["next_run_at"] = new_next
+                    _touch_job_updated_at(job, now)
                     save_jobs(jobs)
                     return True
                 return False

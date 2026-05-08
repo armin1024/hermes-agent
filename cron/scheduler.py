@@ -107,7 +107,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, mark_job_run, record_job_history, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1362,11 +1362,35 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                try:
+                    record_job_history(
+                        job,
+                        success=success,
+                        output_file=output_file,
+                        error=error,
+                        delivery_error=delivery_error,
+                        final_response=final_response,
+                        silent=not should_deliver,
+                    )
+                except Exception as history_exc:
+                    logger.warning(
+                        "Failed to record cron history for job %s: %s",
+                        job.get("id"),
+                        history_exc,
+                    )
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
                 mark_job_run(job["id"], False, str(e))
+                try:
+                    record_job_history(job, success=False, error=str(e))
+                except Exception as history_exc:
+                    logger.warning(
+                        "Failed to record cron history for failed job %s: %s",
+                        job.get("id"),
+                        history_exc,
+                    )
                 return False
 
         # Partition due jobs: those with a per-job workdir mutate

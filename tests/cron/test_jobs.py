@@ -6,12 +6,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import cron.jobs as cron_jobs
 from cron.jobs import (
     parse_duration,
     parse_schedule,
     compute_next_run,
     create_job,
+    get_job_history,
+    get_jobs_updated_at,
     load_jobs,
+    load_jobs_payload,
+    query_cron_history,
+    record_job_history,
     save_jobs,
     get_job,
     list_jobs,
@@ -184,6 +190,7 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     """Redirect cron storage to a temp directory."""
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
     return tmp_path
 
@@ -233,6 +240,12 @@ class TestJobCRUD:
         job = create_job(prompt="Test", schedule="30m")
         assert job["deliver"] == "local"
 
+    def test_create_sets_job_updated_at(self, tmp_cron_dir):
+        job = create_job(prompt="Check server status", schedule="30m")
+        assert job["updated_at"] == job["created_at"]
+        fetched = get_job(job["id"])
+        assert fetched["updated_at"] == job["updated_at"]
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):
@@ -249,6 +262,17 @@ class TestUpdateJob:
         # Verify persisted to disk
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
+
+    def test_update_touches_job_updated_at(self, tmp_cron_dir, monkeypatch):
+        created = "2026-05-08T08:00:00+00:00"
+        updated_at = "2026-05-08T09:00:00+00:00"
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: datetime.fromisoformat(created))
+        job = create_job(prompt="Check server status", schedule="every 1h", name="Old Name")
+
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: datetime.fromisoformat(updated_at))
+        updated = update_job(job["id"], {"name": "New Name"})
+
+        assert updated["updated_at"] == updated_at
 
     def test_update_schedule(self, tmp_cron_dir):
         job = create_job(prompt="Daily report", schedule="every 1h")
@@ -307,6 +331,7 @@ class TestMarkJobRun:
         updated = get_job(job["id"])
         assert updated["repeat"]["completed"] == 1
         assert updated["last_status"] == "ok"
+        assert updated["updated_at"] == updated["last_run_at"]
 
     def test_repeat_limit_removes_job(self, tmp_cron_dir):
         job = create_job(prompt="Once", schedule="30m", repeat=1)
@@ -683,3 +708,63 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+
+class TestJobsPayloadMetadata:
+    def test_load_jobs_payload_includes_file_updated_at(self, tmp_cron_dir):
+        job = create_job(prompt="monitor", schedule="every 1h")
+
+        payload = load_jobs_payload()
+
+        assert payload["updated_at"] is not None
+        assert payload["jobs"][0]["id"] == job["id"]
+        assert get_jobs_updated_at() == payload["updated_at"]
+
+
+class TestCronHistory:
+    def test_record_and_query_history(self, tmp_cron_dir):
+        job = create_job(prompt="monitor", schedule="every 1h", name="Monitor")
+
+        entry = record_job_history(
+            job,
+            success=True,
+            output_file=tmp_cron_dir / "cron" / "output" / "monitor.md",
+            final_response="Fresh metrics are available.",
+            finished_at="2026-05-08T10:00:00+00:00",
+        )
+
+        assert cron_jobs.HISTORY_FILE.exists()
+        assert entry["job_id"] == job["id"]
+        assert entry["status"] == "ok"
+        assert entry["response_preview"] == "Fresh metrics are available."
+
+        history = get_job_history(job["id"])
+        assert history == [entry]
+
+    def test_query_history_filters_and_orders_newest_first(self, tmp_cron_dir):
+        first = create_job(prompt="first", schedule="every 1h", name="First")
+        second = create_job(prompt="second", schedule="every 1h", name="Second")
+
+        record_job_history(first, success=True, finished_at="2026-05-08T09:00:00+00:00")
+        record_job_history(second, success=False, error="boom", finished_at="2026-05-08T11:00:00+00:00")
+        record_job_history(first, success=False, error="timeout", finished_at="2026-05-08T10:00:00+00:00")
+
+        all_history = query_cron_history(limit=None)
+        assert [entry["job_id"] for entry in all_history] == [second["id"], first["id"], first["id"]]
+
+        error_history = query_cron_history(status="error", limit=None)
+        assert len(error_history) == 2
+        assert all(entry["status"] == "error" for entry in error_history)
+
+        first_history = query_cron_history(job_id=first["id"], limit=1)
+        assert len(first_history) == 1
+        assert first_history[0]["error"] == "timeout"
+
+    def test_query_history_skips_malformed_lines(self, tmp_cron_dir):
+        cron_jobs.HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cron_jobs.HISTORY_FILE.write_text('{"job_id":"ok","status":"ok","finished_at":"2026-05-08T10:00:00+00:00"}\nnot-json\n')
+
+        history = query_cron_history(limit=None)
+
+        assert len(history) == 1
+        assert history[0]["job_id"] == "ok"

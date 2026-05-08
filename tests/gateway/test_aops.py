@@ -657,6 +657,64 @@ async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_aops_cron_local_command_returns_document_fields(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Daily report", schedule="every 1h", name="Daily report")
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/cron"))
+
+    payload = json.loads(result)
+    item = payload["items"][0]
+    assert payload["schemaVersion"] == "local-command-list.v1"
+    assert payload["type"] == "cron.list"
+    assert item["id"] == job["id"]
+    assert item["createdAtMs"] is not None
+    assert item["updatedAtMs"] is not None
+    assert item["scheduleText"] == "every 60m"
+    assert item["payloadKind"] == "agentTurn"
+    assert item["lastDeliveryStatus"] == "not-requested"
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_history_returns_structured_list(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Daily report", schedule="every 1h", name="Daily report")
+    cron_jobs.append_cron_history(
+        {
+            "job_id": job["id"],
+            "job_name": job["name"],
+            "status": "ok",
+            "started_at": "2026-05-08T09:00:00+00:00",
+            "finished_at": "2026-05-08T09:01:00+00:00",
+            "response_preview": "报告已生成",
+        }
+    )
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event(f"/cron history {job['id']}"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "cron.history.list"
+    assert payload["itemType"] == "cron.run"
+    assert payload["context"]["jobId"] == job["id"]
+    assert payload["summary"]["task"]["id"] == job["id"]
+    assert payload["items"][0]["jobId"] == job["id"]
+    assert payload["items"][0]["summary"] == "报告已生成"
+
+
+@pytest.mark.asyncio
 async def test_aops_blocked_command_is_rejected_and_hidden_from_help():
     runner = _make_runner(extra={"dm_policy": "open", "blocked_commands": ["gateway"]})
 
@@ -664,24 +722,69 @@ async def test_aops_blocked_command_is_rejected_and_hidden_from_help():
     help_text = await runner._handle_message(_make_aops_event("/help"))
 
     assert "blocked by AOPS config" in blocked
-    assert "`/gateway" not in help_text
-    assert "alias: `/gateway`" not in help_text
-    assert "`/skills <args...>`" in help_text
+    payload = json.loads(help_text)
+    full_commands = {item["fullCommand"] for item in payload["items"]}
+    assert "/help" in full_commands
+    assert "/skills" in full_commands
+    assert "/curator" in full_commands
+    assert "/gateway" not in full_commands
 
 
 @pytest.mark.asyncio
-async def test_aops_cli_only_command_uses_cli_bridge(monkeypatch):
-    from gateway import aops_commands
+async def test_aops_help_returns_structured_tree_with_dangerous_flag():
+    runner = _make_runner(
+        extra={
+            "dm_policy": "open",
+            "dangerous_commands": ["/curator run"],
+        }
+    )
 
-    bridge = AsyncMock(return_value="bridge output")
-    monkeypatch.setattr(aops_commands, "run_cli_bridge", bridge)
+    result = await runner._handle_message(_make_aops_event("/help"))
+
+    payload = json.loads(result)
+    assert payload["schemaVersion"] == "local-command-tree.v1"
+    assert payload["type"] == "command.tree"
+    curator = next(item for item in payload["items"] if item["fullCommand"] == "/curator")
+    run_child = next(child for child in curator["children"] if child["command"] == "run")
+    pin_child = next(child for child in curator["children"] if child["command"] == "pin")
+    assert curator["executable"] is False
+    assert run_child["dangerous"] is True
+    assert run_child["executable"] is True
+    assert pin_child["executable"] is False
+    assert pin_child["completions"] == [{"name": "<skill>", "description": "技能名称。必填。"}]
+
+
+@pytest.mark.asyncio
+async def test_aops_cli_only_command_is_rejected():
     runner = _make_runner(extra={"dm_policy": "open"})
     event = _make_aops_event("/skills search kubernetes")
 
     result = await runner._handle_message(event)
 
-    assert result == "bridge output"
-    bridge.assert_awaited_once_with(event, runner.config)
+    assert "not supported on AOPS" in result
+
+
+@pytest.mark.asyncio
+async def test_aops_commands_text_hides_removed_commands_and_lists_custom():
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/commands"))
+
+    assert "/update" not in result
+    assert "/debug" not in result
+    assert "/cron history <id> [tsMs]" in result
+
+
+@pytest.mark.asyncio
+async def test_aops_curator_is_handled_natively(monkeypatch):
+    from gateway import aops_commands
+
+    monkeypatch.setattr(aops_commands, "run_curator_command", lambda raw_args: (0, f"curator {raw_args}"))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/curator status"))
+
+    assert result == "curator status"
 
 
 def test_clawhub_base_url_uses_registry_env(monkeypatch):

@@ -106,6 +106,8 @@ for rel in "${RUNTIME_FILES[@]}"; do
   printf '%s\n' "$rel" >> "$MANIFEST_PATH"
 done
 
+python3 "$SCRIPT_DIR/web_dist_overlay.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
+
 cat > "$BUNDLE_DIR/examples/config.aops.example.yaml" <<'EOF'
 platforms:
   aops:
@@ -120,7 +122,7 @@ platforms:
       push_tool_calls: true
       dm_policy: open
       allow_from: ["user-001"]
-      blocked_commands: ["gateway"]
+      dangerous_commands: ["/curator run", "/curator restore"]
       trusted_agent_key_from: ["*"]
       agent_routes:
         main:
@@ -141,7 +143,7 @@ AOPS_PUSH_TOOL_CALLS=true
 AOPS_DM_POLICY=open
 AOPS_ALLOW_FROM=user-001
 AOPS_TRUSTED_AGENT_KEY_FROM=*
-AOPS_BLOCKED_COMMANDS=gateway
+AOPS_DANGEROUS_COMMANDS="/curator run,/curator restore"
 CLAWHUB_REGISTRY=http://clawhub.ai
 EOF
 

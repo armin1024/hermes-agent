@@ -4403,6 +4403,9 @@ class GatewayRunner:
             if local_reply is not None:
                 return local_reply
 
+            if not _aops_commands.is_supported_command(command, raw_command_args, canonical):
+                return _aops_commands.unsupported_message(command)
+
         # Fire the ``command:<canonical>`` hook for any recognized slash
         # command — built-in OR plugin-registered. Handlers can return a
         # dict with ``{"decision": "deny" | "handled" | "rewrite", ...}``
@@ -4466,6 +4469,9 @@ class GatewayRunner:
 
         if canonical == "commands":
             return await self._handle_commands_command(event)
+
+        if canonical == "curator":
+            return await self._handle_curator_command(event)
         
         if canonical == "profile":
             return await self._handle_profile_command(event)
@@ -6427,13 +6433,13 @@ class GatewayRunner:
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
-        from hermes_cli.commands import gateway_help_lines
-        help_lines = gateway_help_lines()
         if event.source.platform == Platform.AOPS:
             from gateway import aops_commands as _aops_commands
 
-            help_lines = _aops_commands.filter_help_lines(help_lines, self.config)
-            help_lines.extend(["", "🧰 **CLI Commands via AOPS**", *_aops_commands.aops_cli_help_lines(self.config)])
+            return _aops_commands.help_tree_response(self.config)
+
+        from hermes_cli.commands import gateway_help_lines
+        help_lines = gateway_help_lines()
         lines = [
             "📖 **Hermes Commands**\n",
             *help_lines,
@@ -6472,7 +6478,7 @@ class GatewayRunner:
             from gateway import aops_commands as _aops_commands
 
             entries = _aops_commands.filter_help_lines(entries, self.config)
-            entries.extend(["", "🧰 **CLI Commands via AOPS**", *_aops_commands.aops_cli_help_lines(self.config)])
+            entries = ["🧰 **AOPS Local Commands**", *_aops_commands.aops_text_command_lines(), "", *entries]
         try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()
@@ -6488,7 +6494,6 @@ class GatewayRunner:
         if not entries:
             return "No commands available."
 
-        from gateway.config import Platform
         page_size = 15 if event.source.platform == Platform.TELEGRAM else 20
         total_pages = max(1, (len(entries) + page_size - 1) // page_size)
         page = max(1, min(requested_page, total_pages))
@@ -6510,6 +6515,25 @@ class GatewayRunner:
         if page != requested_page:
             lines.append(f"_(Requested page {requested_page} was out of range, showing page {page}.)_")
         return "\n".join(lines)
+
+    async def _handle_curator_command(self, event: MessageEvent) -> str:
+        """Handle /curator commands natively in gateway contexts."""
+        raw_args = event.get_command_args().strip()
+        loop = asyncio.get_running_loop()
+
+        def _run_curator() -> tuple[int, str]:
+            from gateway import aops_commands as _aops_commands
+
+            return _aops_commands.run_curator_command(raw_args)
+
+        try:
+            exit_code, output = await loop.run_in_executor(None, _run_curator)
+        except Exception as exc:
+            logger.error("Curator command failed: %s", exc, exc_info=True)
+            return f"Curator command failed: {exc}"
+        if exit_code == 0:
+            return output
+        return f"{output}\n\n(exit {exit_code})"
 
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
