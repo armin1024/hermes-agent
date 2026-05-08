@@ -742,16 +742,78 @@ async def test_aops_help_returns_structured_tree_with_dangerous_flag():
     result = await runner._handle_message(_make_aops_event("/help"))
 
     payload = json.loads(result)
-    assert payload["schemaVersion"] == "local-command-tree.v1"
+    assert payload["schemaVersion"] == "local-command-tree.v2"
     assert payload["type"] == "command.tree"
     curator = next(item for item in payload["items"] if item["fullCommand"] == "/curator")
+    fast = next(item for item in payload["items"] if item["fullCommand"] == "/fast")
     run_child = next(child for child in curator["children"] if child["command"] == "run")
     pin_child = next(child for child in curator["children"] if child["command"] == "pin")
     assert curator["executable"] is False
     assert run_child["dangerous"] is True
     assert run_child["executable"] is True
     assert pin_child["executable"] is False
-    assert pin_child["completions"] == [{"name": "<skill>", "description": "技能名称。必填。"}]
+    assert pin_child["completions"] == [
+        {
+            "name": "skill",
+            "description": "技能名称。",
+            "required": True,
+            "choices": [],
+        }
+    ]
+    assert fast["completions"] == [
+        {
+            "name": "mode",
+            "description": "快速模式选项。",
+            "required": False,
+            "choices": [
+                {"value": "normal", "description": "切换到普通模式。"},
+                {"value": "fast", "description": "切换到快速模式。"},
+                {"value": "status", "description": "显示快速模式状态。"},
+                {"value": "on", "description": "开启快速模式。"},
+                {"value": "off", "description": "关闭快速模式。"},
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_aops_help_uses_structured_required_flags_for_cron_history():
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/help"))
+
+    payload = json.loads(result)
+    cron = next(item for item in payload["items"] if item["fullCommand"] == "/cron")
+    history = next(child for child in cron["children"] if child["command"] == "history")
+    after = next(child for child in history["children"] if child["command"] == "after")
+    assert history["completions"] == [
+        {
+            "name": "id",
+            "description": "定时任务 ID。",
+            "required": True,
+            "choices": [],
+        },
+        {
+            "name": "tsMs",
+            "description": "历史锚点时间戳（毫秒）。",
+            "required": False,
+            "choices": [],
+        },
+    ]
+    assert after["completions"] == [
+        {
+            "name": "id",
+            "description": "定时任务 ID。",
+            "required": True,
+            "choices": [],
+        },
+        {
+            "name": "tsMs",
+            "description": "历史锚点时间戳（毫秒）。",
+            "required": True,
+            "choices": [],
+        },
+    ]
 
 
 @pytest.mark.asyncio

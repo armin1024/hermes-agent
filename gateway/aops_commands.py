@@ -17,7 +17,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 
 LOCAL_LIST_SCHEMA = "local-command-list.v1"
-HELP_TREE_SCHEMA = "local-command-tree.v1"
+HELP_TREE_SCHEMA = "local-command-tree.v2"
 
 _REMOVED_AOPS_COMMANDS = {"update", "debug"}
 _AOPS_NATIVE_COMMANDS = {
@@ -103,27 +103,110 @@ _DESCRIPTION_ZH = {
     "cron": "查看定时任务。",
 }
 
+def _choice(value: str, description: str) -> dict[str, str]:
+    return {"value": value, "description": description}
+
+
+def _param(
+    name: str,
+    description: str,
+    *,
+    required: bool = False,
+    choices: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": description,
+        "required": required,
+        "choices": choices or [],
+    }
+
+
 _USAGE_COMPLETIONS = {
-    "title": [{"name": "[name]", "description": "会话标题。可选。"}],
-    "branch": [{"name": "[name]", "description": "新分支会话名称。可选。"}],
-    "compress": [{"name": "[focus topic]", "description": "压缩时关注的话题。可选。"}],
-    "rollback": [{"name": "[number]", "description": "检查点编号。可选。"}],
-    "background": [{"name": "<prompt>", "description": "后台执行的提示内容。必填。"}],
-    "queue": [{"name": "<prompt>", "description": "排队到下一轮的提示内容。必填。"}],
-    "steer": [{"name": "<prompt>", "description": "下一次工具调用后注入的提示内容。必填。"}],
-    "resume": [{"name": "[name]", "description": "之前命名的会话名称。可选。"}],
+    "title": [_param("name", "会话标题。", required=False)],
+    "branch": [_param("name", "新分支会话名称。", required=False)],
+    "compress": [_param("focus", "压缩时关注的话题。", required=False)],
+    "rollback": [_param("number", "检查点编号。", required=False)],
+    "background": [_param("prompt", "后台执行的提示内容。", required=True)],
+    "queue": [_param("prompt", "排队到下一轮的提示内容。", required=True)],
+    "steer": [_param("prompt", "下一次工具调用后注入的提示内容。", required=True)],
+    "resume": [_param("name", "之前命名的会话名称。", required=False)],
     "model": [
-        {"name": "[model]", "description": "模型名称。可选。"},
-        {"name": "[--provider name]", "description": "provider 名称。可选。"},
-        {"name": "[--global]", "description": "是否将切换持久化为全局设置。可选。"},
+        _param("model", "模型名称。", required=False),
+        _param("provider", "provider 名称。", required=False),
+        _param("global", "是否将切换持久化为全局设置。", required=False),
     ],
-    "personality": [{"name": "[name]", "description": "人格名称。可选。"}],
-    "reasoning": [{"name": "[level|show|hide]", "description": "推理强度或显示选项。可选。"}],
-    "fast": [{"name": "[normal|fast|status]", "description": "快速模式选项。可选。"}],
-    "footer": [{"name": "[on|off|status]", "description": "页脚显示选项。可选。"}],
-    "voice": [{"name": "[on|off|tts|status]", "description": "语音模式选项。可选。"}],
-    "approve": [{"name": "[session|always]", "description": "审批范围。可选。"}],
-    "insights": [{"name": "[days]", "description": "统计天数。可选。"}],
+    "personality": [_param("name", "人格名称。", required=False)],
+    "reasoning": [
+        _param(
+            "option",
+            "推理强度或显示选项。",
+            required=False,
+            choices=[
+                _choice("none", "将推理强度设置为无。"),
+                _choice("minimal", "将推理强度设置为最小。"),
+                _choice("low", "将推理强度设置为低。"),
+                _choice("medium", "将推理强度设置为中。"),
+                _choice("high", "将推理强度设置为高。"),
+                _choice("xhigh", "将推理强度设置为超高。"),
+                _choice("show", "显示推理配置。"),
+                _choice("hide", "隐藏推理配置。"),
+                _choice("on", "开启推理配置显示。"),
+                _choice("off", "关闭推理配置显示。"),
+            ],
+        )
+    ],
+    "fast": [
+        _param(
+            "mode",
+            "快速模式选项。",
+            required=False,
+            choices=[
+                _choice("normal", "切换到普通模式。"),
+                _choice("fast", "切换到快速模式。"),
+                _choice("status", "显示快速模式状态。"),
+                _choice("on", "开启快速模式。"),
+                _choice("off", "关闭快速模式。"),
+            ],
+        )
+    ],
+    "footer": [
+        _param(
+            "mode",
+            "页脚显示选项。",
+            required=False,
+            choices=[
+                _choice("on", "开启最终回复页脚。"),
+                _choice("off", "关闭最终回复页脚。"),
+                _choice("status", "显示页脚状态。"),
+            ],
+        )
+    ],
+    "voice": [
+        _param(
+            "mode",
+            "语音模式选项。",
+            required=False,
+            choices=[
+                _choice("on", "开启语音模式。"),
+                _choice("off", "关闭语音模式。"),
+                _choice("tts", "切换到 TTS 语音模式。"),
+                _choice("status", "显示语音模式状态。"),
+            ],
+        )
+    ],
+    "approve": [
+        _param(
+            "scope",
+            "审批范围。",
+            required=False,
+            choices=[
+                _choice("session", "仅批准当前会话。"),
+                _choice("always", "始终批准同类命令。"),
+            ],
+        )
+    ],
+    "insights": [_param("days", "统计天数。", required=False)],
     "skills": [],
     "cron": [],
 }
@@ -170,7 +253,7 @@ class HelpNode:
     dangerous: bool
     usage: str
     executable: bool
-    completions: list[dict[str, str]]
+    completions: list[dict[str, Any]]
     children: list["HelpNode"]
 
     def to_dict(self) -> dict[str, Any]:
@@ -752,7 +835,7 @@ def _node(
     dangerous: bool,
     usage: str,
     executable: bool,
-    completions: list[dict[str, str]] | None = None,
+    completions: list[dict[str, Any]] | None = None,
     children: list[HelpNode] | None = None,
 ) -> HelpNode:
     return HelpNode(
@@ -781,22 +864,9 @@ def _build_official_nodes(config: Any) -> list[HelpNode]:
         if not _is_gateway_available(cmd, overrides):
             continue
         full_command = f"/{cmd.name}"
-        children: list[HelpNode] = []
         if cmd.name == "curator":
             continue
-        for sub in cmd.subcommands:
-            child_full = f"{full_command} {sub}"
-            children.append(
-                _node(
-                    type_=_command_category(cmd.category),
-                    command=sub,
-                    full_command=child_full,
-                    description=_SUBCOMMAND_DESCRIPTION_ZH.get((cmd.name, sub), f"{_DESCRIPTION_ZH[cmd.name]}（{sub}）"),
-                    dangerous=_dangerous(config, child_full),
-                    usage=child_full,
-                    executable=True,
-                )
-            )
+        children: list[HelpNode] = []
         nodes.append(
             _node(
                 type_=_command_category(cmd.category),
@@ -853,8 +923,8 @@ def _cron_node(config: Any) -> HelpNode:
         usage="/cron history <id> [tsMs]",
         executable=False,
         completions=[
-            {"name": "<id>", "description": "定时任务 ID。必填。"},
-            {"name": "[tsMs]", "description": "历史锚点时间戳（毫秒）。可选。"},
+            _param("id", "定时任务 ID。", required=True),
+            _param("tsMs", "历史锚点时间戳（毫秒）。", required=False),
         ],
         children=[
             _node(
@@ -866,8 +936,8 @@ def _cron_node(config: Any) -> HelpNode:
                 usage="/cron history before <id> [tsMs]",
                 executable=False,
                 completions=[
-                    {"name": "<id>", "description": "定时任务 ID。必填。"},
-                    {"name": "[tsMs]", "description": "历史锚点时间戳（毫秒）。可选。"},
+                    _param("id", "定时任务 ID。", required=True),
+                    _param("tsMs", "历史锚点时间戳（毫秒）。", required=False),
                 ],
             ),
             _node(
@@ -879,8 +949,8 @@ def _cron_node(config: Any) -> HelpNode:
                 usage="/cron history after <id> <tsMs>",
                 executable=False,
                 completions=[
-                    {"name": "<id>", "description": "定时任务 ID。必填。"},
-                    {"name": "<tsMs>", "description": "历史锚点时间戳（毫秒）。必填。"},
+                    _param("id", "定时任务 ID。", required=True),
+                    _param("tsMs", "历史锚点时间戳（毫秒）。", required=True),
                 ],
             ),
         ],
@@ -916,9 +986,9 @@ def _curator_node(config: Any) -> HelpNode:
         ("run", "/curator run", True, []),
         ("pause", "/curator pause", True, []),
         ("resume", "/curator resume", True, []),
-        ("pin", "/curator pin <skill>", False, [{"name": "<skill>", "description": "技能名称。必填。"}]),
-        ("unpin", "/curator unpin <skill>", False, [{"name": "<skill>", "description": "技能名称。必填。"}]),
-        ("restore", "/curator restore <skill>", False, [{"name": "<skill>", "description": "技能名称。必填。"}]),
+        ("pin", "/curator pin <skill>", False, [_param("skill", "技能名称。", required=True)]),
+        ("unpin", "/curator unpin <skill>", False, [_param("skill", "技能名称。", required=True)]),
+        ("restore", "/curator restore <skill>", False, [_param("skill", "技能名称。", required=True)]),
     ]:
         child_full = f"{full_command} {sub}"
         children.append(

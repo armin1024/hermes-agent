@@ -55,7 +55,7 @@ if [[ "$ARCH_SUFFIX" == "$(basename "$BASE_BUNDLE")" ]]; then
 fi
 
 BUNDLE_DIR="$WORK_DIR/$TOP_LEVEL"
-TARGET_NAME="offline-bundle-v${VERSION}-aops"
+TARGET_NAME="offline-bundle-v${VERSION}-aops-${GIT_SHA}"
 if [[ "$(basename "$BASE_BUNDLE")" =~ linux-x86_64 ]]; then
   OUTPUT_NAME="hermes-aops-offline-bundle-v${VERSION}-${GIT_SHA}-linux-x86_64.tar.gz"
 else
@@ -74,6 +74,8 @@ mkdir -p "$BUNDLE_DIR/overlay" "$BUNDLE_DIR/examples"
 
 RUNTIME_FILES=(
   "agent/prompt_builder.py"
+  "cron/__init__.py"
+  "cron/jobs.py"
   "cron/scheduler.py"
   "gateway/aops_commands.py"
   "gateway/config.py"
@@ -107,6 +109,7 @@ for rel in "${RUNTIME_FILES[@]}"; do
 done
 
 python3 "$SCRIPT_DIR/web_dist_overlay.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
+python3 "$SCRIPT_DIR/verify_overlay_imports.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
 
 cat > "$BUNDLE_DIR/examples/config.aops.example.yaml" <<'EOF'
 platforms:
@@ -150,22 +153,13 @@ EOF
 cp "$SCRIPT_DIR/install_aops_offline.sh" "$BUNDLE_DIR/install.sh"
 chmod +x "$BUNDLE_DIR/install.sh"
 
-python3 - <<'PY' "$BUNDLE_DIR" "$SCRIPT_DIR/README_aops_bundle.md"
-from pathlib import Path
-import sys
-
-bundle_dir = Path(sys.argv[1])
-template = Path(sys.argv[2]).read_text(encoding="utf-8")
-version = None
-for line in bundle_dir.joinpath("overlay.manifest").read_text(encoding="utf-8").splitlines():
-    if line == "gateway/platforms/aops.py":
-        version = "AOPS overlay"
-        break
-if version is None:
-    version = "offline overlay"
-readme = template.replace("__BUNDLE_NAME__", bundle_dir.name)
-bundle_dir.joinpath("README.md").write_text(readme, encoding="utf-8")
-PY
+python3 "$SCRIPT_DIR/render_bundle_readme.py" \
+  "$SCRIPT_DIR/README_aops_bundle.md" \
+  "$BUNDLE_DIR/README.md" \
+  "$OUTPUT_NAME" \
+  "$TARGET_NAME" \
+  "$VERSION" \
+  "$GIT_SHA"
 
 # Final sweep so the output tarball cannot contain AppleDouble debris.
 find "$BUNDLE_DIR" \( -name '._*' -o -name '__MACOSX' \) -exec rm -rf {} +

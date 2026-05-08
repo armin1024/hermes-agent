@@ -2,6 +2,13 @@
 
 这个离线包以官方 `offline bundle` 为底包，额外叠加了当前仓库里的 AOPS channel 改动，适合 Linux x86_64 内网环境。
 
+## 版本信息
+
+- Hermes 版本：`__VERSION__`
+- Overlay 提交：`__GIT_SHA__`
+- 离线包文件：`__BUNDLE_ARCHIVE__`
+- 解压目录：`__BUNDLE_DIR__`
+
 ## 包含内容
 
 - Hermes Agent 基础离线依赖
@@ -13,8 +20,8 @@
 ## 快速安装
 
 ```bash
-tar -xzf __BUNDLE_NAME__.tar.gz
-cd __BUNDLE_NAME__
+tar -xzf __BUNDLE_ARCHIVE__
+cd __BUNDLE_DIR__
 bash install.sh --link --init-config
 ```
 
