@@ -1119,6 +1119,8 @@ class TestRunJobSessionPersistence:
         assert history_mock.call_args.kwargs["success"] is True
         assert history_mock.call_args.kwargs["output_file"] == "/tmp/out.md"
         assert history_mock.call_args.kwargs["final_response"] == "done"
+        assert history_mock.call_args.kwargs["started_at"] is not None
+        assert history_mock.call_args.kwargs["finished_at"] is not None
 
     def test_tick_records_history_after_processing_exception(self, tmp_path):
         from cron.scheduler import tick
@@ -1149,6 +1151,8 @@ class TestRunJobSessionPersistence:
         assert history_mock.call_args.args[0]["id"] == "history-fail-job"
         assert history_mock.call_args.kwargs["success"] is False
         assert "disk full" in history_mock.call_args.kwargs["error"]
+        assert history_mock.call_args.kwargs["started_at"] is not None
+        assert history_mock.call_args.kwargs["finished_at"] is not None
 
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {

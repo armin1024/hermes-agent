@@ -448,6 +448,18 @@ def _truncate_history_preview(text: Optional[str], limit: int = 280) -> Optional
     return compact[: limit - 1].rstrip() + "…"
 
 
+def _duration_ms(started_at: Optional[str], finished_at: Optional[str]) -> Optional[int]:
+    if not started_at or not finished_at:
+        return None
+    try:
+        started = datetime.fromisoformat(started_at)
+        finished = datetime.fromisoformat(finished_at)
+    except ValueError:
+        return None
+    duration = int((finished - started).total_seconds() * 1000)
+    return duration if duration >= 0 else None
+
+
 def append_cron_history(entry: Dict[str, Any]) -> Dict[str, Any]:
     """Append one structured cron history entry to the JSONL log."""
     ensure_dirs()
@@ -492,12 +504,14 @@ def record_job_history(
         {
             "job_id": job.get("id"),
             "job_name": job.get("name"),
+            "job_description": _truncate_history_preview(job.get("description") or job.get("prompt"), limit=160),
             "status": status,
             "success": success,
             "schedule_kind": schedule_kind,
             "deliver": deliver,
             "started_at": started_at,
             "finished_at": finished_ts,
+            "duration_ms": _duration_ms(started_at, finished_ts),
             "scheduled_for": job.get("next_run_at"),
             "last_run_at": job.get("last_run_at"),
             "output_file": output_path,

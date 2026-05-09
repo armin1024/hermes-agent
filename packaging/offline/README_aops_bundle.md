@@ -17,6 +17,46 @@
 - AOPS 示例配置
 - 一键安装脚本
 
+## 本次升级点
+
+- `/help` 已升级为 `local-command-tree.v2`
+  - `usage` 仅用于展示
+  - 参数必填判断看 `completions[].required`
+  - 静态枚举候选看 `completions[].choices`
+- `/cron` 与 `/cron history` 已补齐更多任务元数据
+  - `description`
+  - `lastDurationMs`
+  - `durationMs`
+- 离线包目录名和归档文件名都带版本号与提交号，便于内网留档和回滚
+
+## 前端二次确认配置
+
+如果前端会根据 `/help` 返回中的 `dangerous: true` 做二次确认，可以在 AOPS 配置里声明需要确认的命令。
+
+`config.yaml` 示例：
+
+```yaml
+platforms:
+  aops:
+    extra:
+      dangerous_commands:
+        - /skills
+        - /curator run
+        - /curator restore
+```
+
+环境变量示例：
+
+```bash
+AOPS_DANGEROUS_COMMANDS="/skills,/curator run,/curator restore"
+```
+
+配置后：
+
+- `/help` 对应命令节点会返回 `dangerous: true`
+- 前端可在执行前弹二次确认
+- 未配置的命令返回 `dangerous: false`
+
 ## 快速安装
 
 ```bash

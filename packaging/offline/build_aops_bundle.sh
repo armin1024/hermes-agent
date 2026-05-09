@@ -129,7 +129,7 @@ platforms:
       push_tool_calls: true
       dm_policy: open
       allow_from: ["user-001"]
-      dangerous_commands: ["/curator run", "/curator restore"]
+      dangerous_commands: ["/skills", "/curator run", "/curator restore"]
       trusted_agent_key_from: ["*"]
       agent_routes:
         main:
@@ -150,7 +150,7 @@ AOPS_PUSH_TOOL_CALLS=true
 AOPS_DM_POLICY=open
 AOPS_ALLOW_FROM=user-001
 AOPS_TRUSTED_AGENT_KEY_FROM=*
-AOPS_DANGEROUS_COMMANDS="/curator run,/curator restore"
+AOPS_DANGEROUS_COMMANDS="/skills,/curator run,/curator restore"
 CLAWHUB_REGISTRY=http://clawhub.ai
 EOF
 

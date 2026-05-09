@@ -458,6 +458,36 @@ def _to_ms(value: Any) -> Optional[int]:
     return int(dt.timestamp() * 1000)
 
 
+def _duration_ms(started_at: Any, finished_at: Any) -> Optional[int]:
+    started = str(started_at or "").strip()
+    finished = str(finished_at or "").strip()
+    if not started or not finished:
+        return None
+    try:
+        started_dt = datetime.fromisoformat(started)
+        finished_dt = datetime.fromisoformat(finished)
+    except ValueError:
+        return None
+    delta_ms = int((finished_dt - started_dt).total_seconds() * 1000)
+    return delta_ms if delta_ms >= 0 else None
+
+
+def _compact_text(value: Any, *, limit: int = 160) -> Optional[str]:
+    raw = " ".join(str(value or "").split()).strip()
+    if not raw:
+        return None
+    if len(raw) <= limit:
+        return raw
+    return raw[: limit - 1].rstrip() + "…"
+
+
+def _job_description(job: dict[str, Any]) -> Optional[str]:
+    explicit = _compact_text(job.get("description"))
+    if explicit:
+        return explicit
+    return _compact_text(job.get("prompt"))
+
+
 def _status_to_delivery(status: str | None, delivery_error: str | None, delivered: Optional[bool]) -> str:
     if delivered is True:
         return "delivered"
@@ -510,6 +540,8 @@ def _cron_items() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
     enabled = 0
     disabled = 0
     for job in jobs:
+        latest_history = cron_jobs.get_job_history(str(job.get("id")), limit=1)
+        latest_entry = latest_history[0] if latest_history else {}
         state = str(job.get("state") or "").lower()
         is_enabled = bool(job.get("enabled", True))
         enabled += 1 if is_enabled else 0
@@ -519,7 +551,7 @@ def _cron_items() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
             {
                 "id": job.get("id"),
                 "name": job.get("name") or job.get("id"),
-                "description": None,
+                "description": _job_description(job),
                 "enabled": is_enabled,
                 "agentId": None,
                 "sessionKey": None,
@@ -545,13 +577,24 @@ def _cron_items() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
                 "lastRunStatus": job.get("last_status"),
                 "lastError": job.get("last_error"),
                 "lastErrorReason": None,
-                "lastDurationMs": None,
+                "lastDurationMs": (
+                    latest_entry.get("duration_ms")
+                    or _duration_ms(latest_entry.get("started_at"), latest_entry.get("finished_at"))
+                ),
                 "consecutiveErrors": None,
                 "lastFailureAlertAtMs": None,
                 "scheduleErrorCount": None,
-                "lastDeliveryStatus": _status_to_delivery(job.get("last_status"), job.get("last_delivery_error"), None),
+                "lastDeliveryStatus": _status_to_delivery(
+                    job.get("last_status"),
+                    job.get("last_delivery_error") or latest_entry.get("delivery_error"),
+                    None if latest_entry.get("silent") else (False if latest_entry.get("delivery_error") else None),
+                ),
                 "lastDeliveryError": job.get("last_delivery_error"),
-                "lastDelivered": None if not job.get("last_delivery_error") else False,
+                "lastDelivered": (
+                    None
+                    if latest_entry.get("silent")
+                    else (False if (job.get("last_delivery_error") or latest_entry.get("delivery_error")) else None)
+                ),
                 "deliveryText": job.get("deliver"),
                 "failureAlertText": None,
                 "state": state or ("scheduled" if is_enabled else "disabled"),
@@ -572,6 +615,7 @@ def _history_summary_item(job: dict[str, Any] | None) -> dict[str, Any] | None:
     return {
         "id": job.get("id"),
         "name": job.get("name"),
+        "description": _job_description(job),
         "enabled": job.get("enabled"),
         "state": job.get("state"),
         "scheduleText": job.get("schedule_display") or schedule.get("display"),
@@ -689,6 +733,7 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
             {
                 "ts": ts,
                 "jobId": entry.get("job_id"),
+                "description": entry.get("job_description") or _job_description(job),
                 "action": "finished",
                 "status": status,
                 "error": entry.get("error"),
@@ -699,7 +744,7 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
                 "sessionId": None,
                 "sessionKey": None,
                 "runAtMs": _to_ms(entry.get("started_at") or entry.get("timestamp")),
-                "durationMs": None,
+                "durationMs": entry.get("duration_ms") or _duration_ms(entry.get("started_at"), entry.get("finished_at")),
                 "nextRunAtMs": _to_ms(entry.get("scheduled_for")),
                 "model": job.get("model"),
                 "provider": job.get("provider"),

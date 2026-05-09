@@ -730,12 +730,15 @@ class TestCronHistory:
             success=True,
             output_file=tmp_cron_dir / "cron" / "output" / "monitor.md",
             final_response="Fresh metrics are available.",
+            started_at="2026-05-08T09:58:00+00:00",
             finished_at="2026-05-08T10:00:00+00:00",
         )
 
         assert cron_jobs.HISTORY_FILE.exists()
         assert entry["job_id"] == job["id"]
         assert entry["status"] == "ok"
+        assert entry["job_description"] == "monitor"
+        assert entry["duration_ms"] == 120000
         assert entry["response_preview"] == "Fresh metrics are available."
 
         history = get_job_history(job["id"])

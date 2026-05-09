@@ -662,8 +662,20 @@ async def test_aops_cron_local_command_returns_document_fields(monkeypatch, tmp_
 
     monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
     monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
     job = cron_jobs.create_job(prompt="Daily report", schedule="every 1h", name="Daily report")
+    cron_jobs.append_cron_history(
+        {
+            "job_id": job["id"],
+            "job_name": job["name"],
+            "job_description": "Daily report",
+            "status": "ok",
+            "started_at": "2026-05-08T09:00:00+00:00",
+            "finished_at": "2026-05-08T09:01:30+00:00",
+            "duration_ms": 90000,
+        }
+    )
 
     runner = _make_runner(extra={"dm_policy": "open"})
 
@@ -674,10 +686,12 @@ async def test_aops_cron_local_command_returns_document_fields(monkeypatch, tmp_
     assert payload["schemaVersion"] == "local-command-list.v1"
     assert payload["type"] == "cron.list"
     assert item["id"] == job["id"]
+    assert item["description"] == "Daily report"
     assert item["createdAtMs"] is not None
     assert item["updatedAtMs"] is not None
     assert item["scheduleText"] == "every 60m"
     assert item["payloadKind"] == "agentTurn"
+    assert item["lastDurationMs"] == 90000
     assert item["lastDeliveryStatus"] == "not-requested"
 
 
@@ -694,9 +708,11 @@ async def test_aops_cron_history_returns_structured_list(monkeypatch, tmp_path):
         {
             "job_id": job["id"],
             "job_name": job["name"],
+            "job_description": "Daily report",
             "status": "ok",
             "started_at": "2026-05-08T09:00:00+00:00",
             "finished_at": "2026-05-08T09:01:00+00:00",
+            "duration_ms": 60000,
             "response_preview": "报告已生成",
         }
     )
@@ -710,8 +726,11 @@ async def test_aops_cron_history_returns_structured_list(monkeypatch, tmp_path):
     assert payload["itemType"] == "cron.run"
     assert payload["context"]["jobId"] == job["id"]
     assert payload["summary"]["task"]["id"] == job["id"]
+    assert payload["summary"]["task"]["description"] == "Daily report"
     assert payload["items"][0]["jobId"] == job["id"]
+    assert payload["items"][0]["description"] == "Daily report"
     assert payload["items"][0]["summary"] == "报告已生成"
+    assert payload["items"][0]["durationMs"] == 60000
 
 
 @pytest.mark.asyncio

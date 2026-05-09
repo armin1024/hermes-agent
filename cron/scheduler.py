@@ -1330,8 +1330,10 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
+            started_at = _hermes_now().isoformat()
             try:
                 success, output, final_response, error = run_job(job)
+                finished_at = _hermes_now().isoformat()
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:
@@ -1370,6 +1372,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         error=error,
                         delivery_error=delivery_error,
                         final_response=final_response,
+                        started_at=started_at,
+                        finished_at=finished_at,
                         silent=not should_deliver,
                     )
                 except Exception as history_exc:
@@ -1381,10 +1385,17 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 return True
 
             except Exception as e:
+                finished_at = _hermes_now().isoformat()
                 logger.error("Error processing job %s: %s", job['id'], e)
                 mark_job_run(job["id"], False, str(e))
                 try:
-                    record_job_history(job, success=False, error=str(e))
+                    record_job_history(
+                        job,
+                        success=False,
+                        error=str(e),
+                        started_at=started_at,
+                        finished_at=finished_at,
+                    )
                 except Exception as history_exc:
                     logger.warning(
                         "Failed to record cron history for failed job %s: %s",
