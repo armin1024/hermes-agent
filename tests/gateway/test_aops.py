@@ -626,6 +626,7 @@ def test_aops_dm_policy_auth_open_allowlist_pairing_disabled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path):
+    import agent.skill_commands as skill_commands
     import tools.skills_tool as skills_tool
 
     skills_root = tmp_path / "skills"
@@ -640,7 +641,29 @@ async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path
         "# Restart Service\n",
         encoding="utf-8",
     )
+    other_dir = skills_root / "ops" / "draft-notes"
+    other_dir.mkdir(parents=True)
+    (other_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: Draft Notes\n"
+        "description: Draft notes quickly.\n"
+        "---\n"
+        "# Draft Notes\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
+    monkeypatch.setattr(
+        skill_commands,
+        "get_skill_commands",
+        lambda: {
+            "/restart-service": {
+                "name": "Restart Service",
+                "description": "Restart a service safely.",
+                "skill_md_path": str(skill_dir / "SKILL.md"),
+                "skill_dir": str(skill_dir),
+            }
+        },
+    )
 
     runner = _make_runner(extra={"dm_policy": "open"})
 
@@ -650,10 +673,13 @@ async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path
     assert payload["schemaVersion"] == "local-command-list.v1"
     assert payload["type"] == "skills.list"
     assert payload["itemType"] == "skill"
-    assert payload["count"] == 1
-    assert payload["items"][0]["id"] == "ops/restart-service"
-    assert payload["items"][0]["name"] == "Restart Service"
-    assert payload["items"][0]["homepage"] == "https://example.com/restart-service"
+    assert payload["count"] == 2
+    items_by_id = {item["id"]: item for item in payload["items"]}
+    assert items_by_id["ops/restart-service"]["name"] == "Restart Service"
+    assert items_by_id["ops/restart-service"]["homepage"] == "https://example.com/restart-service"
+    assert items_by_id["ops/restart-service"]["command"] == "/restart-service"
+    assert items_by_id["ops/draft-notes"]["name"] == "Draft Notes"
+    assert items_by_id["ops/draft-notes"]["command"] is None
 
 
 @pytest.mark.asyncio
@@ -866,6 +892,24 @@ async def test_aops_curator_is_handled_natively(monkeypatch):
     result = await runner._handle_message(_make_aops_event("/curator status"))
 
     assert result == "curator status"
+
+
+@pytest.mark.asyncio
+async def test_aops_curator_invalid_subcommand_reaches_native_handler(monkeypatch):
+    from gateway import aops_commands
+
+    monkeypatch.setattr(
+        aops_commands,
+        "run_curator_command",
+        lambda raw_args: (2, f"usage: hermes curator\nerror: invalid choice: '{raw_args}'"),
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/curator test"))
+
+    assert "not supported on AOPS" not in result
+    assert "invalid choice" in result
+    assert "(exit 2)" in result
 
 
 def test_clawhub_base_url_uses_registry_env(monkeypatch):

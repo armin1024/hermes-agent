@@ -388,15 +388,7 @@ def _is_supported_custom_shape(canonical: str, raw_args: str) -> bool:
             return len(args) in {3, 4}
         return len(args) in {2, 3}
     if canonical == "curator":
-        if not args:
-            return True
-        if args[0] not in {"status", "run", "pause", "resume", "pin", "unpin", "restore"}:
-            return False
-        if args[0] == "run":
-            return args in (["run"], ["run", "--sync"], ["run", "--synchronous"])
-        if args[0] in {"status", "pause", "resume"}:
-            return len(args) == 1
-        return len(args) == 2
+        return True
     return False
 
 
@@ -501,11 +493,20 @@ def _status_to_delivery(status: str | None, delivery_error: str | None, delivere
 
 
 def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    from agent.skill_commands import get_skill_commands
     from agent.skill_utils import iter_skill_index_files
     from tools.skills_tool import SKILLS_DIR, _parse_frontmatter
 
     skills_root = SKILLS_DIR
     items: list[dict[str, Any]] = []
+    command_by_path: dict[str, str] = {}
+    try:
+        for command, info in get_skill_commands().items():
+            skill_md_path = str(info.get("skill_md_path") or "").strip()
+            if skill_md_path:
+                command_by_path[str(Path(skill_md_path).resolve())] = command
+    except Exception:
+        command_by_path = {}
     if skills_root.exists():
         for skill_md in iter_skill_index_files(skills_root, "SKILL.md"):
             parts = set(skill_md.parts)
@@ -524,6 +525,7 @@ def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     "name": name,
                     "description": frontmatter.get("description") or None,
                     "homepage": frontmatter.get("homepage") or frontmatter.get("url") or None,
+                    "command": command_by_path.get(str(skill_md.resolve())),
                     "path": str(skill_md),
                 }
             )
