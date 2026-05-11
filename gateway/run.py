@@ -6477,19 +6477,24 @@ class GatewayRunner:
         if event.source.platform == Platform.AOPS:
             from gateway import aops_commands as _aops_commands
 
-            entries = _aops_commands.filter_help_lines(entries, self.config)
-            entries = ["🧰 **AOPS Local Commands**", *_aops_commands.aops_text_command_lines(), "", *entries]
-        try:
-            from agent.skill_commands import get_skill_commands
-            skill_cmds = get_skill_commands()
-            if skill_cmds:
-                entries.append("")
-                entries.append("⚡ **Skill Commands**:")
-                for cmd in sorted(skill_cmds):
-                    desc = skill_cmds[cmd].get("description", "").strip() or "Skill command"
-                    entries.append(f"`{cmd}` — {desc}")
-        except Exception:
-            pass
+            filtered_entries = _aops_commands.filter_help_lines(entries, self.config)
+            entries = ["🧰 **AOPS Local Commands**", *_aops_commands.aops_text_command_lines(), ""]
+            skill_entries = _aops_commands.aops_skill_command_lines(self.config)
+            if skill_entries:
+                entries.extend(["⚡ **Skill Commands**:", *skill_entries, ""])
+            entries.extend(filtered_entries)
+        else:
+            try:
+                from agent.skill_commands import get_skill_commands
+                skill_cmds = get_skill_commands()
+                if skill_cmds:
+                    entries.append("")
+                    entries.append("⚡ **Skill Commands**:")
+                    for cmd in sorted(skill_cmds):
+                        desc = skill_cmds[cmd].get("description", "").strip() or "Skill command"
+                        entries.append(f"`{cmd}` — {desc}")
+            except Exception:
+                pass
 
         if not entries:
             return "No commands available."

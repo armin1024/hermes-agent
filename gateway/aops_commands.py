@@ -373,6 +373,28 @@ def _tokens(raw_args: str) -> list[str]:
         return raw_args.split()
 
 
+def _aops_skill_commands(config: Any) -> dict[str, dict[str, Any]]:
+    try:
+        from agent.skill_commands import get_skill_commands
+        from agent.skill_utils import get_disabled_skill_names
+    except Exception:
+        return {}
+
+    blocked = blocked_commands(config)
+    platform_disabled = get_disabled_skill_names(platform=Platform.AOPS.value)
+    commands: dict[str, dict[str, Any]] = {}
+    for cmd_key, info in get_skill_commands().items():
+        normalized_key = str(cmd_key or "").strip().lower().replace("_", "-")
+        if not normalized_key.startswith("/"):
+            normalized_key = f"/{normalized_key.lstrip('/')}"
+        if normalized_key in blocked:
+            continue
+        if str(info.get("name") or "").strip() in platform_disabled:
+            continue
+        commands[normalized_key] = info
+    return commands
+
+
 def _is_supported_custom_shape(canonical: str, raw_args: str) -> bool:
     args = _tokens(raw_args)
     if canonical == "skills":
@@ -398,6 +420,13 @@ def is_supported_command(command: str | None, raw_args: str = "", canonical: str
         return False
     if normalized in {"skills", "cron", "curator"}:
         return _is_supported_custom_shape(normalized, raw_args)
+    try:
+        from agent.skill_commands import resolve_skill_command_key
+
+        if resolve_skill_command_key(normalized) is not None:
+            return True
+    except Exception:
+        pass
     return normalized in _AOPS_NATIVE_COMMANDS and normalized not in _REMOVED_AOPS_COMMANDS
 
 
@@ -930,6 +959,24 @@ def _build_official_nodes(config: Any) -> list[HelpNode]:
     return nodes
 
 
+def _skill_command_nodes(config: Any) -> list[HelpNode]:
+    nodes: list[HelpNode] = []
+    for cmd_key, info in sorted(_aops_skill_commands(config).items()):
+        description = str(info.get("description") or "").strip() or f"Invoke the {info.get('name') or cmd_key} skill"
+        nodes.append(
+            _node(
+                type_="tools",
+                command=cmd_key,
+                full_command=cmd_key,
+                description=description,
+                dangerous=_dangerous(config, cmd_key),
+                usage=f"{cmd_key} [prompt]",
+                executable=True,
+            )
+        )
+    return nodes
+
+
 def _skills_node(config: Any) -> HelpNode:
     full_command = "/skills"
     child_full = "/skills list"
@@ -1082,6 +1129,7 @@ def help_tree_response(config: Any) -> str:
     nodes.append(_cron_node(config))
     nodes = [node for node in nodes if node.full_command != "/curator"]
     nodes.append(_curator_node(config))
+    nodes.extend(_skill_command_nodes(config))
     top_level_count = len(nodes)
     total_count, executable_count, dangerous_count = _count_nodes(nodes)
     payload = {
@@ -1135,6 +1183,23 @@ def aops_text_command_lines() -> list[str]:
         "`/cron history before <id> [tsMs]` -- Show cron history before an anchor",
         "`/cron history after <id> <tsMs>` -- Show cron history after an anchor",
     ]
+
+
+def aops_skill_command_lines(config: Any) -> list[str]:
+    lines: list[str] = []
+    for cmd_key, info in sorted(_aops_skill_commands(config).items()):
+        description = str(info.get("description") or "").strip() or "Skill command"
+        lines.append(f"`{cmd_key}` -- {description}")
+    return lines
+
+
+def is_cli_bridge_command(command: str | None) -> bool:
+    return False
+
+
+async def run_cli_bridge(event: MessageEvent, config: Any) -> str:
+    del event, config
+    return unsupported_message("hermes")
 
 
 def run_curator_command(raw_args: str) -> tuple[int, str]:

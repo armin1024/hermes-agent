@@ -777,25 +777,46 @@ async def test_aops_blocked_command_is_rejected_and_hidden_from_help():
 
 @pytest.mark.asyncio
 async def test_aops_help_returns_structured_tree_with_dangerous_flag():
+    import agent.skill_commands as skill_commands
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        skill_commands,
+        "get_skill_commands",
+        lambda: {
+            "/test-skill": {
+                "name": "Test Skill",
+                "description": "Run the test skill",
+                "skill_md_path": "/tmp/test-skill/SKILL.md",
+            }
+        },
+    )
     runner = _make_runner(
         extra={
             "dm_policy": "open",
-            "dangerous_commands": ["/curator run"],
+            "dangerous_commands": ["/curator run", "/test-skill"],
         }
     )
 
-    result = await runner._handle_message(_make_aops_event("/help"))
+    try:
+        result = await runner._handle_message(_make_aops_event("/help"))
+    finally:
+        monkeypatch.undo()
 
     payload = json.loads(result)
     assert payload["schemaVersion"] == "local-command-tree.v2"
     assert payload["type"] == "command.tree"
     curator = next(item for item in payload["items"] if item["fullCommand"] == "/curator")
     fast = next(item for item in payload["items"] if item["fullCommand"] == "/fast")
+    skill = next(item for item in payload["items"] if item["fullCommand"] == "/test-skill")
     run_child = next(child for child in curator["children"] if child["command"] == "run")
     pin_child = next(child for child in curator["children"] if child["command"] == "pin")
     assert curator["executable"] is False
     assert run_child["dangerous"] is True
     assert run_child["executable"] is True
+    assert skill["dangerous"] is True
+    assert skill["usage"] == "/test-skill [prompt]"
+    assert skill["executable"] is True
     assert pin_child["executable"] is False
     assert pin_child["completions"] == [
         {
@@ -873,13 +894,87 @@ async def test_aops_cli_only_command_is_rejected():
 
 @pytest.mark.asyncio
 async def test_aops_commands_text_hides_removed_commands_and_lists_custom():
-    runner = _make_runner(extra={"dm_policy": "open"})
+    import agent.skill_commands as skill_commands
+    import agent.skill_utils as skill_utils
 
-    result = await runner._handle_message(_make_aops_event("/commands"))
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        skill_commands,
+        "get_skill_commands",
+        lambda: {
+            "/alpha-skill": {
+                "name": "Alpha Skill",
+                "description": "Alpha description",
+                "skill_md_path": "/tmp/alpha/SKILL.md",
+            },
+            "/blocked-skill": {
+                "name": "Blocked Skill",
+                "description": "Blocked description",
+                "skill_md_path": "/tmp/blocked/SKILL.md",
+            },
+            "/disabled-skill": {
+                "name": "Disabled Skill",
+                "description": "Disabled description",
+                "skill_md_path": "/tmp/disabled/SKILL.md",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        skill_utils,
+        "get_disabled_skill_names",
+        lambda platform=None: {"Disabled Skill"} if platform == "aops" else set(),
+    )
+    runner = _make_runner(extra={"dm_policy": "open", "blocked_commands": ["/blocked-skill"]})
+
+    try:
+        result = await runner._handle_message(_make_aops_event("/commands"))
+    finally:
+        monkeypatch.undo()
 
     assert "/update" not in result
     assert "/debug" not in result
     assert "/cron history <id> [tsMs]" in result
+    assert "⚡ **Skill Commands**:" in result
+    assert "`/alpha-skill` -- Alpha description" in result
+    assert "/blocked-skill" not in result
+    assert "/disabled-skill" not in result
+
+
+@pytest.mark.asyncio
+async def test_aops_dynamic_skill_command_is_supported_and_invokes_agent(monkeypatch):
+    import agent.skill_commands as skill_commands
+
+    monkeypatch.setattr(
+        skill_commands,
+        "get_skill_commands",
+        lambda: {
+            "/test-skill": {
+                "name": "Test Skill",
+                "description": "Run the test skill",
+                "skill_md_path": "/tmp/test-skill/SKILL.md",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        skill_commands,
+        "resolve_skill_command_key",
+        lambda command: "/test-skill" if str(command).replace("_", "-") == "test-skill" else None,
+    )
+    monkeypatch.setattr(
+        skill_commands,
+        "build_skill_invocation_message",
+        lambda cmd_key, user_instruction, task_id=None: f"skill:{cmd_key}::{user_instruction}",
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    async def _capture(event, source, quick_key, run_generation):
+        return event.text
+
+    runner._handle_message_with_agent = _capture
+
+    result = await runner._handle_message(_make_aops_event("/test-skill do the thing"))
+
+    assert result == "skill:/test-skill::do the thing"
 
 
 @pytest.mark.asyncio
