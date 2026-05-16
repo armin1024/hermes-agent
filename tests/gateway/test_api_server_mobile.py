@@ -222,6 +222,61 @@ class TestMobileBootstrapAndEvents:
             events.close()
 
     @pytest.mark.asyncio
+    async def test_mobile_agent_history_ignores_other_users_stale_group_tasks(self):
+        adapter = _make_adapter()
+        captured_history = []
+
+        async def fake_run_agent(**kwargs):
+            captured_history.extend(kwargs["conversation_history"])
+            kwargs["stream_delta_callback"]("我是 Hermes Agent")
+            return {"final_response": "我是 Hermes Agent"}, {}
+
+        adapter._run_agent = AsyncMock(side_effect=fake_run_agent)
+        app = _create_mobile_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            sender = await _register(cli, await _create_pairing(cli), "ios-current", "Current")
+            other = await _register(cli, await _create_pairing(cli), "ios-other", "Other")
+            headers = {"Authorization": f"Bearer {sender['device_token']}"}
+
+            adapter._mobile_store.create_message(
+                conversation_id=DEFAULT_GROUP_ID,
+                sender_id=other["device_id"],
+                text="今天成都天气怎么样？",
+            )
+            adapter._mobile_store.create_message(
+                conversation_id=DEFAULT_GROUP_ID,
+                sender_id="hermes",
+                text="今天成都天气不错。",
+                kind="assistant",
+                status="completed",
+            )
+            adapter._mobile_store.create_message(
+                conversation_id=DEFAULT_GROUP_ID,
+                sender_id=sender["device_id"],
+                text="你好",
+            )
+            adapter._mobile_store.create_message(
+                conversation_id=DEFAULT_GROUP_ID,
+                sender_id="hermes",
+                text="你好，我是 Hermes Agent。",
+                kind="assistant",
+                status="completed",
+            )
+
+            send = await cli.post(
+                f"/api/mobile/conversations/{DEFAULT_GROUP_ID}/messages",
+                json={"text": "你是谁", "invoke_hermes": True},
+                headers=headers,
+            )
+            assert send.status == 202
+            await asyncio.sleep(0.1)
+
+        history_text = "\n".join(item["content"] for item in captured_history)
+        assert "成都天气" not in history_text
+        assert "天气不错" not in history_text
+        assert "你好" in history_text
+
+    @pytest.mark.asyncio
     async def test_forward_receipts_mark_online_and_offline_recipients(self):
         adapter = _make_adapter()
         async def fake_run_agent(**kwargs):

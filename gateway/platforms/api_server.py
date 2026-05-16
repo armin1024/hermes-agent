@@ -69,7 +69,10 @@ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 MOBILE_AGENT_SYSTEM_PROMPT = (
     "You are Hermes Agent inside an iOS chat client. Reply as concise chat text. "
+    "Always answer the latest user_message directly; use conversation_history only as optional background, "
+    "and ignore unrelated older tasks from other users or previous topics. "
     "Do not call tools for greetings, acknowledgements, registration checks, or explicit reply-exactly requests. "
+    "For identity questions, say that you are Hermes Agent in this iOS chat. "
     "Only call tools when the user clearly asks you to fetch external information, inspect files, or perform an action. "
     "If the user asks you to forward a message, summarize the intended delivery in text; the mobile gateway records receipts separately."
 )
@@ -3366,15 +3369,44 @@ class APIServerAdapter(BasePlatformAdapter):
             except asyncio.QueueFull:
                 logger.debug("[api_server] mobile SSE subscriber queue full for %s", conversation_id)
 
-    def _mobile_conversation_history(self, conversation_id: str, current_message_id: str, limit: int = 12) -> List[Dict[str, str]]:
-        """Build a small explicit mobile chat history without reusing agent session state."""
+    def _mobile_conversation_history(
+        self,
+        conversation_id: str,
+        current_message_id: str,
+        *,
+        sender_device_id: str,
+        trigger_message_id: Optional[str] = None,
+        limit: int = 8,
+    ) -> List[Dict[str, str]]:
+        """Build scoped mobile chat history without reusing agent session state.
+
+        The default mobile room is a group conversation, so blindly feeding every
+        recent message to Hermes makes it answer stale requests from other users.
+        Keep only the triggering device's prior turns plus Hermes replies that
+        followed those turns.
+        """
         history: List[Dict[str, str]] = []
-        for message in self._mobile_store.recent_messages(conversation_id, limit=limit + 1):
-            if message.get("message_id") == current_message_id:
+        excluded_ids = {current_message_id}
+        if trigger_message_id:
+            excluded_ids.add(trigger_message_id)
+        last_user_sender_id: Optional[str] = None
+        lookback = max(limit * 4, 24)
+        for message in self._mobile_store.recent_messages(conversation_id, limit=lookback):
+            if message.get("message_id") in excluded_ids:
                 continue
-            role = "assistant" if message.get("sender_id") == "hermes" or message.get("kind") == "assistant" else "user"
+            if message.get("status") in {"failed", "stopped"}:
+                continue
+            sender_id = str(message.get("sender_id") or "")
+            role = "assistant" if sender_id == "hermes" or message.get("kind") == "assistant" else "user"
             text = str(message.get("text") or "").strip()
-            if text:
+            if not text:
+                continue
+            if role == "user":
+                last_user_sender_id = sender_id
+                if sender_id == sender_device_id:
+                    history.append({"role": role, "content": text})
+                continue
+            if conversation_id.startswith("hermes:") or last_user_sender_id == sender_device_id:
                 history.append({"role": role, "content": text})
         return history[-limit:]
 
@@ -3493,6 +3525,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 sender_device_id=device["device_id"],
                 input_text=text,
                 retry_of=None,
+                trigger_message_id=message["message_id"],
             )
             response.update({"run_id": run_id, "assistant_message": hermes_message})
         return web.json_response(response, status=202 if should_run_hermes else 201)
@@ -3504,6 +3537,7 @@ class APIServerAdapter(BasePlatformAdapter):
         sender_device_id: str,
         input_text: str,
         retry_of: Optional[str],
+        trigger_message_id: Optional[str] = None,
     ) -> tuple[str, Dict[str, Any]]:
         run_id = f"run_{uuid.uuid4().hex}"
         message = self._mobile_store.create_message(
@@ -3538,7 +3572,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_task = asyncio.create_task(
                     self._run_agent(
                         user_message=input_text,
-                        conversation_history=self._mobile_conversation_history(conversation_id, message["message_id"]),
+                        conversation_history=self._mobile_conversation_history(
+                            conversation_id,
+                            message["message_id"],
+                            sender_device_id=sender_device_id,
+                            trigger_message_id=trigger_message_id,
+                        ),
                         ephemeral_system_prompt=MOBILE_AGENT_SYSTEM_PROMPT,
                         session_id=f"mobile-{run_id}",
                         stream_delta_callback=_on_delta,
@@ -3723,6 +3762,7 @@ class APIServerAdapter(BasePlatformAdapter):
             sender_device_id=device["device_id"],
             input_text=message.get("text") or "retry",
             retry_of=message_id,
+            trigger_message_id=message_id,
         )
         return web.json_response({"run_id": run_id, "message": retry_message}, status=202)
 
