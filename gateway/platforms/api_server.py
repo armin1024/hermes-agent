@@ -45,6 +45,12 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.mobile_store import (
+    DEFAULT_GROUP_ID,
+    MobileStore,
+    MobileStoreError,
+    PAIRING_TTL_SECONDS,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -635,6 +641,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._mobile_store = MobileStore(extra.get("mobile_store_path"))
+        self._mobile_subscribers: Dict[str, set["asyncio.Queue[Optional[Dict[str, Any]]]"]] = {}
+        self._mobile_run_tasks: Dict[str, "asyncio.Task"] = {}
+        self._mobile_run_messages: Dict[str, str] = {}
+        self._mobile_run_agent_refs: Dict[str, List[Any]] = {}
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -725,6 +736,30 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
+        )
+
+    def _auth_mobile_device(self, request: "web.Request") -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        """Validate a mobile device token from Authorization header."""
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return None, web.json_response(
+                {"error": {"message": "Missing device token", "type": "invalid_request_error", "code": "missing_device_token"}},
+                status=401,
+            )
+        token = auth_header[7:].strip()
+        device = self._mobile_store.authenticate_device(token)
+        if device is None:
+            return None, web.json_response(
+                {"error": {"message": "Invalid device token", "type": "invalid_request_error", "code": "invalid_device_token"}},
+                status=401,
+            )
+        return device, None
+
+    @staticmethod
+    def _json_error(message: str, code: str, status: int = 400) -> "web.Response":
+        return web.json_response(
+            {"error": {"message": message, "type": "invalid_request_error", "code": code}},
+            status=status,
         )
 
     # ------------------------------------------------------------------
@@ -3311,6 +3346,352 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    # ------------------------------------------------------------------
+    # /api/mobile — iOS custom agent chat API
+    # ------------------------------------------------------------------
+
+    async def _mobile_broadcast(self, conversation_id: str, event: Dict[str, Any]) -> None:
+        subscribers = list(self._mobile_subscribers.get(conversation_id, set()))
+        if conversation_id != DEFAULT_GROUP_ID:
+            subscribers.extend(list(self._mobile_subscribers.get(DEFAULT_GROUP_ID, set())))
+        for queue in subscribers:
+            try:
+                queue.put_nowait(dict(event))
+            except asyncio.QueueFull:
+                logger.debug("[api_server] mobile SSE subscriber queue full for %s", conversation_id)
+
+    def _mobile_event(self, event_type: str, **payload: Any) -> Dict[str, Any]:
+        payload.setdefault("timestamp", time.time())
+        payload["event"] = event_type
+        return payload
+
+    def _mobile_registration_url(self, request: "web.Request", pairing_id: str) -> str:
+        base = str(request.query.get("registration_url_base") or "").strip()
+        if base:
+            return f"{base.rstrip('/')}/{pairing_id}"
+        return f"{request.scheme}://{request.host}/api/mobile/register?pairing_id={pairing_id}"
+
+    async def _handle_mobile_create_pairing(self, request: "web.Request") -> "web.Response":
+        """POST /api/mobile/pairings — create a one-time iOS registration pairing."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        ttl_seconds = int(body.get("ttl_seconds") or PAIRING_TTL_SECONDS)
+        ttl_seconds = max(60, min(ttl_seconds, 3600))
+        placeholder_id = f"pairing_{uuid.uuid4().hex}"
+        registration_url = str(body.get("registration_url") or "").strip()
+        if not registration_url:
+            base = str(body.get("registration_url_base") or request.query.get("registration_url_base") or "").strip()
+            registration_url = f"{base.rstrip('/')}/{placeholder_id}" if base else self._mobile_registration_url(request, placeholder_id)
+        pairing = self._mobile_store.create_pairing(registration_url=registration_url, ttl_seconds=ttl_seconds)
+        if placeholder_id in registration_url:
+            registration_url = registration_url.replace(placeholder_id, pairing["pairing_id"])
+            pairing["registration_url"] = registration_url
+        return web.json_response({
+            "pairing_id": pairing["pairing_id"],
+            "registration_url": registration_url,
+            "verification_code": pairing["verification_code"],
+            "expires_at": pairing["expires_at"],
+        })
+
+    async def _handle_mobile_register(self, request: "web.Request") -> "web.Response":
+        """POST /api/mobile/register — register an iOS device after code comparison."""
+        try:
+            body = await request.json()
+        except Exception:
+            return self._json_error("Invalid JSON", "invalid_json")
+        try:
+            device = self._mobile_store.register_device(
+                pairing_id=str(body.get("pairing_id") or request.query.get("pairing_id") or "").strip(),
+                verification_code=str(body.get("verification_code") or "").strip(),
+                registration_code=str(body.get("registration_code") or "").strip(),
+                device_name=str(body.get("device_name") or "").strip(),
+            )
+        except MobileStoreError as exc:
+            return self._json_error(str(exc), exc.code, exc.status)
+        bootstrap = self._mobile_store.bootstrap(device["device_id"])
+        return web.json_response({
+            "status": "registered",
+            "device_id": device["device_id"],
+            "device_token": device["device_token"],
+            "default_conversation": bootstrap["default_conversation"],
+            "conversations": bootstrap["conversations"],
+        })
+
+    async def _handle_mobile_bootstrap(self, request: "web.Request") -> "web.Response":
+        """GET /api/mobile/bootstrap — return current mobile registration and chat state."""
+        device, auth_err = self._auth_mobile_device(request)
+        if auth_err:
+            return auth_err
+        return web.json_response(self._mobile_store.bootstrap(device["device_id"]))
+
+    async def _handle_mobile_send_message(self, request: "web.Request") -> "web.Response":
+        """POST /api/mobile/conversations/{conversation_id}/messages — send a mobile chat message."""
+        device, auth_err = self._auth_mobile_device(request)
+        if auth_err:
+            return auth_err
+        conversation_id = request.match_info["conversation_id"]
+        if not self._mobile_store.conversation_exists_for_device(conversation_id, device["device_id"]):
+            return self._json_error("Conversation not found", "conversation_not_found", 404)
+        try:
+            body = await request.json()
+        except Exception:
+            return self._json_error("Invalid JSON", "invalid_json")
+        text = str(body.get("text") or body.get("content") or "").strip()
+        if not text:
+            return self._json_error("Message text is required", "missing_text")
+
+        self._mobile_store.touch(device["device_id"])
+        message = self._mobile_store.create_message(
+            conversation_id=conversation_id,
+            sender_id=device["device_id"],
+            text=text,
+            kind="user",
+            status="sent",
+        )
+        await self._mobile_broadcast(
+            conversation_id,
+            self._mobile_event("message.created", conversation_id=conversation_id, message=message),
+        )
+
+        should_run_hermes = (
+            conversation_id.startswith("hermes:")
+            or "hermes" in text.lower()
+            or "转发" in text
+            or "forward" in text.lower()
+            or bool(body.get("invoke_hermes"))
+        )
+        response: Dict[str, Any] = {"message": message}
+        if should_run_hermes:
+            run_id, hermes_message = self._start_mobile_hermes_run(
+                conversation_id=conversation_id,
+                sender_device_id=device["device_id"],
+                input_text=text,
+                retry_of=None,
+            )
+            response.update({"run_id": run_id, "assistant_message": hermes_message})
+        return web.json_response(response, status=202 if should_run_hermes else 201)
+
+    def _start_mobile_hermes_run(
+        self,
+        *,
+        conversation_id: str,
+        sender_device_id: str,
+        input_text: str,
+        retry_of: Optional[str],
+    ) -> tuple[str, Dict[str, Any]]:
+        run_id = f"run_{uuid.uuid4().hex}"
+        message = self._mobile_store.create_message(
+            conversation_id=conversation_id,
+            sender_id="hermes",
+            text="",
+            kind="assistant",
+            status="streaming",
+            run_id=run_id,
+            retry_of=retry_of,
+        )
+        self._mobile_run_messages[run_id] = message["message_id"]
+
+        async def _run() -> None:
+            agent_ref: List[Any] = [None]
+            self._mobile_run_agent_refs[run_id] = agent_ref
+            try:
+                await self._mobile_broadcast(
+                    conversation_id,
+                    self._mobile_event("message.created", conversation_id=conversation_id, message=message, run_id=run_id),
+                )
+                loop = asyncio.get_running_loop()
+                delta_queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
+                text_so_far = ""
+                is_forward = "转发" in input_text or "forward" in input_text.lower()
+
+                def _on_delta(delta: Optional[str]) -> None:
+                    if delta is None:
+                        return
+                    loop.call_soon_threadsafe(delta_queue.put_nowait, str(delta))
+
+                agent_task = asyncio.create_task(
+                    self._run_agent(
+                        user_message=input_text,
+                        conversation_history=[],
+                        ephemeral_system_prompt=None,
+                        session_id=f"mobile-{conversation_id}",
+                        stream_delta_callback=_on_delta,
+                        agent_ref=agent_ref,
+                        gateway_session_key=f"mobile:{sender_device_id}:{conversation_id}",
+                    )
+                )
+                while True:
+                    if agent_task.done() and delta_queue.empty():
+                        break
+                    try:
+                        chunk = await asyncio.wait_for(delta_queue.get(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        continue
+                    if not chunk:
+                        continue
+                    text_so_far += chunk
+                    await self._mobile_broadcast(
+                        conversation_id,
+                        self._mobile_event(
+                            "message.delta",
+                            conversation_id=conversation_id,
+                            run_id=run_id,
+                            message_id=message["message_id"],
+                            delta=chunk,
+                            text=text_so_far,
+                        ),
+                    )
+
+                result, _usage = await agent_task
+                final_text = result.get("final_response", "") if isinstance(result, dict) else ""
+                if final_text and final_text != text_so_far:
+                    text_so_far = final_text
+                receipts = self._mobile_store.delivery_receipts_for_forward(sender_device_id) if is_forward else []
+                completed = self._mobile_store.update_message(
+                    message["message_id"],
+                    text=text_so_far,
+                    status="completed",
+                    receipts=receipts,
+                ) or message
+                await self._mobile_broadcast(
+                    conversation_id,
+                    self._mobile_event(
+                        "message.completed",
+                        conversation_id=conversation_id,
+                        run_id=run_id,
+                        message=completed,
+                        delivery_receipts=receipts,
+                    ),
+                )
+            except asyncio.CancelledError:
+                stopped = self._mobile_store.update_message(message["message_id"], status="stopped") or message
+                await self._mobile_broadcast(
+                    conversation_id,
+                    self._mobile_event("message.completed", conversation_id=conversation_id, run_id=run_id, message=stopped),
+                )
+                raise
+            finally:
+                self._mobile_run_tasks.pop(run_id, None)
+                self._mobile_run_agent_refs.pop(run_id, None)
+
+        task = asyncio.create_task(_run())
+        self._mobile_run_tasks[run_id] = task
+        try:
+            self._background_tasks.add(task)
+        except TypeError:
+            pass
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
+        return run_id, message
+
+    async def _handle_mobile_events(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /api/mobile/conversations/{conversation_id}/events — SSE for mobile chat."""
+        device, auth_err = self._auth_mobile_device(request)
+        if auth_err:
+            return auth_err
+        conversation_id = request.match_info["conversation_id"]
+        if not self._mobile_store.conversation_exists_for_device(conversation_id, device["device_id"]):
+            return self._json_error("Conversation not found", "conversation_not_found", 404)
+
+        queue: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue(maxsize=100)
+        self._mobile_subscribers.setdefault(conversation_id, set()).add(queue)
+        public_device = self._mobile_store.set_online(device["device_id"], True)
+        if public_device:
+            await self._mobile_broadcast(
+                DEFAULT_GROUP_ID,
+                self._mobile_event("presence.updated", device=public_device),
+            )
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await response.prepare(request)
+        await response.write(
+            f"data: {json.dumps(self._mobile_event('connected', conversation_id=conversation_id))}\n\n".encode()
+        )
+
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    await response.write(b": keepalive\n\n")
+                    continue
+                if event is None:
+                    break
+                await response.write(f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8"))
+        except Exception as exc:
+            logger.debug("[api_server] mobile SSE stream closed for %s: %s", conversation_id, exc)
+        finally:
+            subscribers = self._mobile_subscribers.get(conversation_id)
+            if subscribers is not None:
+                subscribers.discard(queue)
+                if not subscribers:
+                    self._mobile_subscribers.pop(conversation_id, None)
+            public_device = self._mobile_store.set_online(device["device_id"], False)
+            if public_device:
+                await self._mobile_broadcast(
+                    DEFAULT_GROUP_ID,
+                    self._mobile_event("presence.updated", device=public_device),
+                )
+        return response
+
+    async def _handle_mobile_stop_run(self, request: "web.Request") -> "web.Response":
+        """POST /api/mobile/runs/{run_id}/stop — stop a mobile Hermes stream."""
+        device, auth_err = self._auth_mobile_device(request)
+        if auth_err:
+            return auth_err
+        self._mobile_store.touch(device["device_id"])
+        run_id = request.match_info["run_id"]
+        task = self._mobile_run_tasks.get(run_id)
+        agent_ref = self._mobile_run_agent_refs.get(run_id)
+        if task is None:
+            return self._json_error("Run not found", "run_not_found", 404)
+        if agent_ref and agent_ref[0] is not None:
+            try:
+                agent_ref[0].interrupt("Stop requested via mobile API")
+            except Exception:
+                pass
+        if not task.done():
+            task.cancel()
+        message_id = self._mobile_run_messages.get(run_id)
+        if message_id:
+            self._mobile_store.update_message(message_id, status="stopping")
+        return web.json_response({"run_id": run_id, "status": "stopping"})
+
+    async def _handle_mobile_retry_message(self, request: "web.Request") -> "web.Response":
+        """POST /api/mobile/messages/{message_id}/retry — retry an interrupted Hermes message."""
+        device, auth_err = self._auth_mobile_device(request)
+        if auth_err:
+            return auth_err
+        message_id = request.match_info["message_id"]
+        message = self._mobile_store.get_message(message_id)
+        if not message:
+            return self._json_error("Message not found", "message_not_found", 404)
+        conversation_id = message["conversation_id"]
+        if not self._mobile_store.conversation_exists_for_device(conversation_id, device["device_id"]):
+            return self._json_error("Conversation not found", "conversation_not_found", 404)
+        run_id, retry_message = self._start_mobile_hermes_run(
+            conversation_id=conversation_id,
+            sender_device_id=device["device_id"],
+            input_text=message.get("text") or "retry",
+            retry_of=message_id,
+        )
+        return web.json_response({"run_id": run_id, "message": retry_message}, status=202)
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -3384,6 +3765,14 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # iOS mobile agent chat API
+            self._app.router.add_post("/api/mobile/pairings", self._handle_mobile_create_pairing)
+            self._app.router.add_post("/api/mobile/register", self._handle_mobile_register)
+            self._app.router.add_get("/api/mobile/bootstrap", self._handle_mobile_bootstrap)
+            self._app.router.add_post("/api/mobile/conversations/{conversation_id}/messages", self._handle_mobile_send_message)
+            self._app.router.add_get("/api/mobile/conversations/{conversation_id}/events", self._handle_mobile_events)
+            self._app.router.add_post("/api/mobile/runs/{run_id}/stop", self._handle_mobile_stop_run)
+            self._app.router.add_post("/api/mobile/messages/{message_id}/retry", self._handle_mobile_retry_message)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
