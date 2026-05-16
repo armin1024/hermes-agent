@@ -3556,6 +3556,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     if not chunk:
                         continue
                     text_so_far += chunk
+                    self._mobile_store.update_message(
+                        message["message_id"],
+                        text=text_so_far,
+                        status="streaming",
+                    )
                     await self._mobile_broadcast(
                         conversation_id,
                         self._mobile_event(

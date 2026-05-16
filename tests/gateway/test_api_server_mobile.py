@@ -199,6 +199,14 @@ class TestMobileBootstrapAndEvents:
 
             created = await _read_sse_event(events, "message.created")
             delta = await _read_sse_event(events, "message.delta")
+            mid_stream = await cli.get("/api/mobile/bootstrap", headers=headers)
+            mid_data = await mid_stream.json()
+            mid_default = next(item for item in mid_data["conversations"] if item["conversation_id"] == DEFAULT_GROUP_ID)
+            mid_messages = {item["message_id"]: item for item in mid_default["messages"]}
+            mid_assistant = mid_messages[send_data["assistant_message"]["message_id"]]
+            assert mid_assistant["text"].startswith(delta["text"])
+            assert mid_assistant["status"] in {"streaming", "completed"}
+
             completed = await _read_sse_event(events, "message.completed")
             assert created["message"]["kind"] in {"user", "assistant"}
             assert delta["delta"]
