@@ -61,6 +61,25 @@ def _config_base_url_trustworthy_for_bare_custom(cfg_base_url: str, cfg_provider
     return _loopback_hostname(base_url_hostname(bu))
 
 
+def _config_no_auth_enabled(model_cfg: Optional[Dict[str, Any]]) -> bool:
+    """Return True when config explicitly says not to send a model API key."""
+    if not isinstance(model_cfg, dict):
+        return False
+    raw = (
+        model_cfg.get("no_auth")
+        if "no_auth" in model_cfg
+        else model_cfg.get("api_key_required", None)
+    )
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw if "no_auth" in model_cfg else not raw
+    text = str(raw).strip().lower()
+    if "no_auth" in model_cfg:
+        return text in {"1", "true", "yes", "on", "none", "no-key", "no-key-required"}
+    return text in {"0", "false", "no", "off", "none", "no-key", "no-key-required"}
+
+
 def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     """Auto-detect api_mode from the resolved base URL.
 
@@ -631,11 +650,12 @@ def _resolve_openrouter_runtime(
     cfg_base_url = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
     cfg_provider = model_cfg.get("provider") if isinstance(model_cfg.get("provider"), str) else ""
     cfg_api_key = ""
-    for k in ("api_key", "api"):
-        v = model_cfg.get(k)
-        if isinstance(v, str) and v.strip():
-            cfg_api_key = v.strip()
-            break
+    if not _config_no_auth_enabled(model_cfg):
+        for k in ("api_key", "api"):
+            v = model_cfg.get(k)
+            if isinstance(v, str) and v.strip():
+                cfg_api_key = v.strip()
+                break
     requested_norm = (requested_provider or "").strip().lower()
     cfg_provider = cfg_provider.strip().lower()
 
@@ -684,13 +704,16 @@ def _resolve_openrouter_runtime(
         # hostname is a look-alike (ollama.com.attacker.test) must not
         # receive the Ollama credential. See GHSA-76xc-57q6-vm5m.
         _is_ollama_url = base_url_host_matches(base_url, "ollama.com")
-        api_key_candidates = [
-            explicit_api_key,
-            (cfg_api_key if use_config_base_url else ""),
-            (os.getenv("OLLAMA_API_KEY") if _is_ollama_url else ""),
-            os.getenv("OPENAI_API_KEY"),
-            os.getenv("OPENROUTER_API_KEY"),
-        ]
+        if _config_no_auth_enabled(model_cfg):
+            api_key_candidates = [explicit_api_key]
+        else:
+            api_key_candidates = [
+                explicit_api_key,
+                (cfg_api_key if use_config_base_url else ""),
+                (os.getenv("OLLAMA_API_KEY") if _is_ollama_url else ""),
+                os.getenv("OPENAI_API_KEY"),
+                os.getenv("OPENROUTER_API_KEY"),
+            ]
     api_key = next(
         (str(candidate or "").strip() for candidate in api_key_candidates if has_usable_secret(candidate)),
         "",

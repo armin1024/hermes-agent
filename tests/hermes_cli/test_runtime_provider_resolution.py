@@ -606,6 +606,29 @@ def test_custom_endpoint_uses_config_api_key_over_env(monkeypatch):
     assert resolved["api_key"] == "config-api-key"
 
 
+def test_custom_endpoint_no_auth_ignores_stale_config_and_env_keys(monkeypatch):
+    """Local no-auth endpoints must not receive stale cloud API keys."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "custom",
+            "base_url": "http://192.168.1.3:1234/v1",
+            "api_key": "stale-config-key",
+            "no_auth": True,
+        },
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "env-openai-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-openrouter-key")
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+
+    resolved = rp.resolve_runtime_provider(requested="custom")
+
+    assert resolved["base_url"] == "http://192.168.1.3:1234/v1"
+    assert resolved["api_key"] == "no-key-required"
+
+
 def test_custom_endpoint_uses_config_api_field_when_no_api_key(monkeypatch):
     """provider: custom with 'api' in config uses it as api_key (#1760)."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
