@@ -256,6 +256,7 @@ class MobileStore:
                     "type": convo.get("type", "group"),
                     "title": convo.get("title") or conversation_id,
                     "members": self.list_members(conversation_id),
+                    "messages": self.recent_messages(conversation_id, limit=50),
                     "updated_at": convo.get("updated_at"),
                 })
             return sorted(result, key=lambda item: (item["conversation_id"] != DEFAULT_GROUP_ID, item["conversation_id"]))

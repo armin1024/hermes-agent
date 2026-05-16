@@ -166,6 +166,8 @@ class TestMobileBootstrapAndEvents:
             assert data["status"] == "registered"
             assert data["default_conversation"]["conversation_id"] == DEFAULT_GROUP_ID
             assert any(item["conversation_id"] == DEFAULT_GROUP_ID for item in data["conversations"])
+            default = next(item for item in data["conversations"] if item["conversation_id"] == DEFAULT_GROUP_ID)
+            assert default["messages"] == []
 
     @pytest.mark.asyncio
     async def test_send_message_streams_created_delta_and_completed_events(self):
@@ -201,6 +203,14 @@ class TestMobileBootstrapAndEvents:
             assert created["message"]["kind"] in {"user", "assistant"}
             assert delta["delta"]
             assert completed["message"]["status"] == "completed"
+
+            bootstrap = await cli.get("/api/mobile/bootstrap", headers=headers)
+            data = await bootstrap.json()
+            default = next(item for item in data["conversations"] if item["conversation_id"] == DEFAULT_GROUP_ID)
+            messages = {item["message_id"]: item for item in default["messages"]}
+            assert send_data["message"]["message_id"] in messages
+            assert completed["message"]["message_id"] in messages
+            assert messages[completed["message"]["message_id"]]["status"] == "completed"
             events.close()
 
     @pytest.mark.asyncio
