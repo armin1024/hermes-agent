@@ -324,6 +324,17 @@ class MobileStore:
             message = self._data["messages"].get(message_id)
             return dict(message) if message else None
 
+    def recent_messages(self, conversation_id: str, limit: int = 12) -> List[Dict[str, Any]]:
+        """Return recent non-empty messages for a conversation in chronological order."""
+        with self._lock:
+            messages = [
+                dict(message)
+                for message in self._data["messages"].values()
+                if message.get("conversation_id") == conversation_id and str(message.get("text") or "").strip()
+            ]
+            messages.sort(key=lambda item: str(item.get("created_at") or ""))
+            return messages[-max(1, int(limit)):]
+
     def delivery_receipts_for_forward(self, sender_device_id: str) -> List[Dict[str, Any]]:
         with self._lock:
             receipts = []

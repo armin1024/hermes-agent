@@ -67,6 +67,12 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MOBILE_AGENT_SYSTEM_PROMPT = (
+    "You are Hermes Agent inside an iOS chat client. Reply as concise chat text. "
+    "Do not call tools for greetings, acknowledgements, registration checks, or explicit reply-exactly requests. "
+    "Only call tools when the user clearly asks you to fetch external information, inspect files, or perform an action. "
+    "If the user asks you to forward a message, summarize the intended delivery in text; the mobile gateway records receipts separately."
+)
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -3360,6 +3366,18 @@ class APIServerAdapter(BasePlatformAdapter):
             except asyncio.QueueFull:
                 logger.debug("[api_server] mobile SSE subscriber queue full for %s", conversation_id)
 
+    def _mobile_conversation_history(self, conversation_id: str, current_message_id: str, limit: int = 12) -> List[Dict[str, str]]:
+        """Build a small explicit mobile chat history without reusing agent session state."""
+        history: List[Dict[str, str]] = []
+        for message in self._mobile_store.recent_messages(conversation_id, limit=limit + 1):
+            if message.get("message_id") == current_message_id:
+                continue
+            role = "assistant" if message.get("sender_id") == "hermes" or message.get("kind") == "assistant" else "user"
+            text = str(message.get("text") or "").strip()
+            if text:
+                history.append({"role": role, "content": text})
+        return history[-limit:]
+
     def _mobile_event(self, event_type: str, **payload: Any) -> Dict[str, Any]:
         payload.setdefault("timestamp", time.time())
         payload["event"] = event_type
@@ -3520,12 +3538,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_task = asyncio.create_task(
                     self._run_agent(
                         user_message=input_text,
-                        conversation_history=[],
-                        ephemeral_system_prompt=None,
-                        session_id=f"mobile-{conversation_id}",
+                        conversation_history=self._mobile_conversation_history(conversation_id, message["message_id"]),
+                        ephemeral_system_prompt=MOBILE_AGENT_SYSTEM_PROMPT,
+                        session_id=f"mobile-{run_id}",
                         stream_delta_callback=_on_delta,
                         agent_ref=agent_ref,
-                        gateway_session_key=f"mobile:{sender_device_id}:{conversation_id}",
+                        gateway_session_key=f"mobile:{run_id}",
                     )
                 )
                 while True:
@@ -3578,6 +3596,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._mobile_event("message.completed", conversation_id=conversation_id, run_id=run_id, message=stopped),
                 )
                 raise
+            except Exception as exc:
+                logger.exception("[api_server] mobile Hermes run failed: run_id=%s conversation_id=%s", run_id, conversation_id)
+                failed = self._mobile_store.update_message(
+                    message["message_id"],
+                    text=f"Hermes 调用失败：{exc}",
+                    status="failed",
+                ) or message
+                await self._mobile_broadcast(
+                    conversation_id,
+                    self._mobile_event("message.completed", conversation_id=conversation_id, run_id=run_id, message=failed),
+                )
             finally:
                 self._mobile_run_tasks.pop(run_id, None)
                 self._mobile_run_agent_refs.pop(run_id, None)
