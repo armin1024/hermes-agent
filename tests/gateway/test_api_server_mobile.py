@@ -277,6 +277,34 @@ class TestMobileBootstrapAndEvents:
         assert "你好" in history_text
 
     @pytest.mark.asyncio
+    async def test_mobile_agent_empty_final_response_gets_visible_fallback(self):
+        adapter = _make_adapter()
+
+        async def fake_run_agent(**kwargs):
+            return {"final_response": ""}, {}
+
+        adapter._run_agent = AsyncMock(side_effect=fake_run_agent)
+        app = _create_mobile_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            registered = await _register(cli, await _create_pairing(cli), "ios-empty")
+            headers = {"Authorization": f"Bearer {registered['device_token']}"}
+
+            events = await cli.get(f"/api/mobile/conversations/{DEFAULT_GROUP_ID}/events", headers=headers)
+            assert events.status == 200
+            await _read_sse_event(events, "connected")
+
+            send = await cli.post(
+                f"/api/mobile/conversations/{DEFAULT_GROUP_ID}/messages",
+                json={"text": "你是谁", "invoke_hermes": True},
+                headers=headers,
+            )
+            assert send.status == 202
+            completed = await _read_sse_event(events, "message.completed")
+            assert completed["message"]["status"] == "completed"
+            assert "没有生成可见回复" in completed["message"]["text"]
+            events.close()
+
+    @pytest.mark.asyncio
     async def test_forward_receipts_mark_online_and_offline_recipients(self):
         adapter = _make_adapter()
         async def fake_run_agent(**kwargs):

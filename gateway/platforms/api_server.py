@@ -3616,6 +3616,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 final_text = result.get("final_response", "") if isinstance(result, dict) else ""
                 if final_text and final_text != text_so_far:
                     text_so_far = final_text
+                if not text_so_far.strip():
+                    text_so_far = "模型这次只返回了推理内容，没有生成可见回复。请重试或换一个问题。"
                 receipts = self._mobile_store.delivery_receipts_for_forward(sender_device_id) if is_forward else []
                 completed = self._mobile_store.update_message(
                     message["message_id"],
