@@ -16,7 +16,7 @@ def _iter_web_dist_files(web_dist_dir: Path) -> list[Path]:
 def _validate_web_dist(web_dist_dir: Path) -> list[Path]:
     index_html = web_dist_dir / "index.html"
     vite_manifest = web_dist_dir / ".vite" / "manifest.json"
-    missing = [path for path in (index_html, vite_manifest) if not path.is_file()]
+    missing = [path for path in (index_html,) if not path.is_file()]
     if missing:
         missing_list = ", ".join(str(path) for path in missing)
         raise SystemExit(
@@ -27,6 +27,17 @@ def _validate_web_dist(web_dist_dir: Path) -> list[Path]:
     files = _iter_web_dist_files(web_dist_dir)
     if not files:
         raise SystemExit(f"web_dist directory is empty: {web_dist_dir}")
+
+    # Newer Hermes web builds may not emit Vite's .vite/manifest.json into
+    # the final hermes_cli/web_dist directory. In that case, fall back to a
+    # simpler presence check: index.html plus at least one asset file.
+    if not vite_manifest.is_file():
+        if not any(path.parent.name == "assets" for path in files):
+            raise SystemExit(
+                "web_dist is missing both the Vite manifest and any built assets. "
+                f"Expected at least one file under {web_dist_dir / 'assets'}."
+            )
+        return files
 
     manifest = json.loads(vite_manifest.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict) or not manifest:
