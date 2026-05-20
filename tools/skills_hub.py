@@ -1620,7 +1620,8 @@ class ClawHubSource(SkillSource):
     their vetting is insufficient (341 malicious skills found Feb 2026).
     """
 
-    BASE_URL = "https://clawhub.ai/api/v1"
+    _registry = os.environ.get("CLAWHUB_REGISTRY", "https://clawhub.ai").rstrip("/")
+    BASE_URL = f"{_registry}/api/v1"
 
     def source_id(self) -> str:
         return "clawhub"

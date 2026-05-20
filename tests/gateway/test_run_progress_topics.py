@@ -11,6 +11,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.aops import AopsAdapter
 from gateway.session import SessionSource
 
 
@@ -65,6 +66,32 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
         raise AssertionError("non-editable adapters should not receive edit_message calls")
 
 
+class AopsProgressCaptureAdapter(AopsAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+        self.events = []
+        self.sent_plain = []
+        self.typing = []
+
+    async def send_reply_event(self, data) -> SendResult:
+        self.events.append(dict(data))
+        return SendResult(success=True, message_id=data.get("messageId"))
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.sent_plain.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="plain-1")
+
+    async def send_typing(self, chat_id, metadata=None) -> None:
+        self.typing.append({"chat_id": chat_id, "metadata": metadata})
+
+
 class FakeAgent:
     def __init__(self, **kwargs):
         # Capture anything passed via kwargs (older code path) but don't
@@ -81,6 +108,25 @@ class FakeAgent:
             time.sleep(0.35)
             cb("tool.started", "browser_navigate", "https://example.com", {})
             time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class AopsToolLifecycleAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback("I'll check that.", already_streamed=False)
+        if self.tool_progress_callback:
+            self.tool_progress_callback("tool.started", "terminal", "pwd", {})
+            self.tool_progress_callback("tool.completed", "terminal", "pwd", {}, duration=0.1)
         return {
             "final_response": "done",
             "messages": [],
@@ -209,6 +255,53 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     ]
     assert adapter.edits
     assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_aops_forwards_tool_progress_via_native_reply(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = AopsToolLifecycleAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = AopsProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.AOPS,
+        chat_id="user-001",
+        chat_type="dm",
+        user_id="user-001",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-aops-tools",
+        session_key="agent:main:aops:dm:user-001",
+        event_message_id="msg-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert result.get("already_sent") is True
+    assert adapter.sent_plain == []
+    tool_events = [event for event in adapter.events if event["phase"] == "tool"]
+    assert [event["tool"]["phase"] for event in tool_events] == ["start", "result"]
+    assert all(event["replyToId"] == "msg-1" for event in adapter.events)
+    assert all(event["runId"] == "sess-aops-tools" for event in adapter.events)
+    assert adapter.events[-1]["phase"] == "end"
+    assert adapter.events[-1]["text"] == "done"
+    assert adapter.events[-1]["conversationEnded"] is True
 
 
 @pytest.mark.asyncio

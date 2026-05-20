@@ -37,6 +37,7 @@ except ImportError:
 HERMES_DIR = get_hermes_home().resolve()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
+HISTORY_FILE = CRON_DIR / "history.jsonl"
 
 # In-process lock protecting load_jobs→modify→save_jobs cycles.
 # Required when tick() runs jobs in parallel threads — without this,
@@ -881,6 +882,24 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+
+
+def append_cron_history(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Backward-compatible structured history append used by AOPS tests/tools."""
+    ensure_dirs()
+    history_file = Path(HISTORY_FILE)
+    timestamp = entry.get("timestamp") or _hermes_now().isoformat()
+    payload = {"timestamp": timestamp, **entry}
+
+    line = json.dumps(payload, ensure_ascii=False)
+    with _jobs_file_lock:
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        _secure_file(history_file)
+    return payload
 
 
 def advance_next_run(job_id: str) -> bool:

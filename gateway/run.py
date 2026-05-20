@@ -5471,6 +5471,13 @@ class GatewayRunner:
                 return None
             return YuanbaoAdapter(config)
 
+        elif platform == Platform.AOPS:
+            from gateway.platforms.aops import AopsAdapter, check_aops_requirements
+            if not check_aops_requirements():
+                logger.warning("AOPS: aiohttp not installed")
+                return None
+            return AopsAdapter(config)
+
         return None
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -5513,6 +5520,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            Platform.AOPS: "AOPS_ALLOWED_USERS",
         }
         platform_group_user_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -5539,6 +5547,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+            Platform.AOPS: "AOPS_ALLOW_ALL_USERS",
         }
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
         platform_allow_bots_map = {
@@ -5585,6 +5594,29 @@ class GatewayRunner:
         platform_name = source.platform.value if source.platform else ""
         if self.pairing_store.is_approved(platform_name, user_id):
             return True
+
+        # AOPS uses dm_policy / allow_from semantics instead of the generic
+        # gateway allowlist flow.
+        if source.platform == Platform.AOPS:
+            platform_cfg = self.config.platforms.get(Platform.AOPS) if hasattr(self.config, "platforms") else None
+            extra = getattr(platform_cfg, "extra", {}) if platform_cfg else {}
+            dm_policy = str(extra.get("dm_policy", "open")).strip().lower() or "open"
+            allow_from = extra.get("allow_from") or []
+            allowed_ids = {str(item).strip() for item in allow_from if str(item).strip()}
+            if os.getenv("AOPS_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+                return True
+            compat_allowlist = os.getenv("AOPS_ALLOWED_USERS", "").strip()
+            if compat_allowlist:
+                allowed_ids.update(uid.strip() for uid in compat_allowlist.split(",") if uid.strip())
+            if dm_policy == "open":
+                return True
+            if dm_policy == "disabled":
+                return False
+            if dm_policy == "allowlist":
+                return "*" in allowed_ids or user_id in allowed_ids
+            # pairing: allow already-approved users only; new users follow the
+            # unauthorized-DM behavior path that emits a pairing code.
+            return False
 
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
@@ -5724,6 +5756,7 @@ class GatewayRunner:
                 Platform.WEIXIN:   "WEIXIN_ALLOWED_USERS",
                 Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
                 Platform.QQBOT:    "QQ_ALLOWED_USERS",
+                Platform.AOPS:     "AOPS_ALLOWED_USERS",
             }
             platform_group_env_map = {
                 Platform.TELEGRAM: (
@@ -6418,6 +6451,20 @@ class GatewayRunner:
         # don't depend on the exact alias the user typed.
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
+        raw_command_args = event.get_command_args().strip() if command else ""
+
+        if command and source.platform == Platform.AOPS:
+            from gateway import aops_commands as _aops_commands
+
+            if _aops_commands.is_blocked(self.config, command, raw_command_args, canonical):
+                return _aops_commands.block_message(command)
+
+            local_reply = _aops_commands.maybe_local_command(event)
+            if local_reply is not None:
+                return local_reply
+
+            if not _aops_commands.is_supported_command(command, raw_command_args, canonical):
+                return _aops_commands.unsupported_message(command)
 
         # Expand alias quick commands before built-in dispatch so targets like
         # /model openai/gpt-5.5 --provider openrouter reach the /model handler.
@@ -6531,6 +6578,14 @@ class GatewayRunner:
 
         if canonical == "commands":
             return await self._handle_commands_command(event)
+
+        if canonical == "curator" and source.platform == Platform.AOPS:
+            from gateway import aops_commands as _aops_commands
+
+            exit_code, output = _aops_commands.run_curator_command(event.get_command_args().strip())
+            if exit_code and "(exit " not in output:
+                output = f"{output}\n(exit {exit_code})"
+            return output
         
         if canonical == "profile":
             return await self._handle_profile_command(event)
@@ -9019,6 +9074,11 @@ class GatewayRunner:
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
+        if event.source.platform == Platform.AOPS:
+            from gateway import aops_commands as _aops_commands
+
+            return _aops_commands.help_tree_response(self.config)
+
         from hermes_cli.commands import gateway_help_lines
         lines = [
             t("gateway.help.header"),
@@ -9057,22 +9117,31 @@ class GatewayRunner:
 
         # Build combined entry list: built-in commands + skill commands
         entries = list(gateway_help_lines())
-        try:
-            from agent.skill_commands import get_skill_commands
-            skill_cmds = get_skill_commands()
-            if skill_cmds:
-                entries.append("")
-                entries.append(t("gateway.commands.skill_header"))
-                for cmd in sorted(skill_cmds):
-                    desc = skill_cmds[cmd].get("description", "").strip() or t("gateway.commands.default_desc")
-                    entries.append(f"`{cmd}` — {desc}")
-        except Exception:
-            pass
+        if event.source.platform == Platform.AOPS:
+            from gateway import aops_commands as _aops_commands
+
+            filtered_entries = _aops_commands.filter_help_lines(entries, self.config)
+            entries = ["🧰 **AOPS Local Commands**", *_aops_commands.aops_text_command_lines(), ""]
+            skill_entries = _aops_commands.aops_skill_command_lines(self.config)
+            if skill_entries:
+                entries.extend(["⚡ **Skill Commands**:", *skill_entries, ""])
+            entries.extend(filtered_entries)
+        else:
+            try:
+                from agent.skill_commands import get_skill_commands
+                skill_cmds = get_skill_commands()
+                if skill_cmds:
+                    entries.append("")
+                    entries.append(t("gateway.commands.skill_header"))
+                    for cmd in sorted(skill_cmds):
+                        desc = skill_cmds[cmd].get("description", "").strip() or t("gateway.commands.default_desc")
+                        entries.append(f"`{cmd}` — {desc}")
+            except Exception:
+                pass
 
         if not entries:
             return t("gateway.commands.none")
 
-        from gateway.config import Platform
         page_size = 15 if event.source.platform == Platform.TELEGRAM else 20
         total_pages = max(1, (len(entries) + page_size - 1) // page_size)
         page = max(1, min(requested_page, total_pages))
@@ -14528,6 +14597,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        route_overrides: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -14630,6 +14700,25 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
+        native_reply_bridge = None
+        native_reply_task = None
+        if source.platform == Platform.AOPS:
+            try:
+                from gateway.platforms.aops import AopsLiveReplyBridge
+                _aops_adapter = self.adapters.get(source.platform)
+                if _aops_adapter is not None:
+                    native_reply_bridge = AopsLiveReplyBridge(
+                        _aops_adapter,
+                        chat_id=source.chat_id,
+                        reply_to_id=event_message_id,
+                        run_id=session_id,
+                    )
+                    # AOPS has its own websocket message_reply stream. Disable
+                    # generic progress bubbles so tool events are not dropped by
+                    # non-editable adapter handling or duplicated as plain text.
+                    progress_queue = None
+            except Exception as exc:
+                logger.debug("AOPS native reply bridge unavailable: %s", exc)
 
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
@@ -14655,6 +14744,20 @@ class GatewayRunner:
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
+            if native_reply_bridge is not None:
+                if not _run_still_current():
+                    return
+                try:
+                    native_reply_bridge.on_tool_progress(
+                        event_type,
+                        tool_name,
+                        preview,
+                        args,
+                        **kwargs,
+                    )
+                except Exception as exc:
+                    logger.debug("AOPS native tool progress enqueue failed: %s", exc)
+                return
             if not progress_queue or not _run_still_current():
                 return
 
@@ -15212,6 +15315,9 @@ class GatewayRunner:
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
+                if native_reply_bridge is not None:
+                    native_reply_bridge.on_commentary(text, already_streamed=already_streamed)
+                    return
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
@@ -15232,6 +15338,14 @@ class GatewayRunner:
                 )
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            if route_overrides:
+                runtime = dict(turn_route.get("runtime") or {})
+                runtime.update({k: v for k, v in route_overrides.items() if k in {"provider", "api_key", "base_url", "api_mode", "command", "credential_pool"}})
+                if "args" in route_overrides:
+                    runtime["args"] = list(route_overrides.get("args") or [])
+                if route_overrides.get("model"):
+                    turn_route["model"] = route_overrides["model"]
+                turn_route["runtime"] = runtime
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -15730,6 +15844,12 @@ class GatewayRunner:
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
+            if native_reply_bridge is not None:
+                native_reply_bridge.send_final(
+                    result.get("final_response") or "",
+                    conversation_ended=True,
+                )
+                native_reply_bridge.finish()
             if _stream_consumer is not None:
                 _stream_consumer.finish()
             
@@ -15896,6 +16016,8 @@ class GatewayRunner:
         progress_task = None
         if tool_progress_enabled:
             progress_task = asyncio.create_task(send_progress_messages())
+        if native_reply_bridge is not None:
+            native_reply_task = asyncio.create_task(native_reply_bridge.run())
 
         # Start stream consumer task — polls for consumer creation since it
         # happens inside run_sync (thread pool) after the agent is constructed.
@@ -16452,6 +16574,15 @@ class GatewayRunner:
             _notify_task.cancel()
 
             # Wait for stream consumer to finish its final edit
+            if native_reply_task:
+                try:
+                    await asyncio.wait_for(native_reply_task, timeout=5.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    native_reply_task.cancel()
+                    try:
+                        await native_reply_task
+                    except asyncio.CancelledError:
+                        pass
             if stream_task:
                 try:
                     await asyncio.wait_for(stream_task, timeout=5.0)
@@ -16501,6 +16632,10 @@ class GatewayRunner:
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
+            _native_sent = bool(
+                native_reply_bridge
+                and getattr(native_reply_bridge, "final_response_sent", False)
+            )
             _streamed = bool(
                 _sc and getattr(_sc, "final_response_sent", False)
             )
@@ -16510,10 +16645,11 @@ class GatewayRunner:
             _content_delivered = bool(
                 _sc and getattr(_sc, "final_content_delivered", False)
             )
-            if not _is_empty_sentinel and (_streamed or _previewed or _content_delivered):
+            if not _is_empty_sentinel and (_native_sent or _streamed or _previewed or _content_delivered):
                 logger.info(
-                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
+                    "Suppressing normal final send for session %s: final delivery already confirmed (native=%s streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
+                    _native_sent,
                     _streamed,
                     _previewed,
                     _content_delivered,

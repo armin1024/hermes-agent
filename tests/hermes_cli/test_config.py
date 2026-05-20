@@ -19,6 +19,7 @@ from hermes_cli.config import (
     save_env_value,
     save_env_value_secure,
     sanitize_env_file,
+    migrate_aops_env_keys,
     _sanitize_env_lines,
 )
 
@@ -452,6 +453,61 @@ class TestSanitizeEnvLines:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             fixes = sanitize_env_file()
             assert fixes == 0
+
+    def test_splits_aops_keys(self):
+        lines = ["AOPS_BOT_TOKEN=tokAOPS_BASE_URL=https://legacy.example\n"]
+        result = _sanitize_env_lines(lines)
+        assert result == [
+            "AOPS_BOT_TOKEN=tok\n",
+            "AOPS_BASE_URL=https://legacy.example\n",
+        ]
+
+
+class TestMigrateAopsEnvKeys:
+    def test_renames_legacy_aops_base_url(self, tmp_path):
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "AOPS_BOT_TOKEN=tok\nAOPS_BASE_URL=https://legacy.example\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+            os.environ.pop("AOPS_BASE_URL", None)
+            os.environ.pop("AOPS_BOT_URL", None)
+            assert migrate_aops_env_keys() is True
+
+        content = env_file.read_text(encoding="utf-8")
+        assert "AOPS_BOT_URL=https://legacy.example\n" in content
+        assert "AOPS_BASE_URL" not in content
+
+    def test_does_not_override_existing_aops_bot_url(self, tmp_path):
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "AOPS_BOT_URL=https://new.example\n"
+            "AOPS_BASE_URL=https://legacy.example\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+            assert migrate_aops_env_keys() is True
+
+        content = env_file.read_text(encoding="utf-8")
+        assert "AOPS_BOT_URL=https://new.example\n" in content
+        assert "AOPS_BASE_URL" not in content
+
+    def test_fills_empty_aops_bot_url_from_legacy_value(self, tmp_path):
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "AOPS_BOT_URL=\nAOPS_BASE_URL=https://legacy.example\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+            assert migrate_aops_env_keys() is True
+
+        content = env_file.read_text(encoding="utf-8")
+        assert "AOPS_BOT_URL=https://legacy.example\n" in content
+        assert "AOPS_BASE_URL" not in content
 
 
 class TestOptionalEnvVarsRegistry:

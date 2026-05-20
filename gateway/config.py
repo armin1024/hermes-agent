@@ -127,6 +127,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    AOPS = "aops"
     @classmethod
     def _missing_(cls, value):
         """Accept unknown platform names only for known plugin adapters.
@@ -432,6 +433,7 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.YUANBAO: lambda cfg: bool(
         cfg.extra.get("app_id") and cfg.extra.get("app_secret")
     ),
+    Platform.AOPS: lambda cfg: bool(cfg.token and cfg.extra.get("base_url")),
     Platform.DINGTALK: lambda cfg: bool(
         (cfg.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
         and (cfg.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
@@ -505,6 +507,8 @@ class GatewayConfig:
                 config.extra.get("account_id")
                 and (config.token or config.extra.get("token"))
             )
+        if platform == Platform.AOPS:
+            return bool(config.token and config.extra.get("base_url"))
 
         # Generic token/api_key auth covers Telegram, Discord, Slack, etc.
         if config.token or config.api_key:
@@ -658,6 +662,12 @@ class GatewayConfig:
                     platform_cfg.extra.get("unauthorized_dm_behavior"),
                     self.unauthorized_dm_behavior,
                 )
+            if platform == Platform.AOPS and platform_cfg:
+                dm_policy = str(platform_cfg.extra.get("dm_policy", "")).strip().lower()
+                if dm_policy == "pairing":
+                    return "pair"
+                if dm_policy in {"open", "allowlist", "disabled"}:
+                    return "ignore"
         return self.unauthorized_dm_behavior
 
     def get_notice_delivery(self, platform: Optional[Platform] = None) -> str:
@@ -1197,6 +1207,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
         Platform.MATTERMOST: "MATTERMOST_TOKEN",
         Platform.MATRIX: "MATRIX_ACCESS_TOKEN",
         Platform.WEIXIN: "WEIXIN_TOKEN",
+        Platform.AOPS: "AOPS_BOT_TOKEN",
     }
     for platform, pconfig in config.platforms.items():
         if not pconfig.enabled:
@@ -1805,6 +1816,45 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         yuanbao_group_allow_from = os.getenv("YUANBAO_GROUP_ALLOW_FROM")
         if yuanbao_group_allow_from:
             extra["group_allow_from"] = yuanbao_group_allow_from
+
+    # AOPS
+    aops_bot_token = os.getenv("AOPS_BOT_TOKEN")
+    aops_base_url = (
+        os.getenv("AOPS_BOT_URL", "").strip()
+        or os.getenv("AOPS_BASE_URL", "").strip()
+    )
+    if aops_bot_token or aops_base_url:
+        if Platform.AOPS not in config.platforms:
+            config.platforms[Platform.AOPS] = PlatformConfig()
+        config.platforms[Platform.AOPS].enabled = True
+        if aops_bot_token:
+            config.platforms[Platform.AOPS].token = aops_bot_token
+        extra = config.platforms[Platform.AOPS].extra
+        if aops_base_url:
+            extra["base_url"] = aops_base_url.rstrip("/")
+        aops_push_tool_calls = os.getenv("AOPS_PUSH_TOOL_CALLS", "").strip()
+        if aops_push_tool_calls:
+            extra["push_tool_calls"] = _coerce_bool(aops_push_tool_calls, True)
+        aops_dm_policy = os.getenv("AOPS_DM_POLICY", "").strip().lower()
+        if aops_dm_policy:
+            extra["dm_policy"] = aops_dm_policy
+        aops_allow_from = os.getenv("AOPS_ALLOW_FROM", "").strip()
+        if aops_allow_from:
+            extra["allow_from"] = [item.strip() for item in aops_allow_from.split(",") if item.strip()]
+        aops_trusted = os.getenv("AOPS_TRUSTED_AGENT_KEY_FROM", "").strip()
+        if aops_trusted:
+            extra["trusted_agent_key_from"] = [item.strip() for item in aops_trusted.split(",") if item.strip()]
+        aops_proxy = os.getenv("AOPS_PROXY", "").strip()
+        if aops_proxy:
+            extra["proxy"] = aops_proxy
+        aops_home = os.getenv("AOPS_HOME_CHANNEL", "").strip()
+        if aops_home:
+            config.platforms[Platform.AOPS].home_channel = HomeChannel(
+                platform=Platform.AOPS,
+                chat_id=aops_home,
+                name=os.getenv("AOPS_HOME_CHANNEL_NAME", "Home"),
+                thread_id=os.getenv("AOPS_HOME_CHANNEL_THREAD_ID") or None,
+            )
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

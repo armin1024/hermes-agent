@@ -961,6 +961,13 @@ class MessageEvent:
     # from ``text`` so the sender-prefix logic in run.py can operate on the
     # trigger message alone, then prepend this context afterward.
     channel_context: Optional[str] = None
+
+    # Backward-compat bridge for adapters that still attach per-turn route
+    # overrides (for example AOPS agentKey -> model/provider overrides).
+    # Newer gateway paths should prefer the explicit turn-route plumbing,
+    # but keeping the field here lets older adapters/tests coexist while
+    # integration code is migrated incrementally.
+    route_overrides: Optional[dict[str, Any]] = None
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
