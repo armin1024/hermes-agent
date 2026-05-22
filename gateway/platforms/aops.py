@@ -543,6 +543,7 @@ class AopsAdapter(BasePlatformAdapter):
         self._channel_send_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._chat_cache: dict[str, dict[str, Any]] = {}
         self._seen_message_ids: set[str] = set()
+        self._reply_flags_by_message_id: dict[str, dict[str, Any]] = {}
         self._bot_id: Optional[str] = None
         self._bot_name: Optional[str] = None
 
@@ -935,6 +936,8 @@ class AopsAdapter(BasePlatformAdapter):
             "name": chat_name or channel_id,
             "type": chat_type,
         }
+        if isinstance(data.get("silent"), bool):
+            self._reply_flags_by_message_id[message_id] = {"silent": bool(data["silent"])}
         return MessageEvent(
             text=str(data.get("text") or ""),
             message_type=MessageType.TEXT,
@@ -960,6 +963,11 @@ class AopsAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=((payload.get("data") or {}).get("messageId")))
 
     async def send_reply_event(self, data: dict[str, Any]) -> SendResult:
+        reply_to_id = str(data.get("replyToId") or "").strip()
+        if "silent" not in data and reply_to_id:
+            reply_flags = self._reply_flags_by_message_id.get(reply_to_id) or {}
+            if isinstance(reply_flags.get("silent"), bool):
+                data = {**data, "silent": reply_flags["silent"]}
         payload = {"event": "message_reply", "data": data}
         self._log_wire("info", direction="out", action="ws.send", payload=payload)
         return await self._send_payload(payload, channel_id=str(data.get("channelId") or ""))
@@ -973,6 +981,11 @@ class AopsAdapter(BasePlatformAdapter):
     ) -> SendResult:
         metadata = metadata or {}
         reply_to = reply_to or metadata.get("reply_to")
+        inherited_silent = None
+        if reply_to:
+            reply_flags = self._reply_flags_by_message_id.get(str(reply_to)) or {}
+            if isinstance(reply_flags.get("silent"), bool):
+                inherited_silent = reply_flags["silent"]
         message_id = str(metadata.get("message_id") or self.create_message_id())
         run_id = metadata.get("run_id")
         kind = str(metadata.get("kind") or "final")
@@ -989,6 +1002,8 @@ class AopsAdapter(BasePlatformAdapter):
             start_payload["replyToId"] = reply_to
         if run_id:
             start_payload["runId"] = run_id
+        if inherited_silent is not None:
+            start_payload["silent"] = inherited_silent
         start = await self.send_reply_event(start_payload)
         if not start.success:
             return start
@@ -1006,6 +1021,8 @@ class AopsAdapter(BasePlatformAdapter):
             end_payload["replyToId"] = reply_to
         if run_id:
             end_payload["runId"] = run_id
+        if inherited_silent is not None:
+            end_payload["silent"] = inherited_silent
         if metadata.get("content"):
             end_payload["content"] = metadata["content"]
         result = await self.send_reply_event(end_payload)

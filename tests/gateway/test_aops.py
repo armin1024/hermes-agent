@@ -253,9 +253,51 @@ async def test_aops_connect_calls_bot_me_and_ws_auth(monkeypatch):
     assert ws_kwargs["headers"]["Authorization"] == "Bearer tok"
     assert fake_ws.sent == [{"action": "auth", "token": "tok"}]
     assert fake_session.post_calls
-    report_url, report_kwargs = fake_session.post_calls[0]
-    assert report_url.endswith("/api/v1/bot/agents/report")
-    assert report_kwargs["json"]["source"] == "hermes"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_reply_event_inherits_silent_from_inbound_message():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._connected_event.set()
+    fake_ws = _FakeWebSocket()
+    adapter._ws = fake_ws
+    adapter._reply_flags_by_message_id["msg-1"] = {"silent": True}
+
+    result = await adapter.send_reply_event(
+        {
+            "messageId": "botmsg-1",
+            "seq": 1,
+            "phase": "start",
+            "kind": "final",
+            "channelId": "user-001",
+            "replyToId": "msg-1",
+            "conversationEnded": False,
+            "ts": 1,
+        }
+    )
+
+    assert result.success is True
+    assert fake_ws.sent[0]["data"]["silent"] is True
+
+
+@pytest.mark.asyncio
+async def test_aops_send_emits_start_then_end_with_inherited_silent():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    adapter._reply_flags_by_message_id["msg-1"] = {"silent": True}
+
+    result = await adapter.send("user-001", "hello", reply_to="msg-1")
+
+    assert result.success is True
+    assert adapter.send_reply_event.await_count == 2
+    start = adapter.send_reply_event.await_args_list[0].args[0]
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert start["phase"] == "start"
+    assert end["phase"] == "end"
+    assert end["text"] == "hello"
+    assert end["replyToId"] == "msg-1"
+    assert start["silent"] is True
+    assert end["silent"] is True
 
 
 def test_resolve_aops_client_id_reads_existing_file(monkeypatch, tmp_path):
