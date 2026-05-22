@@ -1819,10 +1819,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
 
     # AOPS
     aops_bot_token = os.getenv("AOPS_BOT_TOKEN")
-    aops_base_url = (
-        os.getenv("AOPS_BOT_URL", "").strip()
-        or os.getenv("AOPS_BASE_URL", "").strip()
-    )
+    aops_base_url = os.getenv("AOPS_BOT_URL", "").strip()
     if aops_bot_token or aops_base_url:
         if Platform.AOPS not in config.platforms:
             config.platforms[Platform.AOPS] = PlatformConfig()

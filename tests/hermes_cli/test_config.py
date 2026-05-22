@@ -453,31 +453,6 @@ class TestSanitizeEnvLines:
             fixes = sanitize_env_file()
             assert fixes == 0
 
-    def test_splits_aops_keys(self):
-        lines = ["AOPS_BOT_TOKEN=tokAOPS_BASE_URL=https://legacy.example\n"]
-        result = _sanitize_env_lines(lines)
-        assert result == [
-            "AOPS_BOT_TOKEN=tok\n",
-            "AOPS_BASE_URL=https://legacy.example\n",
-        ]
-
-    def test_sanitize_env_file_does_not_rename_legacy_aops_base_url(self, tmp_path):
-        env_file = tmp_path / ".env"
-        env_file.write_text(
-            "AOPS_BOT_TOKEN=tokAOPS_BASE_URL=https://legacy.example\n",
-            encoding="utf-8",
-        )
-
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
-            fixes = sanitize_env_file()
-
-        assert fixes == 1
-        content = env_file.read_text(encoding="utf-8")
-        assert "AOPS_BOT_TOKEN=tok\n" in content
-        assert "AOPS_BASE_URL=https://legacy.example\n" in content
-        assert "AOPS_BOT_URL" not in content
-
-
 class TestOptionalEnvVarsRegistry:
     """Verify that key env vars are registered in OPTIONAL_ENV_VARS."""
 

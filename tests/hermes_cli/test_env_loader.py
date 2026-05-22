@@ -70,28 +70,6 @@ def test_user_env_takes_precedence_over_project_env(tmp_path, monkeypatch):
     assert os.getenv("OPENAI_API_KEY") == "project-key"
 
 
-def test_load_hermes_dotenv_does_not_migrate_legacy_aops_base_url(tmp_path, monkeypatch):
-    home = tmp_path / "hermes"
-    home.mkdir()
-    env_file = home / ".env"
-    env_file.write_text(
-        "AOPS_BOT_TOKEN=tok\nAOPS_BASE_URL=https://legacy-aops.example\n",
-        encoding="utf-8",
-    )
-
-    monkeypatch.delenv("AOPS_BASE_URL", raising=False)
-    monkeypatch.delenv("AOPS_BOT_URL", raising=False)
-
-    loaded = load_hermes_dotenv(hermes_home=home)
-
-    assert loaded == [env_file]
-    assert os.getenv("AOPS_BASE_URL") == "https://legacy-aops.example"
-    assert os.getenv("AOPS_BOT_URL") is None
-    content = env_file.read_text(encoding="utf-8")
-    assert "AOPS_BASE_URL=https://legacy-aops.example\n" in content
-    assert "AOPS_BOT_URL" not in content
-
-
 def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     home.mkdir()

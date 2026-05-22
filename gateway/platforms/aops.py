@@ -525,7 +525,6 @@ class AopsAdapter(BasePlatformAdapter):
         self._base_url = str(
             extra.get("base_url")
             or os.getenv("AOPS_BOT_URL", "").strip()
-            or os.getenv("AOPS_BASE_URL", "").strip()
         ).rstrip("/")
         self._proxy_url = str(extra.get("proxy") or os.getenv("AOPS_PROXY", "")).strip() or resolve_proxy_url("AOPS_PROXY")
         self._push_tool_calls = bool(extra.get("push_tool_calls", True))

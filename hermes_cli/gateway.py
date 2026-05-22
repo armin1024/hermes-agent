@@ -3818,7 +3818,7 @@ def _platform_status(platform: dict) -> str:
             return "partially configured"
         return "not configured"
     if platform.get("key") == "aops":
-        base_url = get_env_value("AOPS_BOT_URL") or get_env_value("AOPS_BASE_URL")
+        base_url = get_env_value("AOPS_BOT_URL")
         if val and base_url:
             return "configured"
         if val or base_url:

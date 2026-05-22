@@ -213,19 +213,6 @@ def test_apply_env_overrides_reads_aops(monkeypatch):
     assert aops.extra["proxy"] == "http://proxy.internal:8080"
 
 
-def test_apply_env_overrides_reads_legacy_aops_base_url(monkeypatch):
-    monkeypatch.setenv("AOPS_BOT_TOKEN", "tok")
-    monkeypatch.setenv("AOPS_BASE_URL", "https://legacy-aops.example.com")
-    monkeypatch.delenv("AOPS_BOT_URL", raising=False)
-
-    config = GatewayConfig()
-    _apply_env_overrides(config)
-
-    aops = config.platforms[Platform.AOPS]
-    assert aops.token == "tok"
-    assert aops.extra["base_url"] == "https://legacy-aops.example.com"
-
-
 @pytest.mark.asyncio
 async def test_create_adapter_returns_aops_adapter(monkeypatch):
     monkeypatch.setattr("gateway.platforms.aops.AIOHTTP_AVAILABLE", True)

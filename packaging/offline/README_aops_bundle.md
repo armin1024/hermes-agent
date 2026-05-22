@@ -107,7 +107,7 @@ hermes-dashboard
 - `.env`
 
 如果这两个文件已经存在，安装脚本不会覆盖，只会继续沿用原配置。
-示例配置统一使用 `AOPS_BOT_URL`。如果现网环境里仍保留旧变量 `AOPS_BASE_URL`，运行时仍兼容读取旧值，但初始化/升级脚本不会自动改写已有 `.env`。
+示例配置统一使用 `AOPS_BOT_URL`。当前版本只读取 `AOPS_BOT_URL`，不再和 `AOPS_BASE_URL` 挂钩。
 
 也可以手工从下面两个模板复制：
 
