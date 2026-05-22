@@ -13,6 +13,7 @@ fi
 
 BASE_BUNDLE="${1:-}"
 OUTPUT_DIR="${2:-$REPO_ROOT/dist}"
+HINDSIGHT_WHEEL_DIR="${HINDSIGHT_WHEEL_DIR:-/private/tmp/hindsight-linux-wheel-cache}"
 
 if [[ -z "$BASE_BUNDLE" ]]; then
   echo "Usage: $0 <base-offline-bundle.tar.gz> [output-dir]" >&2
@@ -68,6 +69,14 @@ fi
 find "$WORK_DIR" \( -name '._*' -o -name '__MACOSX' \) -exec rm -rf {} +
 
 mkdir -p "$BUNDLE_DIR/overlay" "$BUNDLE_DIR/examples"
+
+if [[ -d "$HINDSIGHT_WHEEL_DIR" ]]; then
+  mkdir -p "$BUNDLE_DIR/wheels"
+  cp "$HINDSIGHT_WHEEL_DIR"/*.whl "$BUNDLE_DIR/wheels/"
+  if [[ -f "$BUNDLE_DIR/requirements.txt" ]] && ! grep -q '^hindsight-client==0.6.1$' "$BUNDLE_DIR/requirements.txt"; then
+    printf '\nhindsight-client==0.6.1\n' >> "$BUNDLE_DIR/requirements.txt"
+  fi
+fi
 
 PACKAGE_DIRS=(
   "acp_adapter"
