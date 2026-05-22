@@ -72,7 +72,6 @@ bash install.sh --link --init-config
 如果机器上已经有旧版 `~/hermes-agent`，直接重新执行同一条安装命令即可。安装脚本会进入升级模式：
 
 - 保留现有 `~/.hermes/config.yaml` 和 `~/.hermes/.env`
-- 自动把旧版 `.env` 中的 `AOPS_BASE_URL` 迁移为 `AOPS_BOT_URL`
 - 复用已有虚拟环境并重新覆盖离线依赖与 AOPS overlay
 - 自动备份旧 launchers 和旧 overlay 到 `INSTALL_DIR/upgrade-backups/<timestamp>/`
 - 如果之前已经在 `~/.local/bin` 建过链接，会自动延续
@@ -108,7 +107,7 @@ hermes-dashboard
 - `.env`
 
 如果这两个文件已经存在，安装脚本不会覆盖，只会继续沿用原配置。
-其中旧版 AOPS 地址变量 `AOPS_BASE_URL` 会自动改名为 `AOPS_BOT_URL`，已有 `AOPS_BOT_URL` 时优先保留新值。
+示例配置统一使用 `AOPS_BOT_URL`。如果现网环境里仍保留旧变量 `AOPS_BASE_URL`，运行时仍兼容读取旧值，但初始化/升级脚本不会自动改写已有 `.env`。
 
 也可以手工从下面两个模板复制：
 

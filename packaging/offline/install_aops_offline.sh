@@ -75,85 +75,6 @@ capture_upgrade_backup() {
   fi
 }
 
-migrate_aops_env_keys() {
-  local env_file="$1"
-  [[ -f "$env_file" ]] || return 0
-  "$VENV_DIR/bin/python" - "$env_file" <<'PY'
-import os
-import re
-import stat
-import sys
-import tempfile
-from pathlib import Path
-
-path = Path(sys.argv[1])
-try:
-    original = path.read_text(encoding="utf-8-sig", errors="replace").splitlines(keepends=True)
-except FileNotFoundError:
-    raise SystemExit(0)
-
-assign_re = re.compile(r"^([ \t]*(?:export[ \t]+)?)(AOPS_BASE_URL|AOPS_BOT_URL)([ \t]*=[ \t]*)(.*?)(\r?\n?)$")
-old_entries = []
-new_entries = []
-for idx, line in enumerate(original):
-    match = assign_re.match(line)
-    if not match:
-        continue
-    entry = (idx, match.groups())
-    if match.group(2) == "AOPS_BASE_URL":
-        old_entries.append(entry)
-    else:
-        new_entries.append(entry)
-
-if not old_entries:
-    raise SystemExit(0)
-
-old_value = old_entries[-1][1][3]
-old_value_nonempty = bool(old_value.strip().strip("\"'"))
-drop_old_indices = {idx for idx, _ in old_entries}
-changed = True
-result = list(original)
-
-if new_entries:
-    first_new_idx, first_new_groups = new_entries[0]
-    new_has_value = any(groups[3].strip().strip("\"'") for _, groups in new_entries)
-    if old_value_nonempty and not new_has_value:
-        prefix, _, sep, _, newline = first_new_groups
-        result[first_new_idx] = f"{prefix}AOPS_BOT_URL{sep}{old_value}{newline or os.linesep}"
-else:
-    first_old_idx, first_old_groups = old_entries[0]
-    prefix, _, sep, _, newline = first_old_groups
-    result[first_old_idx] = f"{prefix}AOPS_BOT_URL{sep}{old_value}{newline or os.linesep}"
-    drop_old_indices.discard(first_old_idx)
-
-result = [line for idx, line in enumerate(result) if idx not in drop_old_indices]
-
-if result == original:
-    raise SystemExit(0)
-
-mode = None
-try:
-    mode = stat.S_IMODE(path.stat().st_mode)
-except OSError:
-    pass
-
-fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".env_", suffix=".tmp")
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.writelines(result)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    if mode is not None:
-        os.chmod(path, mode)
-finally:
-    try:
-        os.unlink(tmp)
-    except FileNotFoundError:
-        pass
-PY
-}
-
 [[ -f "$PYTHON_TAR" ]] || fail "Bundled Python runtime not found"
 [[ -f "$REQUIREMENTS" ]] || fail "requirements.txt not found"
 [[ -f "$OVERLAY_MANIFEST" ]] || fail "overlay manifest not found"
@@ -289,10 +210,6 @@ if [[ "$INIT_CONFIG" == true ]]; then
     info "Initialized $HERMES_HOME/.env from example"
   else
     info "Keeping existing $HERMES_HOME/.env"
-  fi
-  if grep -qE '^[[:space:]]*(export[[:space:]]+)?AOPS_BASE_URL[[:space:]]*=' "$HERMES_HOME/.env"; then
-    migrate_aops_env_keys "$HERMES_HOME/.env"
-    info "Migrated AOPS_BASE_URL to AOPS_BOT_URL in $HERMES_HOME/.env"
   fi
 fi
 
