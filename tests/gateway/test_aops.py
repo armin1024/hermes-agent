@@ -150,6 +150,22 @@ def _make_aops_event(text: str) -> MessageEvent:
     )
 
 
+def _make_silent_aops_event(text: str, *, metadata: dict | None = None) -> MessageEvent:
+    event = _make_aops_event(text)
+    event.raw_message = {
+        "silent": True,
+        "model": "openclaw",
+        "metadata": {
+            "silent": True,
+            "id": 123456,
+            "botId": "bot-001",
+            "agentId": "main",
+            **(metadata or {}),
+        },
+    }
+    return event
+
+
 def _read_aops_wire_records(hermes_home):
     files = sorted((hermes_home / "logs" / "aops").glob("aops-wire-*.log"))
     records = []
@@ -278,6 +294,7 @@ async def test_aops_send_reply_event_inherits_silent_from_inbound_message():
 
     assert result.success is True
     assert fake_ws.sent[0]["data"]["silent"] is True
+    assert fake_ws.sent[0]["data"]["messageType"] == "silent"
 
 
 @pytest.mark.asyncio
@@ -298,6 +315,85 @@ async def test_aops_send_emits_start_then_end_with_inherited_silent():
     assert end["replyToId"] == "msg-1"
     assert start["silent"] is True
     assert end["silent"] is True
+    assert start["messageType"] == "silent"
+    assert end["messageType"] == "silent"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_defaults_message_type_to_common():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+
+    result = await adapter.send("user-001", "hello")
+
+    assert result.success is True
+    start = adapter.send_reply_event.await_args_list[0].args[0]
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert start["messageType"] == "common"
+    assert end["messageType"] == "common"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_uses_cron_message_type_from_metadata():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+
+    result = await adapter.send("user-001", "hello", metadata={"message_type": "cron"})
+
+    assert result.success is True
+    start = adapter.send_reply_event.await_args_list[0].args[0]
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert start["messageType"] == "cron"
+    assert end["messageType"] == "cron"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_cron_message_type_overrides_inherited_silent():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    adapter._reply_flags_by_message_id["msg-1"] = {"silent": True}
+
+    result = await adapter.send(
+        "user-001",
+        "hello",
+        reply_to="msg-1",
+        metadata={"message_type": "cron"},
+    )
+
+    assert result.success is True
+    start = adapter.send_reply_event.await_args_list[0].args[0]
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert start["silent"] is True
+    assert end["silent"] is True
+    assert start["messageType"] == "cron"
+    assert end["messageType"] == "cron"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_emits_structured_content_in_end_payload():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+
+    result = await adapter.send(
+        "user-001",
+        '{"ok":true}',
+        reply_to="msg-1",
+        metadata={
+            "content": [
+                {
+                    "type": "commandResult",
+                    "command": "clawhub explore --json",
+                    "body": {"items": [{"slug": "knowledge-query"}]},
+                }
+            ]
+        },
+    )
+
+    assert result.success is True
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert end["phase"] == "end"
+    assert end["content"][0]["type"] == "commandResult"
+    assert end["content"][0]["body"]["items"][0]["slug"] == "knowledge-query"
 
 
 def test_resolve_aops_client_id_reads_existing_file(monkeypatch, tmp_path):
@@ -1237,6 +1333,104 @@ async def test_aops_curator_invalid_subcommand_reaches_native_handler(monkeypatc
     assert "not supported on AOPS" not in result
     assert "invalid choice" in result
     assert "(exit 2)" in result
+
+
+@pytest.mark.asyncio
+async def test_aops_silent_skillhub_explore_returns_structured_result(monkeypatch):
+    from gateway import aops_skillhub_bridge
+    from gateway.aops_commands import LocalCommandResult
+
+    monkeypatch.setattr(
+        aops_skillhub_bridge,
+        "_list_market_items",
+        lambda: [
+            {
+                "slug": "knowledge-query",
+                "displayName": "knowledge-query",
+                "summary": "查询知识库。",
+                "tags": [],
+                "stats": {"downloads": 5, "stars": 0},
+                "updatedAt": 1779094163560,
+                "latestVersion": {"version": "20260518.084923"},
+            }
+        ],
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/bash clawhub explore --json"))
+
+    assert isinstance(result, LocalCommandResult)
+    assert result.content
+    payload = result.content[0]
+    assert payload["type"] == "commandResult"
+    assert payload["ok"] is True
+    assert payload["context"]["silent"] is True
+    assert payload["context"]["parentMessageId"] == 123456
+    assert payload["body"]["items"][0]["slug"] == "knowledge-query"
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    adapter._reply_flags_by_message_id["msg-1"] = {"silent": True}
+    await adapter.send("user-001", result.text, reply_to="msg-1", metadata={"content": result.content})
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert end["messageType"] == "silent"
+
+
+@pytest.mark.asyncio
+async def test_aops_silent_skillhub_install_returns_result_and_done(monkeypatch):
+    from gateway import aops_skillhub_bridge
+    from gateway.aops_commands import LocalCommandResult
+
+    monkeypatch.setattr(
+        aops_skillhub_bridge,
+        "_install_skill",
+        lambda slug: (True, {"ok": True, "action": "install", "slug": slug, "message": "installed", "installedPath": "research/comment-context"}),
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/bash clawhub install comment-context"))
+
+    assert isinstance(result, LocalCommandResult)
+    assert result.content
+    assert len(result.content) == 2
+    payload = result.content[0]
+    done_payload = result.content[1]
+    assert payload["body"]["action"] == "install"
+    assert payload["body"]["slug"] == "comment-context"
+    assert done_payload["done"] is True
+
+
+@pytest.mark.asyncio
+async def test_aops_silent_skillhub_uninstall_returns_result_and_done(monkeypatch):
+    from gateway import aops_skillhub_bridge
+    from gateway.aops_commands import LocalCommandResult
+
+    monkeypatch.setattr(
+        aops_skillhub_bridge,
+        "_uninstall_skill",
+        lambda slug: (True, {"ok": True, "action": "uninstall", "slug": slug, "message": "removed"}),
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/bash clawhub uninstall comment-context"))
+
+    assert isinstance(result, LocalCommandResult)
+    assert result.content
+    assert result.content[0]["body"]["action"] == "uninstall"
+    assert result.content[1]["done"] is True
+
+
+@pytest.mark.asyncio
+async def test_aops_silent_skillhub_invalid_subcommand_returns_error():
+    from gateway.aops_commands import LocalCommandResult
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    result = await runner._handle_message(_make_silent_aops_event("/bash clawhub test"))
+
+    assert isinstance(result, LocalCommandResult)
+    assert result.content
+    payload = result.content[0]
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "UNSUPPORTED_COMMAND"
 
 
 def test_clawhub_base_url_uses_registry_env(monkeypatch):

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.aops_skillhub_bridge import execute_silent_skillhub_command
 from gateway.platforms.base import MessageEvent
 
 LOCAL_LIST_SCHEMA = "local-command-list.v1"
@@ -268,6 +269,12 @@ class HelpNode:
             "completions": self.completions,
             "children": [child.to_dict() for child in self.children],
         }
+
+
+@dataclass(frozen=True)
+class LocalCommandResult:
+    text: str
+    content: list[dict[str, Any]] | None = None
 
 
 def is_aops_event(event: MessageEvent) -> bool:
@@ -854,8 +861,13 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
     )
 
 
-def maybe_local_command(event: MessageEvent) -> str | None:
+def maybe_local_command(event: MessageEvent) -> str | LocalCommandResult | None:
     command = event.get_command()
+    skillhub_results = execute_silent_skillhub_command(event)
+    if skillhub_results is not None:
+        content = [result.payload for result in skillhub_results]
+        text = json.dumps(content[0], ensure_ascii=False, indent=2) if content else ""
+        return LocalCommandResult(text=text, content=content)
     if not command:
         return None
     canonical = command.strip().lower().replace("_", "-")

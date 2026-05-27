@@ -145,6 +145,9 @@ done < "$RUNTIME_FILE_LIST"
 "$PYTHON_BIN" "$SCRIPT_DIR/verify_overlay_imports.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
 
 cat > "$BUNDLE_DIR/examples/config.aops.example.yaml" <<'EOF'
+display:
+  busy_input_mode: queue
+
 platforms:
   aops:
     enabled: true

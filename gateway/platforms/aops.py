@@ -189,6 +189,15 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _aops_message_type(*, metadata: dict[str, Any], inherited_silent: bool | None) -> str:
+    explicit = str(metadata.get("message_type") or "").strip().lower()
+    if explicit == "cron":
+        return "cron"
+    if inherited_silent is True:
+        return "silent"
+    return "common"
+
+
 def _format_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -968,6 +977,15 @@ class AopsAdapter(BasePlatformAdapter):
             reply_flags = self._reply_flags_by_message_id.get(reply_to_id) or {}
             if isinstance(reply_flags.get("silent"), bool):
                 data = {**data, "silent": reply_flags["silent"]}
+        if "messageType" not in data:
+            data = {
+                **data,
+                "messageType": (
+                    "cron"
+                    if str(data.get("messageType") or "").strip().lower() == "cron"
+                    else ("silent" if data.get("silent") is True else "common")
+                ),
+            }
         payload = {"event": "message_reply", "data": data}
         self._log_wire("info", direction="out", action="ws.send", payload=payload)
         return await self._send_payload(payload, channel_id=str(data.get("channelId") or ""))
@@ -997,6 +1015,7 @@ class AopsAdapter(BasePlatformAdapter):
             "channelId": chat_id,
             "conversationEnded": False,
             "ts": _now_ms(),
+            "messageType": _aops_message_type(metadata=metadata, inherited_silent=inherited_silent),
         }
         if reply_to:
             start_payload["replyToId"] = reply_to
@@ -1016,6 +1035,7 @@ class AopsAdapter(BasePlatformAdapter):
             "text": content,
             "conversationEnded": bool(metadata.get("conversation_ended", True)),
             "ts": _now_ms(),
+            "messageType": _aops_message_type(metadata=metadata, inherited_silent=inherited_silent),
         }
         if reply_to:
             end_payload["replyToId"] = reply_to

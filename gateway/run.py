@@ -4030,12 +4030,19 @@ class GatewayRunner:
             # Either way, agent ran without raising — count as success.
             return
 
+        response_content = None
+        if hasattr(response_text, "text") and hasattr(response_text, "content"):
+            response_content = getattr(response_text, "content", None)
+            response_text = getattr(response_text, "text", "") or ""
+
         # Send the agent's reply to the destination. Route to the new
         # thread if we created one; otherwise the configured home channel
         # (which may itself carry a thread_id).
         send_metadata: Dict[str, Any] = {}
         if effective_thread_id:
             send_metadata["thread_id"] = effective_thread_id
+        if response_content:
+            send_metadata["content"] = response_content
         try:
             result = await adapter.send(
                 chat_id=str(home.chat_id),
@@ -5807,7 +5814,7 @@ class GatewayRunner:
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
-    async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+    async def _handle_message(self, event: MessageEvent) -> Optional[Any]:
         """
         Handle an incoming message from any platform.
         

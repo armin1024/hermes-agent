@@ -2771,6 +2771,11 @@ class BasePlatformAdapter(ABC):
 
         try:
             response = await self._message_handler(event)
+
+            _response_content = None
+            if hasattr(response, "text") and hasattr(response, "content"):
+                _response_content = getattr(response, "content", None)
+                response = getattr(response, "text", "") or ""
             _text, _eph_ttl = self._unwrap_ephemeral(response)
             # Send the response BEFORE cancelling the old task so the send
             # cannot be affected by task-cancellation side effects (race
@@ -3189,6 +3194,8 @@ class BasePlatformAdapter(ABC):
                         _thread_metadata["notify"] = True
                     else:
                         _thread_metadata = {"notify": True}
+                    if _response_content:
+                        _thread_metadata["content"] = _response_content
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
