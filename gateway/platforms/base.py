@@ -3083,6 +3083,10 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            _response_content = None
+            if hasattr(response, "text") and hasattr(response, "content"):
+                _response_content = getattr(response, "content", None)
+                response = getattr(response, "text", "") or ""
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
