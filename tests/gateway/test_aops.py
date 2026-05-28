@@ -204,6 +204,23 @@ def _make_top_level_context_silent_aops_event(text: str) -> MessageEvent:
     return event
 
 
+def _make_wire_silent_aops_payload(text: str, *, message_id: str = "wire-msg-1") -> dict:
+    return {
+        "event": "message_posted",
+        "data": {
+            "id": message_id,
+            "userId": "user-001",
+            "userName": "AOPS User",
+            "agentKey": "main",
+            "text": text,
+            "channelId": "conv-001",
+            "channelType": "direct",
+            "timestamp": "2026-05-22T03:20:30Z",
+            "silent": True,
+        },
+    }
+
+
 def _read_aops_wire_records(hermes_home):
     files = sorted((hermes_home / "logs" / "aops").glob("aops-wire-*.log"))
     records = []
@@ -1541,6 +1558,30 @@ async def test_aops_silent_skillhub_explore_returns_structured_result(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_aops_silent_skillhub_reply_links_to_user_message_id(monkeypatch):
+    from gateway import aops_skillhub_bridge
+
+    monkeypatch.setattr(aops_skillhub_bridge, "_list_market_items", lambda: [])
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._message_handler = _make_runner(extra={"dm_policy": "open"})._handle_message
+    adapter._connected_event.set()
+    adapter._ws = _FakeWebSocket()
+
+    await adapter._dispatch_payload(_make_wire_silent_aops_payload("/bash clawhub explore --json", message_id="2106450357"))
+    if adapter._background_tasks:
+        await asyncio.gather(*list(adapter._background_tasks))
+
+    sent = [payload["data"] for payload in adapter._ws.sent if payload.get("event") == "message_reply"]
+    assert len(sent) == 2
+    assert [item["phase"] for item in sent] == ["start", "end"]
+    assert sent[0]["replyToId"] == "2106450357"
+    assert sent[1]["replyToId"] == "2106450357"
+    assert sent[0]["messageType"] == "silent"
+    assert sent[1]["messageType"] == "silent"
+    assert sent[1]["content"][0]["context"]["parentMessageId"] == "2106450357"
+
+
+@pytest.mark.asyncio
 async def test_aops_message_type_silent_skillhub_explore_returns_structured_result(monkeypatch):
     from gateway import aops_skillhub_bridge
     from gateway.aops_commands import LocalCommandResult
@@ -1663,6 +1704,49 @@ async def test_aops_silent_skillhub_install_returns_result_and_done(monkeypatch)
     assert done_payload["done"] is True
 
 
+def test_aops_skillhub_install_forces_clawhub_source_and_detects_cli_error(monkeypatch):
+    from gateway import aops_skillhub_bridge
+
+    identifiers = []
+
+    class _Source:
+        def inspect(self, slug):
+            return object()
+
+    def fake_install(identifier, **kwargs):
+        identifiers.append(identifier)
+        kwargs["console"].print("[bold red]Error:[/] No skill named 'machine-access-review' found in any source.")
+
+    monkeypatch.setattr(aops_skillhub_bridge, "_configure_clawhub_source_base_url", lambda: "http://clawhub.internal/api/v1")
+    monkeypatch.setattr(aops_skillhub_bridge, "_installed_path", lambda slug: None)
+    monkeypatch.setattr("tools.skills_hub.ClawHubSource", lambda: _Source())
+    monkeypatch.setattr("hermes_cli.skills_hub.do_install", fake_install)
+
+    ok, payload = aops_skillhub_bridge._install_skill("machine-access-review")
+
+    assert ok is False
+    assert payload["ok"] is False
+    assert identifiers == ["clawhub/machine-access-review"]
+    assert payload["error"]["code"] == "INSTALL_FAILED"
+
+
+def test_aops_skillhub_install_returns_not_found_when_clawhub_slug_missing(monkeypatch):
+    from gateway import aops_skillhub_bridge
+
+    class _Source:
+        def inspect(self, slug):
+            return None
+
+    monkeypatch.setattr(aops_skillhub_bridge, "_configure_clawhub_source_base_url", lambda: "http://clawhub.internal/api/v1")
+    monkeypatch.setattr("tools.skills_hub.ClawHubSource", lambda: _Source())
+
+    ok, payload = aops_skillhub_bridge._install_skill("missing-skill")
+
+    assert ok is False
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "SKILL_NOT_FOUND"
+
+
 @pytest.mark.asyncio
 async def test_aops_silent_skillhub_uninstall_returns_result_and_done(monkeypatch):
     from gateway import aops_skillhub_bridge
@@ -1681,6 +1765,22 @@ async def test_aops_silent_skillhub_uninstall_returns_result_and_done(monkeypatc
     assert result.content
     assert result.content[0]["action"] == "uninstall"
     assert result.content[1]["done"] is True
+
+
+def test_aops_skillhub_uninstall_detects_cli_error(monkeypatch):
+    from gateway import aops_skillhub_bridge
+
+    def fake_uninstall(name, **kwargs):
+        kwargs["console"].print("[bold red]Error:[/] 'missing-skill' is not a hub-installed skill (may be a builtin)")
+
+    monkeypatch.setattr(aops_skillhub_bridge, "_configure_clawhub_source_base_url", lambda: "http://clawhub.internal/api/v1")
+    monkeypatch.setattr("hermes_cli.skills_hub.do_uninstall", fake_uninstall)
+
+    ok, payload = aops_skillhub_bridge._uninstall_skill("missing-skill")
+
+    assert ok is False
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "UNINSTALL_FAILED"
 
 
 @pytest.mark.asyncio

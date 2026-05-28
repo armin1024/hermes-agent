@@ -182,6 +182,15 @@ def _clawhub_base_url() -> str:
     return str(ClawHubSource.BASE_URL).rstrip("/")
 
 
+def _configure_clawhub_source_base_url() -> str:
+    """Keep the shared Skills Hub ClawHub adapter aligned with CLAWHUB_REGISTRY."""
+    base_url = _clawhub_base_url()
+    from tools.skills_hub import ClawHubSource
+
+    ClawHubSource.BASE_URL = base_url
+    return base_url
+
+
 def _market_item_from_raw(item: dict[str, Any]) -> dict[str, Any] | None:
     slug = item.get("slug")
     if not isinstance(slug, str) or not slug:
@@ -200,6 +209,7 @@ def _market_item_from_raw(item: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _list_market_items() -> list[dict[str, Any]]:
+    base_url = _configure_clawhub_source_base_url()
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     cursor: str | None = None
@@ -209,7 +219,7 @@ def _list_market_items() -> list[dict[str, Any]]:
         params: dict[str, Any] = {"limit": 200}
         if cursor:
             params["cursor"] = cursor
-        resp = httpx.get(f"{_clawhub_base_url()}/skills", params=params, timeout=30)
+        resp = httpx.get(f"{base_url}/skills", params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         raw_items = data.get("items", data) if isinstance(data, dict) else data
@@ -241,6 +251,20 @@ def _capture_cli_call(fn, *args, **kwargs) -> tuple[bool, str]:
         return False, (stream.getvalue().strip() or str(exc))
 
 
+def _message_indicates_failure(message: str) -> bool:
+    lowered = message.lower()
+    failure_markers = (
+        "error:",
+        "installation blocked:",
+        "could not fetch",
+        "no skill named",
+        "cannot install",
+        "cancelled.",
+        "not a hub-installed skill",
+    )
+    return any(marker in lowered for marker in failure_markers)
+
+
 def _installed_path(slug: str) -> str | None:
     from tools.skills_hub import HubLockFile
 
@@ -253,38 +277,71 @@ def _installed_path(slug: str) -> str | None:
 
 def _install_skill(slug: str) -> tuple[bool, dict[str, Any]]:
     from hermes_cli.skills_hub import do_install
+    from tools.skills_hub import ClawHubSource
 
+    _configure_clawhub_source_base_url()
+    source = ClawHubSource()
+    if source.inspect(slug) is None:
+        message = f"No skill named '{slug}' found in ClawHub."
+        return False, {
+            "ok": False,
+            "action": "install",
+            "slug": slug,
+            "message": message,
+            "installedPath": None,
+            "error": {"code": "SKILL_NOT_FOUND", "message": message, "details": {}},
+        }
+
+    identifier = f"clawhub/{slug}"
     ok, message = _capture_cli_call(
         do_install,
-        slug,
+        identifier,
         skip_confirm=True,
         invalidate_cache=True,
     )
+    installed_path = _installed_path(slug)
+    if _message_indicates_failure(message) or not installed_path:
+        ok = False
     payload = {
         "ok": ok,
         "action": "install",
         "slug": slug,
         "message": message,
-        "installedPath": _installed_path(slug),
+        "installedPath": installed_path,
     }
+    if not ok:
+        payload["error"] = {
+            "code": "INSTALL_FAILED",
+            "message": message or f"Failed to install '{slug}'.",
+            "details": {},
+        }
     return ok, payload
 
 
 def _uninstall_skill(slug: str) -> tuple[bool, dict[str, Any]]:
     from hermes_cli.skills_hub import do_uninstall
 
+    _configure_clawhub_source_base_url()
     ok, message = _capture_cli_call(
         do_uninstall,
         slug,
         skip_confirm=True,
         invalidate_cache=True,
     )
+    if _message_indicates_failure(message):
+        ok = False
     payload = {
         "ok": ok,
         "action": "uninstall",
         "slug": slug,
         "message": message,
     }
+    if not ok:
+        payload["error"] = {
+            "code": "UNINSTALL_FAILED",
+            "message": message or f"Failed to uninstall '{slug}'.",
+            "details": {},
+        }
     return ok, payload
 
 
