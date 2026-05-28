@@ -906,6 +906,16 @@ class AopsAdapter(BasePlatformAdapter):
             "channelType": "direct",
             "timestamp": message_data.get("createdAt") or message_data.get("updatedAt"),
             "agentKey": agent_key or None,
+            "model": message_data.get("model"),
+            "metadata": metadata,
+            "messageType": message_data.get("messageType") or metadata.get("messageType"),
+            "silent": (
+                bool(metadata["silent"])
+                if isinstance(metadata.get("silent"), bool)
+                else bool(message_data["silent"])
+                if isinstance(message_data.get("silent"), bool)
+                else None
+            ),
         }
 
     def _build_message_event(self, data: dict[str, Any]) -> Optional[MessageEvent]:

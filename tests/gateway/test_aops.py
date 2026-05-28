@@ -166,6 +166,20 @@ def _make_silent_aops_event(text: str, *, metadata: dict | None = None) -> Messa
     return event
 
 
+def _make_message_type_silent_aops_event(text: str) -> MessageEvent:
+    event = _make_aops_event(text)
+    event.raw_message = {
+        "messageType": "silent",
+        "model": "openclaw",
+        "metadata": {
+            "id": 123456,
+            "botId": "bot-001",
+            "agentId": "main",
+        },
+    }
+    return event
+
+
 def _read_aops_wire_records(hermes_home):
     files = sorted((hermes_home / "logs" / "aops").glob("aops-wire-*.log"))
     records = []
@@ -1373,6 +1387,40 @@ async def test_aops_silent_skillhub_explore_returns_structured_result(monkeypatc
     await adapter.send("user-001", result.text, reply_to="msg-1", metadata={"content": result.content})
     end = adapter.send_reply_event.await_args_list[1].args[0]
     assert end["messageType"] == "silent"
+
+
+@pytest.mark.asyncio
+async def test_aops_message_type_silent_skillhub_explore_returns_structured_result(monkeypatch):
+    from gateway import aops_skillhub_bridge
+    from gateway.aops_commands import LocalCommandResult
+
+    monkeypatch.setattr(
+        aops_skillhub_bridge,
+        "_list_market_items",
+        lambda: [
+            {
+                "slug": "knowledge-query",
+                "displayName": "knowledge-query",
+                "summary": "查询知识库。",
+                "tags": [],
+                "stats": {"downloads": 5, "stars": 0},
+                "updatedAt": 1779094163560,
+                "latestVersion": {"version": "20260518.084923"},
+            }
+        ],
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_message_type_silent_aops_event("/bash clawhub explore --json"))
+
+    assert isinstance(result, LocalCommandResult)
+    assert result.content
+    payload = result.content[0]
+    assert payload["type"] == "commandResult"
+    assert payload["ok"] is True
+    assert payload["context"]["silent"] is True
+    assert payload["context"]["parentMessageId"] == 123456
+    assert payload["body"]["items"][0]["slug"] == "knowledge-query"
 
 
 @pytest.mark.asyncio

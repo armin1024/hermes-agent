@@ -31,8 +31,12 @@ def is_silent_skillhub_command(event: MessageEvent) -> bool:
     metadata = raw.get("metadata")
     if isinstance(metadata, dict) and isinstance(metadata.get("silent"), bool):
         return bool(metadata.get("silent"))
+    if isinstance(metadata, dict) and str(metadata.get("messageType") or "").strip().lower() == "silent":
+        return True
     if isinstance(raw.get("silent"), bool):
         return bool(raw.get("silent"))
+    if str(raw.get("messageType") or "").strip().lower() == "silent":
+        return True
     return False
 
 
