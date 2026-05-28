@@ -1704,47 +1704,44 @@ async def test_aops_silent_skillhub_install_returns_result_and_done(monkeypatch)
     assert done_payload["done"] is True
 
 
-def test_aops_skillhub_install_forces_clawhub_source_and_detects_cli_error(monkeypatch):
+def test_aops_skillhub_install_uses_cli_short_name_and_detects_cli_error(monkeypatch):
     from gateway import aops_skillhub_bridge
 
-    identifiers = []
-
-    class _Source:
-        def inspect(self, slug):
-            return object()
+    calls = []
 
     def fake_install(identifier, **kwargs):
-        identifiers.append(identifier)
+        calls.append((identifier, kwargs))
         kwargs["console"].print("[bold red]Error:[/] No skill named 'machine-access-review' found in any source.")
 
     monkeypatch.setattr(aops_skillhub_bridge, "_configure_clawhub_source_base_url", lambda: "http://clawhub.internal/api/v1")
     monkeypatch.setattr(aops_skillhub_bridge, "_installed_path", lambda slug: None)
-    monkeypatch.setattr("tools.skills_hub.ClawHubSource", lambda: _Source())
     monkeypatch.setattr("hermes_cli.skills_hub.do_install", fake_install)
 
     ok, payload = aops_skillhub_bridge._install_skill("machine-access-review")
 
     assert ok is False
     assert payload["ok"] is False
-    assert identifiers == ["clawhub/machine-access-review"]
+    assert calls[0][0] == "machine-access-review"
+    assert calls[0][1]["force"] is True
+    assert calls[0][1]["skip_confirm"] is True
     assert payload["error"]["code"] == "INSTALL_FAILED"
 
 
-def test_aops_skillhub_install_returns_not_found_when_clawhub_slug_missing(monkeypatch):
+def test_aops_skillhub_install_succeeds_when_cli_installs_short_name(monkeypatch):
     from gateway import aops_skillhub_bridge
 
-    class _Source:
-        def inspect(self, slug):
-            return None
+    def fake_install(identifier, **kwargs):
+        kwargs["console"].print("[bold green]Installed:[/] machine-access-review")
 
     monkeypatch.setattr(aops_skillhub_bridge, "_configure_clawhub_source_base_url", lambda: "http://clawhub.internal/api/v1")
-    monkeypatch.setattr("tools.skills_hub.ClawHubSource", lambda: _Source())
+    monkeypatch.setattr(aops_skillhub_bridge, "_installed_path", lambda slug: "machine-access-review")
+    monkeypatch.setattr("hermes_cli.skills_hub.do_install", fake_install)
 
-    ok, payload = aops_skillhub_bridge._install_skill("missing-skill")
+    ok, payload = aops_skillhub_bridge._install_skill("machine-access-review")
 
-    assert ok is False
-    assert payload["ok"] is False
-    assert payload["error"]["code"] == "SKILL_NOT_FOUND"
+    assert ok is True
+    assert payload["ok"] is True
+    assert payload["installedPath"] == "machine-access-review"
 
 
 @pytest.mark.asyncio

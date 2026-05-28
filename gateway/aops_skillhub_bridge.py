@@ -277,25 +277,12 @@ def _installed_path(slug: str) -> str | None:
 
 def _install_skill(slug: str) -> tuple[bool, dict[str, Any]]:
     from hermes_cli.skills_hub import do_install
-    from tools.skills_hub import ClawHubSource
 
     _configure_clawhub_source_base_url()
-    source = ClawHubSource()
-    if source.inspect(slug) is None:
-        message = f"No skill named '{slug}' found in ClawHub."
-        return False, {
-            "ok": False,
-            "action": "install",
-            "slug": slug,
-            "message": message,
-            "installedPath": None,
-            "error": {"code": "SKILL_NOT_FOUND", "message": message, "details": {}},
-        }
-
-    identifier = f"clawhub/{slug}"
     ok, message = _capture_cli_call(
         do_install,
-        identifier,
+        slug,
+        force=True,
         skip_confirm=True,
         invalidate_cache=True,
     )
