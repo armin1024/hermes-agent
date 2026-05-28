@@ -7,6 +7,7 @@ import getpass
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import queue
 import threading
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 
 try:
     import aiohttp
@@ -32,6 +33,10 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
+    cache_video_from_bytes,
     proxy_kwargs_for_aiohttp,
     resolve_proxy_url,
 )
@@ -49,6 +54,7 @@ _TOOL = object()
 _FINAL = object()
 _ERROR = object()
 _AOPS_CLIENT_ID_CACHE: dict[str, str] = {}
+_AOPS_MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 
 def check_aops_requirements() -> bool:
@@ -196,6 +202,66 @@ def _aops_message_type(*, metadata: dict[str, Any], inherited_silent: bool | Non
     if inherited_silent is True:
         return "silent"
     return "common"
+
+
+def _normalize_aops_attachment_type(attachment: dict[str, Any]) -> str:
+    raw_type = str(attachment.get("fileType") or attachment.get("file_type") or "").strip().lower()
+    mime_type = str(attachment.get("mimeType") or attachment.get("mime_type") or "").strip().lower()
+    file_name = str(attachment.get("fileName") or attachment.get("file_name") or "").strip()
+    guessed_mime = mimetypes.guess_type(file_name)[0] or ""
+    effective_mime = mime_type or guessed_mime.lower()
+
+    if raw_type in {"image", "audio", "video", "pdf", "document", "spreadsheet", "presentation", "text", "archive"}:
+        return raw_type
+    if effective_mime.startswith("image/"):
+        return "image"
+    if effective_mime.startswith("audio/"):
+        return "audio"
+    if effective_mime.startswith("video/"):
+        return "video"
+    if effective_mime == "application/pdf":
+        return "pdf"
+    if effective_mime.startswith("text/"):
+        return "text"
+    ext = Path(file_name).suffix.lower()
+    if ext in {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz"}:
+        return "archive"
+    if ext in {".doc", ".docx"}:
+        return "document"
+    if ext in {".xls", ".xlsx", ".csv"}:
+        return "spreadsheet"
+    if ext in {".ppt", ".pptx"}:
+        return "presentation"
+    return "unknown"
+
+
+def _message_type_for_aops_media(media_types: list[str]) -> MessageType:
+    normalized = [str(item or "").lower() for item in media_types]
+    if any(item.startswith("image/") for item in normalized):
+        return MessageType.PHOTO
+    if any(item.startswith("audio/") for item in normalized):
+        return MessageType.AUDIO
+    if any(item.startswith("video/") for item in normalized):
+        return MessageType.VIDEO
+    if normalized:
+        return MessageType.DOCUMENT
+    return MessageType.TEXT
+
+
+def _extension_for_aops_attachment(filename: str, mime_type: str, file_type: str) -> str:
+    ext = Path(filename).suffix
+    if ext:
+        return ext
+    guessed = mimetypes.guess_extension(mime_type or "")
+    if guessed:
+        return guessed
+    if file_type == "audio":
+        return ".ogg"
+    if file_type == "video":
+        return ".mp4"
+    if file_type == "image":
+        return ".jpg"
+    return ".bin"
 
 
 def _format_utc(dt: datetime) -> str:
@@ -834,6 +900,7 @@ class AopsAdapter(BasePlatformAdapter):
         event = self._build_message_event(data)
         if event is None:
             return
+        await self._attach_inbound_attachments(event)
         await self.handle_message(event)
 
     def _normalize_inbound_message(self, payload: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -908,6 +975,7 @@ class AopsAdapter(BasePlatformAdapter):
             "agentKey": agent_key or None,
             "model": message_data.get("model"),
             "metadata": metadata,
+            "attachments": message_data.get("attachments"),
             "messageType": message_data.get("messageType") or metadata.get("messageType"),
             "silent": (
                 bool(metadata["silent"])
@@ -967,6 +1035,81 @@ class AopsAdapter(BasePlatformAdapter):
             channel_prompt=channel_prompt,
             route_overrides=route_overrides,
         )
+
+    async def _attach_inbound_attachments(self, event: MessageEvent) -> None:
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        if raw.get("silent") is True or str(raw.get("messageType") or "").strip().lower() == "silent":
+            return
+        attachments = raw.get("attachments")
+        if not isinstance(attachments, list) or not attachments:
+            return
+
+        media_paths: list[str] = []
+        media_types: list[str] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            file_id = str(attachment.get("fileId") or attachment.get("file_id") or "").strip()
+            if not file_id:
+                continue
+            try:
+                cached_path, media_type = await self._download_and_cache_attachment(attachment)
+            except Exception as exc:
+                logger.warning("[%s] Failed to download AOPS attachment %s: %s", self.name, file_id, exc)
+                continue
+            if cached_path:
+                media_paths.append(cached_path)
+                media_types.append(media_type)
+
+        if media_paths:
+            event.media_urls.extend(media_paths)
+            event.media_types.extend(media_types)
+            event.message_type = _message_type_for_aops_media(media_types)
+
+    def _attachment_download_url(self, attachment: dict[str, Any]) -> str:
+        raw_url = str(attachment.get("downloadUrl") or attachment.get("download_url") or "").strip()
+        if raw_url:
+            return urljoin(f"{self._base_url}/", raw_url.lstrip("/"))
+        file_id = str(attachment.get("fileId") or attachment.get("file_id") or "").strip()
+        return urljoin(f"{self._base_url}/", f"api/v1/attachments/{quote(file_id, safe='')}/download")
+
+    async def _download_attachment_bytes(self, attachment: dict[str, Any]) -> tuple[bytes, str]:
+        if not self._session:
+            raise RuntimeError("AOPS session not initialized")
+        session_kwargs, request_kwargs = self._request_kwargs()
+        del session_kwargs
+        url = self._attachment_download_url(attachment)
+        async with self._session.get(url, headers=self._headers(), **request_kwargs) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                raise RuntimeError(f"attachment download failed ({resp.status}): {body[:200]}")
+            raw_size = resp.headers.get("Content-Length") if hasattr(resp, "headers") else None
+            try:
+                if raw_size and int(raw_size) > _AOPS_MAX_ATTACHMENT_BYTES:
+                    raise RuntimeError(f"attachment too large: {raw_size} bytes")
+            except ValueError:
+                pass
+            data = await resp.read()
+            if len(data) > _AOPS_MAX_ATTACHMENT_BYTES:
+                raise RuntimeError(f"attachment too large: {len(data)} bytes")
+            content_type = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip() if hasattr(resp, "headers") else ""
+            return data, content_type
+
+    async def _download_and_cache_attachment(self, attachment: dict[str, Any]) -> tuple[str, str]:
+        data, response_mime = await self._download_attachment_bytes(attachment)
+        file_name = str(attachment.get("fileName") or attachment.get("file_name") or attachment.get("fileId") or "aops_attachment")
+        declared_mime = str(attachment.get("mimeType") or attachment.get("mime_type") or "").strip()
+        media_type = response_mime or declared_mime or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+        file_type = _normalize_aops_attachment_type({**attachment, "mimeType": media_type})
+        ext = _extension_for_aops_attachment(file_name, media_type, file_type)
+
+        if file_type == "image":
+            return cache_image_from_bytes(data, ext), media_type
+        if file_type == "audio":
+            return cache_audio_from_bytes(data, ext), media_type
+        if file_type == "video":
+            return cache_video_from_bytes(data, ext), media_type
+        return cache_document_from_bytes(data, file_name), media_type
 
     async def _send_payload(self, payload: dict[str, Any], *, channel_id: str) -> SendResult:
         try:

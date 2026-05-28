@@ -15,7 +15,7 @@ import pytest
 import gateway.run as gateway_run
 from agent.prompt_builder import PLATFORM_HINTS
 from gateway.config import GatewayConfig, Platform, PlatformConfig, _apply_env_overrides
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms.aops import AopsAdapter, AopsLiveReplyBridge, SendResult
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -42,10 +42,12 @@ class _CapturingAgent:
 
 
 class _FakeResponse:
-    def __init__(self, *, status=200, payload=None, text=""):
+    def __init__(self, *, status=200, payload=None, text="", body=b"", headers=None):
         self.status = status
         self._payload = payload or {}
         self._text = text
+        self._body = body
+        self.headers = headers or {}
 
     async def __aenter__(self):
         return self
@@ -58,6 +60,9 @@ class _FakeResponse:
 
     async def text(self):
         return self._text
+
+    async def read(self):
+        return self._body
 
 
 class _FakeWebSocket:
@@ -86,9 +91,12 @@ class _FakeClientSession:
         self.get_calls = []
         self.post_calls = []
         self.ws_calls = []
+        self.get_responses = []
 
     def get(self, url, **kwargs):
         self.get_calls.append((url, kwargs))
+        if self.get_responses:
+            return self.get_responses.pop(0)
         return _FakeResponse(payload={"id": "bot-001", "name": "AOPS Bot"})
 
     def post(self, url, **kwargs):
@@ -810,6 +818,133 @@ def test_group_channel_type_maps_to_group_and_bot_messages_are_ignored():
             "channelType": "direct",
         }
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_aops_inbound_attachment_downloads_to_media_event(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    fake_ws = _FakeWebSocket()
+    fake_session = _FakeClientSession(fake_ws)
+    fake_session.get_responses.append(
+        _FakeResponse(
+            body=b"\x89PNG\r\n\x1a\nfake-png",
+            headers={"Content-Type": "image/png", "Content-Length": "16"},
+        )
+    )
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._session = fake_session
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-attach-1",
+            "userId": "user-001",
+            "text": "请分析附件",
+            "channelId": "user-001",
+            "channelType": "direct",
+            "attachments": [
+                {
+                    "fileId": "cms_file_001",
+                    "fileName": "告警截图.png",
+                    "mimeType": "image/png",
+                    "fileType": "image",
+                    "size": 16,
+                    "downloadUrl": "/api/v1/attachments/cms_file_001/download",
+                }
+            ],
+        }
+    )
+
+    await adapter._attach_inbound_attachments(event)
+
+    assert event.message_type == MessageType.PHOTO
+    assert event.media_types == ["image/png"]
+    assert len(event.media_urls) == 1
+    assert Path(event.media_urls[0]).exists()
+    assert fake_session.get_calls[0][0] == "https://aops.example.com/api/v1/attachments/cms_file_001/download"
+    assert fake_session.get_calls[0][1]["headers"]["Authorization"] == "Bearer tok"
+    assert "tec-client-ip" in fake_session.get_calls[0][1]["headers"]
+
+
+@pytest.mark.asyncio
+async def test_aops_inbound_attachment_uses_file_id_download_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    fake_ws = _FakeWebSocket()
+    fake_session = _FakeClientSession(fake_ws)
+    fake_session.get_responses.append(
+        _FakeResponse(
+            body=b"hello",
+            headers={"Content-Type": "text/plain", "Content-Length": "5"},
+        )
+    )
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._session = fake_session
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-attach-2",
+            "userId": "user-001",
+            "text": "看附件",
+            "channelId": "user-001",
+            "attachments": [{"fileId": "file with space", "fileName": "note.txt"}],
+        }
+    )
+
+    await adapter._attach_inbound_attachments(event)
+
+    assert event.message_type == MessageType.DOCUMENT
+    assert event.media_types == ["text/plain"]
+    assert fake_session.get_calls[0][0] == "https://aops.example.com/api/v1/attachments/file%20with%20space/download"
+
+
+@pytest.mark.asyncio
+async def test_aops_silent_inbound_attachment_is_ignored(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    fake_ws = _FakeWebSocket()
+    fake_session = _FakeClientSession(fake_ws)
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._session = fake_session
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-silent-attach",
+            "userId": "user-001",
+            "text": "/bash clawhub explore --json",
+            "channelId": "user-001",
+            "silent": True,
+            "attachments": [{"fileId": "cms_file_001", "fileName": "a.png"}],
+        }
+    )
+
+    await adapter._attach_inbound_attachments(event)
+
+    assert event.media_urls == []
+    assert fake_session.get_calls == []
+
+
+@pytest.mark.asyncio
+async def test_aops_inbound_attachment_failure_keeps_text_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    fake_ws = _FakeWebSocket()
+    fake_session = _FakeClientSession(fake_ws)
+    fake_session.get_responses.append(_FakeResponse(status=403, text='{"status":403}'))
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._session = fake_session
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-attach-fail",
+            "userId": "user-001",
+            "text": "附件失败也要处理文本",
+            "channelId": "user-001",
+            "attachments": [{"fileId": "cms_file_403", "fileName": "secret.pdf"}],
+        }
+    )
+
+    await adapter._attach_inbound_attachments(event)
+
+    assert event.text == "附件失败也要处理文本"
+    assert event.message_type == MessageType.TEXT
+    assert event.media_urls == []
 
 
 @pytest.mark.asyncio
