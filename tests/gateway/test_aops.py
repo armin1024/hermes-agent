@@ -397,7 +397,7 @@ async def test_aops_send_emits_structured_content_in_end_payload():
                 {
                     "type": "commandResult",
                     "command": "clawhub explore --json",
-                    "body": {"items": [{"slug": "knowledge-query"}]},
+                    "items": [{"slug": "knowledge-query"}],
                 }
             ]
         },
@@ -407,7 +407,7 @@ async def test_aops_send_emits_structured_content_in_end_payload():
     end = adapter.send_reply_event.await_args_list[1].args[0]
     assert end["phase"] == "end"
     assert end["content"][0]["type"] == "commandResult"
-    assert end["content"][0]["body"]["items"][0]["slug"] == "knowledge-query"
+    assert end["content"][0]["items"][0]["slug"] == "knowledge-query"
 
 
 def test_resolve_aops_client_id_reads_existing_file(monkeypatch, tmp_path):
@@ -1380,7 +1380,7 @@ async def test_aops_silent_skillhub_explore_returns_structured_result(monkeypatc
     assert payload["ok"] is True
     assert payload["context"]["silent"] is True
     assert payload["context"]["parentMessageId"] == 123456
-    assert payload["body"]["items"][0]["slug"] == "knowledge-query"
+    assert payload["items"][0]["slug"] == "knowledge-query"
     adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
     adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
     adapter._reply_flags_by_message_id["msg-1"] = {"silent": True}
@@ -1420,7 +1420,54 @@ async def test_aops_message_type_silent_skillhub_explore_returns_structured_resu
     assert payload["ok"] is True
     assert payload["context"]["silent"] is True
     assert payload["context"]["parentMessageId"] == 123456
-    assert payload["body"]["items"][0]["slug"] == "knowledge-query"
+    assert payload["items"][0]["slug"] == "knowledge-query"
+
+
+def test_aops_skillhub_market_list_calls_clawhub_listing_api(monkeypatch):
+    from gateway import aops_skillhub_bridge
+
+    calls = []
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "items": [
+                    {
+                        "slug": "knowledge-query",
+                        "displayName": "Knowledge Query",
+                        "summary": "查询知识库。",
+                        "tags": ["knowledge"],
+                        "stats": {"downloads": 5, "stars": 1},
+                        "updatedAt": "2026-05-18T08:49:23Z",
+                        "latestVersion": {"version": "20260518.084923"},
+                    }
+                ]
+            }
+
+    def fake_get(url, *, params, timeout):
+        calls.append((url, params, timeout))
+        return _Resp()
+
+    monkeypatch.setenv("CLAWHUB_REGISTRY", "https://clawhub.internal")
+    monkeypatch.setattr(aops_skillhub_bridge.httpx, "get", fake_get)
+
+    items = aops_skillhub_bridge._list_market_items()
+
+    assert calls == [("https://clawhub.internal/api/v1/skills", {"limit": 200}, 30)]
+    assert items == [
+        {
+            "slug": "knowledge-query",
+            "displayName": "Knowledge Query",
+            "summary": "查询知识库。",
+            "tags": ["knowledge"],
+            "stats": {"downloads": 5, "stars": 1},
+            "updatedAt": 1779094163000,
+            "latestVersion": {"version": "20260518.084923"},
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1442,8 +1489,8 @@ async def test_aops_silent_skillhub_install_returns_result_and_done(monkeypatch)
     assert len(result.content) == 2
     payload = result.content[0]
     done_payload = result.content[1]
-    assert payload["body"]["action"] == "install"
-    assert payload["body"]["slug"] == "comment-context"
+    assert payload["action"] == "install"
+    assert payload["slug"] == "comment-context"
     assert done_payload["done"] is True
 
 
@@ -1463,7 +1510,7 @@ async def test_aops_silent_skillhub_uninstall_returns_result_and_done(monkeypatc
 
     assert isinstance(result, LocalCommandResult)
     assert result.content
-    assert result.content[0]["body"]["action"] == "uninstall"
+    assert result.content[0]["action"] == "uninstall"
     assert result.content[1]["done"] is True
 
 

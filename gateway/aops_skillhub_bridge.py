@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+import httpx
 from rich.console import Console
 
 from gateway.platforms.base import MessageEvent
@@ -131,28 +133,56 @@ def _latest_version(extra: dict[str, Any]) -> dict[str, Any]:
     return {"version": None}
 
 
-def _list_market_items() -> list[dict[str, Any]]:
-    from tools.skills_hub import ClawHubSource
+def _clawhub_base_url() -> str:
+    registry = os.environ.get("CLAWHUB_REGISTRY", "https://clawhub.ai").rstrip("/")
+    return f"{registry}/api/v1"
 
-    source = ClawHubSource()
-    catalog = source._load_catalog_index()
+
+def _market_item_from_raw(item: dict[str, Any]) -> dict[str, Any] | None:
+    slug = item.get("slug")
+    if not isinstance(slug, str) or not slug:
+        return None
+    display_name = item.get("displayName") or item.get("name") or slug
+    summary = item.get("summary") or item.get("description") or ""
+    return {
+        "slug": slug,
+        "displayName": str(display_name),
+        "summary": str(summary),
+        "tags": [str(tag) for tag in item.get("tags", [])] if isinstance(item.get("tags"), list) else [],
+        "stats": _coerce_stats(item),
+        "updatedAt": _entry_updated_ms(item),
+        "latestVersion": _latest_version(item),
+    }
+
+
+def _list_market_items() -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for meta in catalog:
-        extra = dict(meta.extra or {})
-        slug = meta.identifier
-        if not slug:
-            continue
-        items.append(
-            {
-                "slug": slug,
-                "displayName": meta.name,
-                "summary": meta.description,
-                "tags": list(meta.tags or []),
-                "stats": _coerce_stats(extra),
-                "updatedAt": _entry_updated_ms(extra),
-                "latestVersion": _latest_version(extra),
-            }
-        )
+    seen: set[str] = set()
+    cursor: str | None = None
+    max_pages = 50
+
+    for _ in range(max_pages):
+        params: dict[str, Any] = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        resp = httpx.get(f"{_clawhub_base_url()}/skills", params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        raw_items = data.get("items", data) if isinstance(data, dict) else data
+        if not isinstance(raw_items, list) or not raw_items:
+            break
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            item = _market_item_from_raw(raw_item)
+            if not item or item["slug"] in seen:
+                continue
+            seen.add(item["slug"])
+            items.append(item)
+        cursor = data.get("nextCursor") if isinstance(data, dict) else None
+        if not isinstance(cursor, str) or not cursor:
+            break
+
     return items
 
 
@@ -239,7 +269,7 @@ def execute_silent_skillhub_command(event: MessageEvent) -> list[SkillHubBridgeR
                         "ok": True,
                         "command": command,
                         "context": _request_context(event),
-                        "body": {"items": items},
+                        "items": items,
                     },
                 )
             ]
@@ -259,7 +289,7 @@ def execute_silent_skillhub_command(event: MessageEvent) -> list[SkillHubBridgeR
                 "ok": ok,
                 "command": command,
                 "context": _request_context(event),
-                "body": body,
+                **body,
             },
         )
         return [result, _done_result(event, command)]
@@ -277,7 +307,7 @@ def execute_silent_skillhub_command(event: MessageEvent) -> list[SkillHubBridgeR
                 "ok": ok,
                 "command": command,
                 "context": _request_context(event),
-                "body": body,
+                **body,
             },
         )
         return [result, _done_result(event, command)]
