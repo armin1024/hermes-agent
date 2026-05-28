@@ -5,9 +5,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -57,11 +59,11 @@ def _request_context(event: MessageEvent) -> dict[str, Any]:
     metadata = _metadata(event)
     model = None
     if isinstance(raw, dict):
-        model = raw.get("model")
+        model = raw.get("model") or metadata.get("model")
     return {
-        "parentMessageId": metadata.get("id"),
-        "botId": metadata.get("botId"),
-        "agentId": metadata.get("agentId"),
+        "parentMessageId": metadata.get("id") or (raw.get("id") if isinstance(raw, dict) else None) or getattr(event, "message_id", None),
+        "botId": metadata.get("botId") or (raw.get("botId") if isinstance(raw, dict) else None),
+        "agentId": metadata.get("agentId") or (raw.get("agentId") if isinstance(raw, dict) else None) or (raw.get("agentKey") if isinstance(raw, dict) else None),
         "model": model,
         "silent": True,
     }
@@ -133,9 +135,51 @@ def _latest_version(extra: dict[str, Any]) -> dict[str, Any]:
     return {"version": None}
 
 
+def _shell_value(raw: str) -> str | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        parts = shlex.split(raw, comments=True, posix=True)
+        if parts:
+            return parts[0].strip() or None
+    except ValueError:
+        pass
+    value = raw.split("#", 1)[0].strip().strip("'\"")
+    return value or None
+
+
+def _load_clawhub_registry_from_shell_init() -> None:
+    if os.environ.get("CLAWHUB_REGISTRY"):
+        return
+    for name in (".bashrc", ".bash_profile", ".profile"):
+        path = Path.home() / name
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[len("export "):].lstrip()
+            if not stripped.startswith("CLAWHUB_REGISTRY="):
+                continue
+            value = _shell_value(stripped.split("=", 1)[1])
+            if value:
+                os.environ["CLAWHUB_REGISTRY"] = value
+                return
+
+
 def _clawhub_base_url() -> str:
-    registry = os.environ.get("CLAWHUB_REGISTRY", "https://clawhub.ai").rstrip("/")
-    return f"{registry}/api/v1"
+    _load_clawhub_registry_from_shell_init()
+    from tools.skills_hub import ClawHubSource
+
+    registry = os.environ.get("CLAWHUB_REGISTRY", "").strip().rstrip("/")
+    if registry:
+        return f"{registry}/api/v1"
+    return str(ClawHubSource.BASE_URL).rstrip("/")
 
 
 def _market_item_from_raw(item: dict[str, Any]) -> dict[str, Any] | None:

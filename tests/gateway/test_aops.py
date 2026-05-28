@@ -1,5 +1,7 @@
 import asyncio
+import importlib
 import json
+import os
 import sys
 import threading
 import types
@@ -177,6 +179,20 @@ def _make_message_type_silent_aops_event(text: str) -> MessageEvent:
             "agentId": "main",
         },
     }
+    return event
+
+
+def _make_top_level_context_silent_aops_event(text: str) -> MessageEvent:
+    event = _make_aops_event(text)
+    event.raw_message = {
+        "id": "msg-top-1",
+        "botId": "bot-top",
+        "agentId": "agent-top",
+        "model": "openclaw",
+        "messageType": "silent",
+        "metadata": {},
+    }
+    event.message_id = "msg-top-1"
     return event
 
 
@@ -1471,6 +1487,24 @@ def test_aops_skillhub_market_list_calls_clawhub_listing_api(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_aops_skillhub_context_falls_back_to_top_level_fields(monkeypatch):
+    from gateway import aops_skillhub_bridge
+    from gateway.aops_commands import LocalCommandResult
+
+    monkeypatch.setattr(aops_skillhub_bridge, "_list_market_items", lambda: [])
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_top_level_context_silent_aops_event("/bash clawhub explore --json"))
+
+    assert isinstance(result, LocalCommandResult)
+    payload = result.content[0]
+    assert payload["context"]["parentMessageId"] == "msg-top-1"
+    assert payload["context"]["botId"] == "bot-top"
+    assert payload["context"]["agentId"] == "agent-top"
+    assert payload["context"]["model"] == "openclaw"
+
+
+@pytest.mark.asyncio
 async def test_aops_silent_skillhub_install_returns_result_and_done(monkeypatch):
     from gateway import aops_skillhub_bridge
     from gateway.aops_commands import LocalCommandResult
@@ -1529,13 +1563,41 @@ async def test_aops_silent_skillhub_invalid_subcommand_returns_error():
 
 
 def test_clawhub_base_url_uses_registry_env(monkeypatch):
-    import importlib
     import tools.skills_hub as skills_hub
 
     monkeypatch.setenv("CLAWHUB_REGISTRY", "http://clawhub.internal")
     reloaded = importlib.reload(skills_hub)
     try:
         assert reloaded.ClawHubSource.BASE_URL == "http://clawhub.internal/api/v1"
+    finally:
+        monkeypatch.delenv("CLAWHUB_REGISTRY", raising=False)
+        importlib.reload(skills_hub)
+
+
+def test_aops_clawhub_base_url_reuses_skills_hub_registry_env(monkeypatch):
+    import gateway.aops_skillhub_bridge as bridge
+    import tools.skills_hub as skills_hub
+
+    monkeypatch.setenv("CLAWHUB_REGISTRY", "http://clawhub.internal")
+    importlib.reload(skills_hub)
+    try:
+        assert bridge._clawhub_base_url() == skills_hub.ClawHubSource.BASE_URL
+    finally:
+        monkeypatch.delenv("CLAWHUB_REGISTRY", raising=False)
+        importlib.reload(skills_hub)
+
+
+def test_aops_clawhub_base_url_reads_bashrc_when_process_env_missing(monkeypatch, tmp_path):
+    import gateway.aops_skillhub_bridge as bridge
+    import tools.skills_hub as skills_hub
+
+    (tmp_path / ".bashrc").write_text("export CLAWHUB_REGISTRY=http://bashrc-clawhub.internal\n", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("CLAWHUB_REGISTRY", raising=False)
+    importlib.reload(skills_hub)
+    try:
+        assert bridge._clawhub_base_url() == "http://bashrc-clawhub.internal/api/v1"
+        assert os.environ["CLAWHUB_REGISTRY"] == "http://bashrc-clawhub.internal"
     finally:
         monkeypatch.delenv("CLAWHUB_REGISTRY", raising=False)
         importlib.reload(skills_hub)
