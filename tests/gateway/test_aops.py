@@ -221,6 +221,16 @@ def _make_wire_silent_aops_payload(text: str, *, message_id: str = "wire-msg-1")
     }
 
 
+def _aops_messages_text(system_text: str, user_text: str) -> str:
+    return json.dumps(
+        [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ],
+        ensure_ascii=False,
+    )
+
+
 def _read_aops_wire_records(hermes_home):
     files = sorted((hermes_home / "logs" / "aops").glob("aops-wire-*.log"))
     records = []
@@ -231,6 +241,10 @@ def _read_aops_wire_records(hermes_home):
             if line.strip()
         )
     return records
+
+
+def _aops_wire_actions(hermes_home):
+    return [record.get("action") for record in _read_aops_wire_records(hermes_home)]
 
 
 def test_platform_aops_registered():
@@ -880,6 +894,9 @@ async def test_aops_inbound_attachment_downloads_to_media_event(monkeypatch, tmp
     assert fake_session.get_calls[0][0] == "https://aops.example.com/api/v1/attachments/cms_file_001/download"
     assert fake_session.get_calls[0][1]["headers"]["Authorization"] == "Bearer tok"
     assert "tec-client-ip" in fake_session.get_calls[0][1]["headers"]
+    actions = _aops_wire_actions(tmp_path)
+    assert "attachment.download.start" in actions
+    assert "attachment.download.success" in actions
 
 
 @pytest.mark.asyncio
@@ -936,6 +953,7 @@ async def test_aops_silent_inbound_attachment_is_ignored(tmp_path, monkeypatch):
 
     assert event.media_urls == []
     assert fake_session.get_calls == []
+    assert "attachment.download.skipped" in _aops_wire_actions(tmp_path)
 
 
 @pytest.mark.asyncio
@@ -959,9 +977,46 @@ async def test_aops_inbound_attachment_failure_keeps_text_event(tmp_path, monkey
 
     await adapter._attach_inbound_attachments(event)
 
-    assert event.text == "附件失败也要处理文本"
+    assert "附件失败也要处理文本" in event.text
+    assert "下载失败" in event.text
+    assert "无法识别" in event.text
     assert event.message_type == MessageType.TEXT
     assert event.media_urls == []
+    assert "attachment.download.failed" in _aops_wire_actions(tmp_path)
+
+
+def test_aops_extracts_user_content_from_messages_json():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-json-text",
+            "userId": "user-001",
+            "text": _aops_messages_text("系统提示", "识别图片问题"),
+            "channelId": "user-001",
+        }
+    )
+
+    assert event is not None
+    assert event.text == "识别图片问题"
+    assert event.raw_message["metadata"]["aopsRawTextWasMessages"] is True
+
+
+def test_aops_plain_text_is_not_marked_as_messages_json():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-plain-text",
+            "userId": "user-001",
+            "text": "普通问题",
+            "channelId": "user-001",
+        }
+    )
+
+    assert event is not None
+    assert event.text == "普通问题"
+    assert "aopsRawTextWasMessages" not in event.raw_message.get("metadata", {})
 
 
 @pytest.mark.asyncio
@@ -1164,6 +1219,18 @@ async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
     monkeypatch.setattr(
         skill_commands,
+        "scan_skill_commands",
+        lambda: {
+            "/restart-service": {
+                "name": "Restart Service",
+                "description": "Restart a service safely.",
+                "skill_md_path": str(skill_dir / "SKILL.md"),
+                "skill_dir": str(skill_dir),
+            }
+        },
+    )
+    monkeypatch.setattr(
+        skill_commands,
         "get_skill_commands",
         lambda: {
             "/restart-service": {
@@ -1189,7 +1256,13 @@ async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path
     assert items_by_id["ops/restart-service"]["homepage"] == "https://example.com/restart-service"
     assert items_by_id["ops/restart-service"]["command"] == "/restart-service"
     assert items_by_id["ops/draft-notes"]["name"] == "Draft Notes"
-    assert items_by_id["ops/draft-notes"]["command"] is None
+    assert items_by_id["ops/draft-notes"]["command"] == "/draft-notes"
+
+    result = await runner._handle_message(_make_aops_event("/skills list"))
+    payload = json.loads(result)
+    items_by_id = {item["id"]: item for item in payload["items"]}
+    assert items_by_id["ops/restart-service"]["command"] == "/restart-service"
+    assert items_by_id["ops/draft-notes"]["command"] == "/draft-notes"
 
 
 @pytest.mark.asyncio

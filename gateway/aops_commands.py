@@ -380,6 +380,17 @@ def _tokens(raw_args: str) -> list[str]:
         return raw_args.split()
 
 
+_SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
+_SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
+
+
+def _skill_command_slug(name: str) -> str:
+    cmd_name = str(name or "").strip().lower().replace(" ", "-").replace("_", "-")
+    cmd_name = _SKILL_INVALID_CHARS.sub("", cmd_name)
+    cmd_name = _SKILL_MULTI_HYPHEN.sub("-", cmd_name).strip("-")
+    return f"/{cmd_name}" if cmd_name else ""
+
+
 def _aops_skill_commands(config: Any) -> dict[str, dict[str, Any]]:
     try:
         from agent.skill_commands import get_skill_commands
@@ -529,20 +540,29 @@ def _status_to_delivery(status: str | None, delivery_error: str | None, delivere
 
 
 def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    from agent.skill_commands import get_skill_commands
+    from agent.skill_commands import get_skill_commands, scan_skill_commands
     from agent.skill_utils import iter_skill_index_files
-    from tools.skills_tool import SKILLS_DIR, _parse_frontmatter
+    from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform
 
     skills_root = SKILLS_DIR
     items: list[dict[str, Any]] = []
     command_by_path: dict[str, str] = {}
+    command_by_name: dict[str, str] = {}
     try:
-        for command, info in get_skill_commands().items():
+        commands = scan_skill_commands() or get_skill_commands()
+        for command, info in commands.items():
+            normalized_command = str(command or "").strip().lower().replace("_", "-")
+            if not normalized_command.startswith("/"):
+                normalized_command = f"/{normalized_command.lstrip('/')}"
             skill_md_path = str(info.get("skill_md_path") or "").strip()
             if skill_md_path:
-                command_by_path[str(Path(skill_md_path).resolve())] = command
+                command_by_path[str(Path(skill_md_path).resolve())] = normalized_command
+            name = str(info.get("name") or "").strip()
+            if name:
+                command_by_name[name] = normalized_command
     except Exception:
         command_by_path = {}
+        command_by_name = {}
     if skills_root.exists():
         for skill_md in iter_skill_index_files(skills_root, "SKILL.md"):
             parts = set(skill_md.parts)
@@ -553,15 +573,27 @@ def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 frontmatter, _body = _parse_frontmatter(content)
             except Exception:
                 frontmatter = {}
+            try:
+                if not skill_matches_platform(frontmatter):
+                    continue
+            except Exception:
+                pass
             name = str(frontmatter.get("name") or skill_md.parent.name)
             item_id = _safe_relative(skill_md.parent, skills_root)
+            command = (
+                command_by_path.get(str(skill_md.resolve()))
+                or command_by_name.get(name)
+                or _skill_command_slug(name)
+                or _skill_command_slug(skill_md.parent.name)
+                or None
+            )
             items.append(
                 {
                     "id": item_id,
                     "name": name,
                     "description": frontmatter.get("description") or None,
                     "homepage": frontmatter.get("homepage") or frontmatter.get("url") or None,
-                    "command": command_by_path.get(str(skill_md.resolve())),
+                    "command": command,
                     "path": str(skill_md),
                 }
             )

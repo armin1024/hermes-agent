@@ -248,6 +248,28 @@ def _message_type_for_aops_media(media_types: list[str]) -> MessageType:
     return MessageType.TEXT
 
 
+def _extract_aops_text(raw_text: Any) -> tuple[str, bool]:
+    text = str(raw_text or "")
+    stripped = text.strip()
+    if not stripped.startswith("["):
+        return text, False
+    try:
+        messages = json.loads(stripped)
+    except Exception:
+        return text, False
+    if not isinstance(messages, list):
+        return text, False
+    for item in reversed(messages):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "").strip().lower() != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str) and content.strip():
+            return content, True
+    return text, False
+
+
 def _extension_for_aops_attachment(filename: str, mime_type: str, file_type: str) -> str:
     ext = Path(filename).suffix
     if ext:
@@ -952,8 +974,8 @@ class AopsAdapter(BasePlatformAdapter):
             or str(message_data.get("ownerUserId") or "").strip()
         )
         channel_id = str(message_data.get("conversationId") or "").strip()
-        text = str(message_data.get("content") or "").strip()
-        if not user_id or not channel_id or not text:
+        raw_text = str(message_data.get("content") or "").strip()
+        if not user_id or not channel_id or not raw_text:
             return None
 
         agent_key = str(
@@ -964,6 +986,9 @@ class AopsAdapter(BasePlatformAdapter):
         if agent_key == "main":
             agent_key = ""
 
+        text, text_was_messages = _extract_aops_text(message_data.get("content"))
+        if text_was_messages:
+            metadata = {**metadata, "aopsRawTextWasMessages": True}
         return {
             "id": message_id,
             "userId": user_id,
@@ -1025,8 +1050,14 @@ class AopsAdapter(BasePlatformAdapter):
         }
         if isinstance(data.get("silent"), bool):
             self._reply_flags_by_message_id[message_id] = {"silent": bool(data["silent"])}
+        text, text_was_messages = _extract_aops_text(data.get("text"))
+        if text_was_messages:
+            metadata = data.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            data = {**data, "metadata": {**metadata, "aopsRawTextWasMessages": True}}
         return MessageEvent(
-            text=str(data.get("text") or ""),
+            text=text,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=data,
@@ -1039,6 +1070,12 @@ class AopsAdapter(BasePlatformAdapter):
     async def _attach_inbound_attachments(self, event: MessageEvent) -> None:
         raw = event.raw_message if isinstance(event.raw_message, dict) else {}
         if raw.get("silent") is True or str(raw.get("messageType") or "").strip().lower() == "silent":
+            self._log_wire(
+                "info",
+                direction="drop",
+                action="attachment.download.skipped",
+                payload={"messageId": getattr(event, "message_id", None), "reason": "silent"},
+            )
             return
         attachments = raw.get("attachments")
         if not isinstance(attachments, list) or not attachments:
@@ -1046,25 +1083,73 @@ class AopsAdapter(BasePlatformAdapter):
 
         media_paths: list[str] = []
         media_types: list[str] = []
+        failures: list[str] = []
         for attachment in attachments:
             if not isinstance(attachment, dict):
+                self._log_wire(
+                    "warning",
+                    direction="drop",
+                    action="attachment.download.skipped",
+                    payload={"messageId": getattr(event, "message_id", None), "reason": "invalid_attachment"},
+                )
                 continue
             file_id = str(attachment.get("fileId") or attachment.get("file_id") or "").strip()
             if not file_id:
+                self._log_wire(
+                    "warning",
+                    direction="drop",
+                    action="attachment.download.skipped",
+                    payload={
+                        "messageId": getattr(event, "message_id", None),
+                        "reason": "missing_file_id",
+                        "fileName": attachment.get("fileName") or attachment.get("file_name"),
+                    },
+                )
                 continue
+            attachment_log = self._attachment_log_payload(event, attachment)
+            self._log_wire("info", direction="in", action="attachment.download.start", payload=attachment_log)
             try:
                 cached_path, media_type = await self._download_and_cache_attachment(attachment)
             except Exception as exc:
                 logger.warning("[%s] Failed to download AOPS attachment %s: %s", self.name, file_id, exc)
+                failures.append(str(attachment.get("fileName") or attachment.get("file_name") or file_id))
+                self._log_wire(
+                    "warning",
+                    direction="in",
+                    action="attachment.download.failed",
+                    payload=attachment_log,
+                    error=str(exc),
+                )
                 continue
             if cached_path:
                 media_paths.append(cached_path)
                 media_types.append(media_type)
+                self._log_wire(
+                    "info",
+                    direction="in",
+                    action="attachment.download.success",
+                    payload={**attachment_log, "mimeType": media_type, "cachedPath": cached_path},
+                )
 
         if media_paths:
             event.media_urls.extend(media_paths)
             event.media_types.extend(media_types)
             event.message_type = _message_type_for_aops_media(media_types)
+        if failures:
+            failed = "、".join(failures[:3])
+            suffix = "等" if len(failures) > 3 else ""
+            notice = f"[系统提示：收到附件，但 {failed}{suffix} 下载失败或内容不可用，无法识别对应图片/文件。]"
+            event.text = f"{event.text.rstrip()}\n\n{notice}" if event.text.strip() else notice
+
+    def _attachment_log_payload(self, event: MessageEvent, attachment: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "messageId": getattr(event, "message_id", None),
+            "fileId": attachment.get("fileId") or attachment.get("file_id"),
+            "fileName": attachment.get("fileName") or attachment.get("file_name"),
+            "mimeType": attachment.get("mimeType") or attachment.get("mime_type"),
+            "fileType": attachment.get("fileType") or attachment.get("file_type"),
+            "downloadUrl": self._attachment_download_url(attachment),
+        }
 
     def _attachment_download_url(self, attachment: dict[str, Any]) -> str:
         raw_url = str(attachment.get("downloadUrl") or attachment.get("download_url") or "").strip()
