@@ -75,6 +75,55 @@ capture_upgrade_backup() {
   fi
 }
 
+run_post_install_self_check() {
+  info "Post-install self-check: verifying overlay and cache layout"
+  local tmp_home
+  tmp_home="$(mktemp -d "${TMPDIR:-/tmp}/hermes-aops-selfcheck.XXXXXX")"
+  local output
+  if ! output="$(HERMES_HOME="$tmp_home/.hermes" "$VENV_DIR/bin/python" - <<'PY'
+import os
+import sys
+from pathlib import Path
+
+from hermes_cli.config import ensure_hermes_home
+import hermes_cli.config as config_mod
+
+home = Path(os.environ["HERMES_HOME"])
+ensure_hermes_home()
+
+expected = [
+    home / "cache" / "images",
+    home / "cache" / "audio",
+    home / "cache" / "videos",
+    home / "cache" / "documents",
+]
+legacy = [
+    home / "image_cache",
+    home / "audio_cache",
+]
+
+missing = [str(path) for path in expected if not path.is_dir()]
+created_legacy = [str(path) for path in legacy if path.exists()]
+
+print(f"hermes_cli.config={config_mod.__file__}")
+print(f"selfcheck_home={home}")
+
+if missing or created_legacy:
+    if missing:
+        print("missing expected cache dirs:", ", ".join(missing), file=sys.stderr)
+    if created_legacy:
+        print("legacy cache dirs were created:", ", ".join(created_legacy), file=sys.stderr)
+    raise SystemExit(1)
+PY
+  )"; then
+    echo "$output" >&2
+    rm -rf "$tmp_home"
+    fail "Post-install self-check failed; installed overlay may not be active"
+  fi
+  echo "$output"
+  rm -rf "$tmp_home"
+}
+
 [[ -f "$PYTHON_TAR" ]] || fail "Bundled Python runtime not found"
 [[ -f "$REQUIREMENTS" ]] || fail "requirements.txt not found"
 [[ -f "$OVERLAY_MANIFEST" ]] || fail "overlay manifest not found"
@@ -213,6 +262,8 @@ if [[ "$INIT_CONFIG" == true ]]; then
   fi
 fi
 
+run_post_install_self_check
+
 echo
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}Hermes Agent offline bundle installed${NC}"
@@ -221,6 +272,7 @@ echo "Install dir: $INSTALL_DIR"
 echo "CLI launcher: $INSTALL_DIR/hermes"
 echo "Gateway launcher: $INSTALL_DIR/hermes-gateway"
 echo "Dashboard launcher: $INSTALL_DIR/hermes-dashboard"
+echo "Venv Python: $VENV_DIR/bin/python"
 if [[ "$UPGRADE_MODE" == true ]]; then
   echo "Upgrade mode: preserved existing runtime config and launch path"
   echo "Upgrade backup: $BACKUP_DIR"
