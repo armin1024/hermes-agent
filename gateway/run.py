@@ -16723,11 +16723,15 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     cron delivery path so live adapters can be used for E2EE rooms.
 
     Also refreshes the channel directory every 5 minutes and prunes the
-    image/audio/document cache + expired ``hermes debug share`` pastes
-    once per hour.
+    media/document cache + expired ``hermes debug share`` pastes once per hour.
     """
     from cron.scheduler import tick as cron_tick
-    from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache
+    from gateway.platforms.base import (
+        cleanup_audio_cache,
+        cleanup_document_cache,
+        cleanup_image_cache,
+        cleanup_video_cache,
+    )
     from hermes_cli.debug import _sweep_expired_pastes
 
     IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
@@ -16764,18 +16768,18 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                 logger.debug("Channel directory refresh error: %s", e)
 
         if tick_count % IMAGE_CACHE_EVERY == 0:
-            try:
-                removed = cleanup_image_cache(max_age_hours=24)
-                if removed:
-                    logger.info("Image cache cleanup: removed %d stale file(s)", removed)
-            except Exception as e:
-                logger.debug("Image cache cleanup error: %s", e)
-            try:
-                removed = cleanup_document_cache(max_age_hours=24)
-                if removed:
-                    logger.info("Document cache cleanup: removed %d stale file(s)", removed)
-            except Exception as e:
-                logger.debug("Document cache cleanup error: %s", e)
+            for cache_name, cleanup in (
+                ("Image", cleanup_image_cache),
+                ("Audio", cleanup_audio_cache),
+                ("Video", cleanup_video_cache),
+                ("Document", cleanup_document_cache),
+            ):
+                try:
+                    removed = cleanup(max_age_hours=24)
+                    if removed:
+                        logger.info("%s cache cleanup: removed %d stale file(s)", cache_name, removed)
+                except Exception as e:
+                    logger.debug("%s cache cleanup error: %s", cache_name, e)
 
         if tick_count % PASTE_SWEEP_EVERY == 0:
             try:

@@ -470,7 +470,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
-from hermes_constants import get_hermes_dir
+from hermes_constants import get_hermes_home
 
 
 GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
@@ -542,8 +542,8 @@ async def _ssrf_redirect_guard(response):
 # (e.g. Telegram file URLs expire after ~1 hour).
 # ---------------------------------------------------------------------------
 
-# Default location: {HERMES_HOME}/cache/images/ (legacy: image_cache/)
-IMAGE_CACHE_DIR = get_hermes_dir("cache/images", "image_cache")
+# Default location: {HERMES_HOME}/cache/images/.
+IMAGE_CACHE_DIR = get_hermes_home() / "cache" / "images"
 
 
 def get_image_cache_dir() -> Path:
@@ -656,15 +656,15 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
                 raise
 
 
-def cleanup_image_cache(max_age_hours: int = 24) -> int:
+def _cleanup_cache_dir(cache_dir: Path, max_age_hours: int) -> int:
     """
-    Delete cached images older than *max_age_hours*.
+    Delete cached files in *cache_dir* older than *max_age_hours*.
 
     Returns the number of files removed.
     """
     import time
 
-    cache_dir = get_image_cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
     cutoff = time.time() - (max_age_hours * 3600)
     removed = 0
     for f in cache_dir.iterdir():
@@ -677,6 +677,15 @@ def cleanup_image_cache(max_age_hours: int = 24) -> int:
     return removed
 
 
+def cleanup_image_cache(max_age_hours: int = 24) -> int:
+    """
+    Delete cached images older than *max_age_hours*.
+
+    Returns the number of files removed.
+    """
+    return _cleanup_cache_dir(get_image_cache_dir(), max_age_hours)
+
+
 # ---------------------------------------------------------------------------
 # Audio cache utilities
 #
@@ -684,7 +693,7 @@ def cleanup_image_cache(max_age_hours: int = 24) -> int:
 # here so the STT tool (OpenAI Whisper) can transcribe them from local files.
 # ---------------------------------------------------------------------------
 
-AUDIO_CACHE_DIR = get_hermes_dir("cache/audio", "audio_cache")
+AUDIO_CACHE_DIR = get_hermes_home() / "cache" / "audio"
 
 
 def get_audio_cache_dir() -> Path:
@@ -709,6 +718,15 @@ def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
     filepath = cache_dir / filename
     filepath.write_bytes(data)
     return str(filepath)
+
+
+def cleanup_audio_cache(max_age_hours: int = 24) -> int:
+    """
+    Delete cached audio files older than *max_age_hours*.
+
+    Returns the number of files removed.
+    """
+    return _cleanup_cache_dir(get_audio_cache_dir(), max_age_hours)
 
 
 async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) -> str:
@@ -777,7 +795,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
 # here so the agent can reference them by local file path.
 # ---------------------------------------------------------------------------
 
-VIDEO_CACHE_DIR = get_hermes_dir("cache/videos", "video_cache")
+VIDEO_CACHE_DIR = get_hermes_home() / "cache" / "videos"
 
 SUPPORTED_VIDEO_TYPES = {
     ".mp4": "video/mp4",
@@ -803,6 +821,15 @@ def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
     return str(filepath)
 
 
+def cleanup_video_cache(max_age_hours: int = 24) -> int:
+    """
+    Delete cached videos older than *max_age_hours*.
+
+    Returns the number of files removed.
+    """
+    return _cleanup_cache_dir(get_video_cache_dir(), max_age_hours)
+
+
 # ---------------------------------------------------------------------------
 # Document cache utilities
 #
@@ -810,7 +837,7 @@ def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
 # here so the agent can reference them by local file path.
 # ---------------------------------------------------------------------------
 
-DOCUMENT_CACHE_DIR = get_hermes_dir("cache/documents", "document_cache")
+DOCUMENT_CACHE_DIR = get_hermes_home() / "cache" / "documents"
 
 SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf",
@@ -876,19 +903,7 @@ def cleanup_document_cache(max_age_hours: int = 24) -> int:
 
     Returns the number of files removed.
     """
-    import time
-
-    cache_dir = get_document_cache_dir()
-    cutoff = time.time() - (max_age_hours * 3600)
-    removed = 0
-    for f in cache_dir.iterdir():
-        if f.is_file() and f.stat().st_mtime < cutoff:
-            try:
-                f.unlink()
-                removed += 1
-            except OSError:
-                pass
-    return removed
+    return _cleanup_cache_dir(get_document_cache_dir(), max_age_hours)
 
 
 class MessageType(Enum):

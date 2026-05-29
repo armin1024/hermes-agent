@@ -397,22 +397,21 @@ class TestCacheDirectoryMounts:
         assert len(mounts) == 1
         assert mounts[0]["container_path"] == "/root/.hermes/cache/documents"
 
-    def test_legacy_dir_names_resolved(self, tmp_path, monkeypatch):
-        """Old-style dir names (e.g. document_cache) are resolved correctly."""
+    def test_legacy_dir_names_ignored_for_cache_mounts(self, tmp_path, monkeypatch):
+        """Cache mounts use only the normalized cache layout."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
-        # Use legacy dir name — get_hermes_dir prefers old if it exists
         (hermes_home / "document_cache").mkdir()
         (hermes_home / "image_cache").mkdir()
+        (hermes_home / "cache" / "images").mkdir(parents=True)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
         mounts = get_cache_directory_mounts()
         host_paths = {m["host_path"] for m in mounts}
-        assert str(hermes_home / "document_cache") in host_paths
-        assert str(hermes_home / "image_cache") in host_paths
-        # Container paths always use the new layout
+        assert str(hermes_home / "document_cache") not in host_paths
+        assert str(hermes_home / "image_cache") not in host_paths
+        assert str(hermes_home / "cache" / "images") in host_paths
         container_paths = {m["container_path"] for m in mounts}
-        assert "/root/.hermes/cache/documents" in container_paths
         assert "/root/.hermes/cache/images" in container_paths
 
     def test_empty_hermes_home(self, tmp_path, monkeypatch):

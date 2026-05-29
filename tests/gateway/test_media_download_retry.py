@@ -12,11 +12,61 @@ in this environment.
 """
 
 import asyncio
+import importlib
+import os
 import sys
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import httpx
+
+# ---------------------------------------------------------------------------
+# Cache directory layout and cleanup (base.py)
+# ---------------------------------------------------------------------------
+
+
+def test_media_cache_dirs_use_normalized_cache_layout(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    (hermes_home / "image_cache").mkdir(parents=True)
+    (hermes_home / "audio_cache").mkdir()
+    (hermes_home / "video_cache").mkdir()
+    (hermes_home / "document_cache").mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    import gateway.platforms.base as base
+
+    base = importlib.reload(base)
+
+    assert base.get_image_cache_dir() == hermes_home / "cache" / "images"
+    assert base.get_audio_cache_dir() == hermes_home / "cache" / "audio"
+    assert base.get_video_cache_dir() == hermes_home / "cache" / "videos"
+    assert base.get_document_cache_dir() == hermes_home / "cache" / "documents"
+    assert base.get_image_cache_dir() != hermes_home / "image_cache"
+
+
+def test_audio_video_cache_cleanup_removes_old_files(tmp_path, monkeypatch):
+    import gateway.platforms.base as base
+
+    monkeypatch.setattr(base, "AUDIO_CACHE_DIR", tmp_path / "cache" / "audio")
+    monkeypatch.setattr(base, "VIDEO_CACHE_DIR", tmp_path / "cache" / "videos")
+
+    old_time = time.time() - 48 * 3600
+    recent_audio = base.get_audio_cache_dir() / "recent.mp3"
+    old_audio = base.get_audio_cache_dir() / "old.mp3"
+    old_video = base.get_video_cache_dir() / "old.mp4"
+    recent_audio.write_bytes(b"fresh")
+    old_audio.write_bytes(b"old")
+    old_video.write_bytes(b"old")
+    os.utime(old_audio, (old_time, old_time))
+    os.utime(old_video, (old_time, old_time))
+
+    assert base.cleanup_audio_cache(max_age_hours=24) == 1
+    assert base.cleanup_video_cache(max_age_hours=24) == 1
+    assert recent_audio.exists()
+    assert not old_audio.exists()
+    assert not old_video.exists()
+
 
 # ---------------------------------------------------------------------------
 # Helpers for building httpx exceptions
