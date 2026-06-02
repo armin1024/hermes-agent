@@ -88,6 +88,7 @@ class _FakeClientSession:
     def __init__(self, ws):
         self.ws = ws
         self.closed = False
+        self.kwargs = {}
         self.get_calls = []
         self.post_calls = []
         self.ws_calls = []
@@ -333,6 +334,32 @@ async def test_aops_connect_calls_bot_me_and_ws_auth(monkeypatch):
     assert get_kwargs["headers"]["Authorization"] == "Bearer tok"
     assert get_kwargs["headers"]["tec-client-ip"] == "client-123"
     assert fake_session.ws_calls
+
+
+@pytest.mark.asyncio
+async def test_aops_connect_timeout_reads_env(monkeypatch):
+    fake_ws = _FakeWebSocket()
+    fake_session = _FakeClientSession(fake_ws)
+
+    def _client_session(**kwargs):
+        fake_session.kwargs = kwargs
+        return fake_session
+
+    fake_aiohttp = types.SimpleNamespace(
+        ClientSession=_client_session,
+        ClientTimeout=lambda total: {"total": total},
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setenv("AOPS_CONNECT_TIMEOUT", "90")
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setattr("gateway.platforms.aops.AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr("gateway.platforms.aops._resolve_aops_client_id", lambda config: "client-123")
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._listen_loop = AsyncMock(return_value=None)
+
+    assert await adapter.connect() is True
+    assert fake_session.kwargs["timeout"] == {"total": 90.0}
     ws_url, ws_kwargs = fake_session.ws_calls[0]
     assert ws_url == "wss://aops.example.com/api/v1/ws"
     assert ws_kwargs["headers"]["Authorization"] == "Bearer tok"
@@ -999,7 +1026,41 @@ def test_aops_extracts_user_content_from_messages_json():
 
     assert event is not None
     assert event.text == "识别图片问题"
+    assert event.channel_prompt == "系统提示"
     assert event.raw_message["metadata"]["aopsRawTextWasMessages"] is True
+    assert event.raw_message["metadata"]["aopsMessagesSystemPrompt"] == "系统提示"
+
+
+def test_aops_messages_json_preserves_route_prompt_and_system_context():
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={
+                "base_url": "https://aops.example.com",
+                "trusted_agent_key_from": ["user-001"],
+                "agent_routes": {
+                    "oma": {
+                        "prompt": "路由提示",
+                    },
+                },
+            },
+        )
+    )
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-json-route-text",
+            "userId": "user-001",
+            "agentKey": "oma",
+            "text": _aops_messages_text("系统提示里包含报错详情", "请帮我分析提交的1条报错信息。"),
+            "channelId": "user-001",
+        }
+    )
+
+    assert event is not None
+    assert event.text == "请帮我分析提交的1条报错信息。"
+    assert event.channel_prompt == "路由提示\n\n系统提示里包含报错详情"
 
 
 def test_aops_plain_text_is_not_marked_as_messages_json():
@@ -1340,6 +1401,43 @@ async def test_aops_cron_history_returns_structured_list(monkeypatch, tmp_path):
     assert payload["items"][0]["description"] == "Daily report"
     assert payload["items"][0]["summary"] == "报告已生成"
     assert payload["items"][0]["durationMs"] == 60000
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_history_returns_newest_first(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Daily report", schedule="every 1h", name="Daily report")
+    for hour, summary in [(9, "first"), (10, "second"), (11, "third")]:
+        cron_jobs.append_cron_history(
+            {
+                "job_id": job["id"],
+                "job_name": job["name"],
+                "job_description": "Daily report",
+                "status": "ok",
+                "started_at": f"2026-05-08T{hour:02d}:00:00+00:00",
+                "finished_at": f"2026-05-08T{hour:02d}:01:00+00:00",
+                "duration_ms": 60000,
+                "response_preview": summary,
+            }
+        )
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event(f"/cron history {job['id']}"))
+
+    payload = json.loads(result)
+    assert [item["summary"] for item in payload["items"]] == ["third", "second", "first"]
+
+    anchor_ts = payload["items"][1]["ts"]
+    result = await runner._handle_message(_make_aops_event(f"/cron history after {job['id']} {anchor_ts}"))
+
+    payload = json.loads(result)
+    assert [item["summary"] for item in payload["items"]] == ["third"]
 
 
 @pytest.mark.asyncio

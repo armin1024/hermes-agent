@@ -70,7 +70,7 @@ find "$WORK_DIR" \( -name '._*' -o -name '__MACOSX' \) -exec rm -rf {} +
 
 mkdir -p "$BUNDLE_DIR/overlay" "$BUNDLE_DIR/examples"
 
-if [[ -d "$HINDSIGHT_WHEEL_DIR" ]]; then
+if [[ -d "$HINDSIGHT_WHEEL_DIR" ]] && compgen -G "$HINDSIGHT_WHEEL_DIR/*.whl" >/dev/null; then
   mkdir -p "$BUNDLE_DIR/wheels"
   cp "$HINDSIGHT_WHEEL_DIR"/*.whl "$BUNDLE_DIR/wheels/"
   if [[ -f "$BUNDLE_DIR/requirements.txt" ]] && ! grep -q '^hindsight-client==0.6.1$' "$BUNDLE_DIR/requirements.txt"; then
@@ -182,6 +182,8 @@ EOF
 
 cp "$SCRIPT_DIR/install_aops_offline.sh" "$BUNDLE_DIR/install.sh"
 chmod +x "$BUNDLE_DIR/install.sh"
+cp "$SCRIPT_DIR/tec01_oneclick_install.sh" "$BUNDLE_DIR/tec01_oneclick_install.sh"
+chmod +x "$BUNDLE_DIR/tec01_oneclick_install.sh"
 
 CONTENT_SHA="$(
   cd "$BUNDLE_DIR"

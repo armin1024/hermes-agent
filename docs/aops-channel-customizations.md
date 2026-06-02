@@ -10,6 +10,8 @@
 - 支持 AOPS 静默 SkillHub 后端命令：`/bash clawhub explore --json`、`install`、`uninstall`。
 - 支持 AOPS 入站附件下载并进入 Hermes 多模态链路，静默 SkillHub 命令会跳过附件处理。
 - 附件和媒体缓存统一写入 `~/.hermes/cache/{images,audio,videos,documents}`。
+- AOPS cron 投递支持 `AOPS_HOME_CHANNEL`，历史记录查询按时间倒序返回。
+- tec01 一键安装支持新装/更新、目标用户创建、配置下发、预装技能、Hindsight 和 USER.md 初始化。
 - 离线包安装后会执行自检，确认实际导入的 overlay 不会创建旧 `image_cache/audio_cache` 目录。
 
 ## 配置
@@ -25,6 +27,8 @@ AOPS_DM_POLICY=open
 AOPS_ALLOW_FROM=user-001
 AOPS_TRUSTED_AGENT_KEY_FROM=*
 AOPS_DANGEROUS_COMMANDS="/skills,/curator run,/curator restore"
+CLAWHUB_REGISTRY=http://clawhub.internal
+AOPS_CONNECT_TIMEOUT=90
 ```
 
 示例 `config.yaml`：
@@ -147,6 +151,10 @@ CLAWHUB_REGISTRY=http://clawhub.internal
 AOPS 本地命令入口继续支持 `/skills`、`/skills list`、`/cron` 等结构化结果。
 
 - `/skills` 和 `/skills list` 会刷新 skill command 缓存后返回，避免新安装技能缺少 `command`。
+- `/cron history <id>` 返回最新记录在前，默认最多 20 条。
+- `/cron history before <id> [tsMs]` 返回锚点之前的更老记录，仍保持最新在前。
+- `/cron history after <id> <tsMs>` 返回锚点之后的更新记录，仍保持最新在前。
+- cron 自动投递到 AOPS 时可使用 `AOPS_HOME_CHANNEL` 作为 home channel，不需要用户手动 `/sethome`。
 - `dangerous_commands` 仅标记命令危险状态，用于前端审批展示；是否禁止执行由 `blocked_commands` 控制。
 - 不支持的命令会返回 `Command /xxx is not supported on AOPS`。
 
@@ -222,6 +230,35 @@ bash install.sh --link --init-config
 - gateway launcher
 - dashboard launcher
 - venv Python
+
+## tec01 一键安装
+
+tec01 下发入口使用 `install-oneclick.sh` 加任务 JSON：
+
+```bash
+curl -fsSL "http://tec01.internal/hermes/install-oneclick.sh" | sudo bash -s -- \
+  --task-url "http://tec01.internal/hermes/tasks/test-001.json"
+```
+
+任务 JSON 主要支持：
+
+- `targetUser`: 安装到哪个 Linux 用户；用户不存在时脚本会创建。
+- `bundleUrl` / `bundleSha256`: tec01 管理的离线包地址和校验值。
+- `config.modelGateway`: 模型网关地址、模型名、API key。
+- `config.aops`: `AOPS_BOT_TOKEN`、`AOPS_BOT_URL`、`AOPS_HOME_CHANNEL`、`CLAWHUB_REGISTRY`、`AOPS_API_KEY`、`AOPS_CONNECT_TIMEOUT` 等。
+- `config.preinstallSkills`: 从 `CLAWHUB_REGISTRY` 预装的技能 slug 列表。
+- `config.approvals.mode`: 使用官方 `approvals.mode` 取值，不自定义新值。
+- `config.display.busy_input_mode`: 使用官方 `display.busy_input_mode` 取值，不自定义新值。
+- `config.userInstructions.content`: 完整 Markdown，写入 `~/.hermes/memories/USER.md`。
+- `config.hindsight`: 写入 `~/.hermes/hindsight/config.json`，`bankIdTemplate` 支持 `users-{user}`。
+
+更新安装默认保留已有配置，只填充缺失项：
+
+- `options.overwriteExistingConfig=false`: 默认值，已有 `.env`、`config.yaml`、`USER.md`、Hindsight 配置不被覆盖。
+- `options.overwriteExistingConfig=true`: 覆盖任务 JSON 中提供的所有配置字段。
+- `options.overwriteFields`: 只覆盖指定字段，例如 `["userInstructions", "aops.AOPS_BOT_URL"]`。
+
+脚本会根据是否已存在 Hermes 安装判断新装或更新；新装后可自动 `hermes gateway start`，更新后可自动 `hermes gateway restart`。
 
 ## 排障
 

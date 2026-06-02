@@ -9,6 +9,10 @@ LINK_BIN=false
 INIT_CONFIG=false
 UPGRADE_MODE=false
 AUTO_LINK_EXISTING=false
+FORCE_UPGRADE=false
+APPLY_CONFIG_ONLY=false
+PRESERVE_CONFIG=false
+CONFIG_PAYLOAD=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -20,16 +24,36 @@ while [[ $# -gt 0 ]]; do
       INIT_CONFIG=true
       shift
       ;;
+    --upgrade)
+      FORCE_UPGRADE=true
+      shift
+      ;;
+    --preserve-config)
+      PRESERVE_CONFIG=true
+      shift
+      ;;
+    --apply-config)
+      APPLY_CONFIG_ONLY=true
+      shift
+      ;;
+    --config-payload)
+      CONFIG_PAYLOAD="$2"
+      shift 2
+      ;;
     -h|--help)
       cat <<'EOF'
-Usage: bash install.sh [INSTALL_DIR] [--link] [--init-config]
+Usage: bash install.sh [INSTALL_DIR] [--link] [--init-config] [--upgrade] [--preserve-config] [--config-payload FILE]
 
 Arguments:
   INSTALL_DIR    Optional install directory. Default: ~/hermes-agent
 
 Flags:
-  --link         Create symlinks in ~/.local/bin
-  --init-config  Copy AOPS example config/env into ~/.hermes if missing
+  --link             Create symlinks in ~/.local/bin
+  --init-config      Copy AOPS example config/env into ~/.hermes if missing
+  --upgrade          Force upgrade mode for task runners
+  --preserve-config  Preserve existing ~/.hermes config files; payload still patches explicit fields
+  --apply-config     Only apply --config-payload with the installed venv, then exit
+  --config-payload   tec01 task JSON used to patch .env/config.yaml and preinstall skills
 EOF
       exit 0
       ;;
@@ -65,6 +89,10 @@ NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 fail()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+
+if [[ -n "$CONFIG_PAYLOAD" && ! -f "$CONFIG_PAYLOAD" ]]; then
+  fail "Config payload not found: $CONFIG_PAYLOAD"
+fi
 
 capture_upgrade_backup() {
   local src="$1"
@@ -130,7 +158,15 @@ PY
 
 mkdir -p "$INSTALL_DIR"
 
-if [[ -d "$INSTALL_DIR/venv" || -x "$INSTALL_DIR/hermes" || -d "$INSTALL_DIR/source-overlay" ]]; then
+if [[ "$APPLY_CONFIG_ONLY" == true ]]; then
+  [[ -n "$CONFIG_PAYLOAD" ]] || fail "--apply-config requires --config-payload FILE"
+  [[ -x "$VENV_DIR/bin/python" ]] || fail "Installed venv not found: $VENV_DIR"
+  info "Applying tec01 configuration payload"
+  "$VENV_DIR/bin/python" -m hermes_cli.remote_config apply --payload "$CONFIG_PAYLOAD"
+  exit 0
+fi
+
+if [[ "$FORCE_UPGRADE" == true || -d "$INSTALL_DIR/venv" || -x "$INSTALL_DIR/hermes" || -d "$INSTALL_DIR/source-overlay" ]]; then
   UPGRADE_MODE=true
   BACKUP_DIR="$INSTALL_DIR/upgrade-backups/$TIMESTAMP"
   mkdir -p "$BACKUP_DIR"
@@ -264,6 +300,11 @@ fi
 
 run_post_install_self_check
 
+if [[ -n "$CONFIG_PAYLOAD" ]]; then
+  info "Applying tec01 configuration payload"
+  "$VENV_DIR/bin/python" -m hermes_cli.remote_config apply --payload "$CONFIG_PAYLOAD"
+fi
+
 echo
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}Hermes Agent offline bundle installed${NC}"
@@ -276,6 +317,12 @@ echo "Venv Python: $VENV_DIR/bin/python"
 if [[ "$UPGRADE_MODE" == true ]]; then
   echo "Upgrade mode: preserved existing runtime config and launch path"
   echo "Upgrade backup: $BACKUP_DIR"
+fi
+if [[ "$PRESERVE_CONFIG" == true ]]; then
+  echo "Config mode: preserve existing files, patch payload fields only"
+fi
+if [[ -n "$CONFIG_PAYLOAD" ]]; then
+  echo "Config payload: $CONFIG_PAYLOAD"
 fi
 if [[ "$AUTO_LINK_EXISTING" == true ]]; then
   echo "Symlinks: preserved existing ~/.local/bin links"

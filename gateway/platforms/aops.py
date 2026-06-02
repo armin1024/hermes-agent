@@ -55,6 +55,7 @@ _FINAL = object()
 _ERROR = object()
 _AOPS_CLIENT_ID_CACHE: dict[str, str] = {}
 _AOPS_MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+_AOPS_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 
 
 def check_aops_requirements() -> bool:
@@ -71,6 +72,17 @@ def _coerce_str_list(value: Any, *, default: Optional[list[str]] = None) -> list
         return [str(item).strip() for item in value if str(item).strip()]
     text = str(value).strip()
     return [text] if text else list(default or [])
+
+
+def _coerce_float(value: Any, *, default: float, name: str) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        logger.warning("[Aops] Ignoring invalid %s=%r", name, value)
+        return default
+    return max(0.0, parsed)
 
 
 def _current_system_user() -> str:
@@ -248,17 +260,26 @@ def _message_type_for_aops_media(media_types: list[str]) -> MessageType:
     return MessageType.TEXT
 
 
-def _extract_aops_text(raw_text: Any) -> tuple[str, bool]:
+def _extract_aops_text(raw_text: Any) -> tuple[str, bool, str | None]:
     text = str(raw_text or "")
     stripped = text.strip()
     if not stripped.startswith("["):
-        return text, False
+        return text, False, None
     try:
         messages = json.loads(stripped)
     except Exception:
-        return text, False
+        return text, False, None
     if not isinstance(messages, list):
-        return text, False
+        return text, False, None
+    system_parts: list[str] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "").strip().lower() != "system":
+            continue
+        content = item.get("content")
+        if isinstance(content, str) and content.strip():
+            system_parts.append(content.strip())
     for item in reversed(messages):
         if not isinstance(item, dict):
             continue
@@ -266,8 +287,9 @@ def _extract_aops_text(raw_text: Any) -> tuple[str, bool]:
             continue
         content = item.get("content")
         if isinstance(content, str) and content.strip():
-            return content, True
-    return text, False
+            system_prompt = "\n\n".join(system_parts).strip() or None
+            return content, True, system_prompt
+    return text, False, None
 
 
 def _extension_for_aops_attachment(filename: str, mime_type: str, file_type: str) -> str:
@@ -623,6 +645,13 @@ class AopsAdapter(BasePlatformAdapter):
             extra.get("base_url")
             or os.getenv("AOPS_BOT_URL", "").strip()
         ).rstrip("/")
+        self._connect_timeout = _coerce_float(
+            extra.get("connect_timeout")
+            if extra.get("connect_timeout") is not None
+            else os.getenv("AOPS_CONNECT_TIMEOUT"),
+            default=_AOPS_CONNECT_TIMEOUT_SECS_DEFAULT,
+            name="AOPS_CONNECT_TIMEOUT",
+        )
         self._proxy_url = str(extra.get("proxy") or os.getenv("AOPS_PROXY", "")).strip() or resolve_proxy_url("AOPS_PROXY")
         self._push_tool_calls = bool(extra.get("push_tool_calls", True))
         self._dm_policy = str(extra.get("dm_policy") or os.getenv("AOPS_DM_POLICY", "open")).strip().lower() or "open"
@@ -741,10 +770,12 @@ class AopsAdapter(BasePlatformAdapter):
         await self._cleanup()
         session_kwargs, request_kwargs = self._request_kwargs()
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30),
+            timeout=aiohttp.ClientTimeout(total=self._connect_timeout or None),
             trust_env=True,
             **session_kwargs,
         )
+        timeout_label = f"{self._connect_timeout:g}"
+        logger.info("[%s] Opening AOPS connection (timeout=%ss, base_url=%s)", self.name, timeout_label, self._base_url)
         bot_info = await self._fetch_bot_me(request_kwargs=request_kwargs)
         self._bot_id = str(bot_info.get("id") or "").strip() or None
         self._bot_name = str(bot_info.get("name") or "").strip() or None
@@ -986,9 +1017,11 @@ class AopsAdapter(BasePlatformAdapter):
         if agent_key == "main":
             agent_key = ""
 
-        text, text_was_messages = _extract_aops_text(message_data.get("content"))
+        text, text_was_messages, system_prompt = _extract_aops_text(message_data.get("content"))
         if text_was_messages:
             metadata = {**metadata, "aopsRawTextWasMessages": True}
+            if system_prompt:
+                metadata = {**metadata, "aopsMessagesSystemPrompt": system_prompt}
         return {
             "id": message_id,
             "userId": user_id,
@@ -1050,12 +1083,20 @@ class AopsAdapter(BasePlatformAdapter):
         }
         if isinstance(data.get("silent"), bool):
             self._reply_flags_by_message_id[message_id] = {"silent": bool(data["silent"])}
-        text, text_was_messages = _extract_aops_text(data.get("text"))
+        text, text_was_messages, system_prompt = _extract_aops_text(data.get("text"))
         if text_was_messages:
             metadata = data.get("metadata")
             if not isinstance(metadata, dict):
                 metadata = {}
-            data = {**data, "metadata": {**metadata, "aopsRawTextWasMessages": True}}
+            metadata = {**metadata, "aopsRawTextWasMessages": True}
+            if system_prompt:
+                metadata = {**metadata, "aopsMessagesSystemPrompt": system_prompt}
+                channel_prompt = (channel_prompt + "\n\n" + system_prompt).strip() if channel_prompt else system_prompt
+            data = {**data, "metadata": metadata}
+        elif isinstance((data.get("metadata") or {}), dict):
+            system_prompt = str((data.get("metadata") or {}).get("aopsMessagesSystemPrompt") or "").strip()
+            if system_prompt:
+                channel_prompt = (channel_prompt + "\n\n" + system_prompt).strip() if channel_prompt else system_prompt
         return MessageEvent(
             text=text,
             message_type=MessageType.TEXT,

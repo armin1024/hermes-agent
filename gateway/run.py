@@ -4915,6 +4915,7 @@ class GatewayRunner:
                         )
                         del self._failed_platforms[platform]
                     else:
+                        await self._safe_adapter_disconnect(adapter, platform)
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="retrying",
@@ -4937,6 +4938,8 @@ class GatewayRunner:
                                 ),
                             )
                 except Exception as e:
+                    if "adapter" in locals() and adapter is not None:
+                        await self._safe_adapter_disconnect(adapter, platform)
                     self._update_platform_runtime_status(
                         platform.value,
                         platform_state="retrying",

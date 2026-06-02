@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import getpass
 import importlib
 import json
 import logging
@@ -478,6 +479,16 @@ def _sanitize_bank_segment(value: str) -> str:
     return "".join(out).strip("-_")
 
 
+def _current_system_user() -> str:
+    try:
+        user = getpass.getuser().strip()
+    except Exception:
+        user = ""
+    if not user:
+        user = os.environ.get("USER", "").strip() or os.environ.get("LOGNAME", "").strip()
+    return user or "user"
+
+
 def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str) -> str:
     """Resolve a bank_id template string with the given placeholders.
 
@@ -485,7 +496,8 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
       {profile}   — active Hermes profile name (from agent_identity)
       {workspace} — Hermes workspace name (from agent_workspace)
       {platform}  — "cli", "telegram", "discord", etc.
-      {user}      — platform user id (gateway sessions)
+      {user}      — current system user
+      {platform_user} — platform user id (gateway sessions)
       {session}   — current session id
 
     Missing/empty placeholders are rendered as the empty string and then
@@ -496,6 +508,8 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
     """
     if not template:
         return fallback
+    placeholders.setdefault("user", _current_system_user())
+    placeholders.setdefault("platform_user", placeholders.get("user_id", ""))
     sanitized = {k: _sanitize_bank_segment(v) for k, v in placeholders.items()}
     try:
         rendered = template.format(**sanitized)
@@ -844,7 +858,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "llm_api_key", "description": "LLM API key (optional for openai_compatible)", "secret": True, "env_var": "HINDSIGHT_LLM_API_KEY", "when": {"mode": "local_embedded"}},
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
             {"key": "bank_id", "description": "Memory bank name (static fallback when bank_id_template is unset)", "default": "hermes"},
-            {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}", "default": ""},
+            {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user} (system user), {platform_user}, {session}. Example: users-{user}", "default": ""},
             {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
             {"key": "bank_retain_mission", "description": "Custom extraction prompt for memory retention"},
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
@@ -1145,7 +1159,7 @@ class HindsightMemoryProvider(MemoryProvider):
             profile=self._agent_identity,
             workspace=self._agent_workspace,
             platform=self._platform,
-            user=self._user_id,
+            platform_user=self._user_id,
             session=self._session_id,
         )
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")

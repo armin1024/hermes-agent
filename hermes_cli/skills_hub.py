@@ -31,7 +31,7 @@ _console = Console()
 # Shared do_* functions
 # ---------------------------------------------------------------------------
 
-def _resolve_short_name(name: str, sources, console: Console) -> str:
+def _resolve_short_name(name: str, sources, console: Console, source: str = "all") -> str:
     """
     Resolve a short skill name (e.g. 'pptx') to a full identifier by searching
     all sources. If exactly one match is found, returns its identifier. If multiple
@@ -43,7 +43,7 @@ def _resolve_short_name(name: str, sources, console: Console) -> str:
     c = console or _console
     c.print(f"[dim]Resolving '{name}'...[/]")
 
-    results = unified_search(name, sources, source_filter="all", limit=20)
+    results = unified_search(name, sources, source_filter=source, limit=20)
 
     # Filter to exact name matches (case-insensitive)
     exact = [r for r in results if r.name.lower() == name.lower()]
@@ -408,7 +408,8 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
 def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True,
-               name_override: str = "") -> None:
+               name_override: str = "",
+               source: str = "all") -> None:
     """Fetch, quarantine, scan, confirm, and install a skill.
 
     ``name_override`` lets non-interactive callers (slash commands, gateway,
@@ -430,10 +431,16 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     # Resolve which source adapter handles this identifier
     auth = GitHubAuth()
     sources = create_source_router(auth)
+    if source and source != "all":
+        filtered_sources = [src for src in sources if src.source_id() == source]
+        if not filtered_sources:
+            c.print(f"[bold red]Error:[/] Unknown skill source '{source}'.\n")
+            return
+        sources = filtered_sources
 
     # If identifier looks like a short name (no slashes), resolve it via search
     if "/" not in identifier:
-        identifier = _resolve_short_name(identifier, sources, c)
+        identifier = _resolve_short_name(identifier, sources, c, source=source)
         if not identifier:
             return
 
@@ -1324,7 +1331,8 @@ def skills_command(args) -> None:
     elif action == "install":
         do_install(args.identifier, category=args.category, force=args.force,
                    skip_confirm=getattr(args, "yes", False),
-                   name_override=getattr(args, "name", "") or "")
+                   name_override=getattr(args, "name", "") or "",
+                   source=getattr(args, "source", "all") or "all")
     elif action == "inspect":
         do_inspect(args.identifier)
     elif action == "list":
@@ -1463,6 +1471,7 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         identifier = args[0]
         category = ""
         name_override = ""
+        source = "all"
         # Slash commands run inside prompt_toolkit where input() hangs.
         # Always skip confirmation — the user typing the command is implicit consent.
         skip_confirm = True
@@ -1475,9 +1484,11 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
                 category = args[i + 1]
             elif a == "--name" and i + 1 < len(args):
                 name_override = args[i + 1]
+            elif a == "--source" and i + 1 < len(args):
+                source = args[i + 1]
         do_install(identifier, category=category, force=force,
                    skip_confirm=skip_confirm, invalidate_cache=invalidate_cache,
-                   name_override=name_override, console=c)
+                   name_override=name_override, source=source, console=c)
 
     elif action == "inspect":
         if not args:

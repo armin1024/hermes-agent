@@ -121,6 +121,8 @@ _EXTRA_ENV_KEYS = frozenset({
     "BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_PASSWORD",
     "BLUEBUBBLES_HOME_CHANNEL", "BLUEBUBBLES_HOME_CHANNEL_NAME",
     "AOPS_BOT_TOKEN", "AOPS_BOT_URL", "AOPS_HOME_CHANNEL",
+    "AOPS_HOME_CHANNEL_NAME", "AOPS_HOME_CHANNEL_THREAD_ID",
+    "AOPS_BASE_URL", "AOPS_API_KEY", "CLAWHUB_REGISTRY",
     "QQ_APP_ID", "QQ_CLIENT_SECRET", "QQBOT_HOME_CHANNEL", "QQBOT_HOME_CHANNEL_NAME",
     "QQ_HOME_CHANNEL", "QQ_HOME_CHANNEL_NAME",  # legacy aliases (pre-rename, still read for back-compat)
     "QQ_ALLOWED_USERS", "QQ_GROUP_ALLOWED_USERS", "QQ_ALLOW_ALL_USERS", "QQ_MARKDOWN_SUPPORT",
@@ -5135,6 +5137,18 @@ def config_command(args):
     
     elif subcmd == "env-path":
         print(get_env_path())
+
+    elif subcmd == "schema":
+        from hermes_cli.remote_config import schema
+        import json
+
+        data = schema()
+        if getattr(args, "json", False):
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+        else:
+            for key, spec in data.items():
+                values = ", ".join(spec.get("values", []))
+                print(f"{key}: {values}")
     
     elif subcmd == "migrate":
         print()

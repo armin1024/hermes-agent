@@ -278,6 +278,19 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_aops_platform_falls_back_to_home_channel(self, monkeypatch):
+        monkeypatch.setenv("AOPS_HOME_CHANNEL", "conv-aops")
+        job = {
+            "deliver": "aops",
+            "origin": None,
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "aops",
+            "chat_id": "conv-aops",
+            "thread_id": None,
+        }
+
     def test_explicit_discord_topic_target_with_thread_id(self):
         """deliver: 'discord:chat_id:thread_id' parses correctly."""
         job = {

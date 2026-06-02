@@ -842,6 +842,8 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
             }
         )
 
+    normalized.sort(key=lambda item: item.get("ts") or 0, reverse=True)
+
     anchor_entry = normalized[0]
     selected: list[dict[str, Any]]
     if requested_anchor is None:
@@ -867,7 +869,7 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
             selected = normalized[index + 1:index + 21]
         elif direction == "after":
             start = max(0, index - 20)
-            selected = list(reversed(normalized[start:index]))
+            selected = normalized[start:index]
         else:
             selected = normalized[index:index + 20]
 

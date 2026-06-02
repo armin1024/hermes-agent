@@ -10757,6 +10757,10 @@ Examples:
     # config env-path
     config_subparsers.add_parser("env-path", help="Print .env file path")
 
+    # config schema
+    config_schema = config_subparsers.add_parser("schema", help="Print supported config schema")
+    config_schema.add_argument("--json", action="store_true", help="Print JSON output")
+
     # config check
     config_subparsers.add_parser("check", help="Check for missing/outdated config")
 
@@ -10863,6 +10867,11 @@ Examples:
         "--name",
         default="",
         help="Override the skill name (useful when installing from a URL whose SKILL.md has no `name:` frontmatter)",
+    )
+    skills_install.add_argument(
+        "--source",
+        default="all",
+        help="Resolve short skill names against a specific source, e.g. clawhub",
     )
     skills_install.add_argument(
         "--force", action="store_true", help="Install despite blocked scan verdict"

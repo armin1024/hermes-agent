@@ -1297,6 +1297,21 @@ class TestBankIdTemplate:
         )
         assert result == "user-josh-example-com"
 
+    def test_resolve_user_defaults_to_system_user(self, monkeypatch):
+        monkeypatch.setattr("plugins.memory.hindsight.getpass.getuser", lambda: "zhangzx")
+        result = _resolve_bank_id_template(
+            "users-{user}", fallback="hermes",
+            profile="", workspace="", platform="", platform_user="front-user", session="",
+        )
+        assert result == "users-zhangzx"
+
+    def test_resolve_platform_user_placeholder(self):
+        result = _resolve_bank_id_template(
+            "front-{platform_user}", fallback="hermes",
+            profile="", workspace="", platform="", platform_user="josh@example.com", session="",
+        )
+        assert result == "front-josh-example-com"
+
     def test_resolve_invalid_template_returns_fallback(self):
         # Unknown placeholder should fall back without raising
         result = _resolve_bank_id_template(
@@ -1548,4 +1563,3 @@ class TestShutdown:
         embedded.close.assert_called_once()
         assert embedded._client is None
         assert provider._client is None
-
