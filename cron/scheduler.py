@@ -42,6 +42,75 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _cron_delivery_metadata(job: dict, extra: dict | None = None) -> dict:
+    """Build outbound metadata for cron reminder deliveries."""
+    job_id = str(job.get("id") or "").strip()
+    job_name = str(job.get("name") or job_id or "").strip()
+    bot_reply_extra = {"messageType": "cron"}
+    if job_id:
+        bot_reply_extra["id"] = job_id
+    if job_name:
+        bot_reply_extra["name"] = job_name
+    metadata = {
+        "source": "claw",
+        "message_type": "cron",
+        "botReplyExtra": bot_reply_extra,
+    }
+    if extra:
+        metadata.update(extra)
+    return metadata
+
+
+def _append_tick_history(
+    job: dict,
+    *,
+    started_at,
+    finished_at,
+    success: bool,
+    output_file,
+    final_response: str,
+    error: Optional[str],
+    delivery_error: Optional[str],
+    silent: bool,
+) -> None:
+    """Record the structured run metadata consumed by AOPS /cron history."""
+    try:
+        try:
+            duration_ms = int((finished_at - started_at).total_seconds() * 1000)
+        except Exception:
+            duration_ms = None
+        if duration_ms is not None and duration_ms < 0:
+            duration_ms = None
+        try:
+            refreshed = get_job(job["id"]) or {}
+        except Exception:
+            refreshed = {}
+        preview_source = final_response or error or ""
+        append_cron_history(
+            {
+                "job_id": job.get("id"),
+                "job_name": job.get("name"),
+                "job_description": job_description(job),
+                "status": "ok" if success else "error",
+                "error": error,
+                "response_preview": str(preview_source or "").strip()[:300] or None,
+                "delivery_error": delivery_error,
+                "silent": bool(silent),
+                "started_at": started_at.isoformat(),
+                "finished_at": finished_at.isoformat(),
+                "duration_ms": duration_ms,
+                "next_run_at": refreshed.get("next_run_at"),
+                "last_run_at": refreshed.get("last_run_at"),
+                "schedule_display": job.get("schedule_display"),
+                "model": job.get("model"),
+                "provider": job.get("provider"),
+                "output_path": str(output_file) if output_file is not None else None,
+            }
+        )
+    except Exception as exc:
+        logger.warning("Failed to append cron history for job %s: %s", job.get("id"), exc)
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -123,7 +192,16 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    append_cron_history,
+    advance_next_run,
+    audit_cron_jobs,
+    get_due_jobs,
+    get_job,
+    job_description,
+    mark_job_run,
+    save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -587,7 +665,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
-            send_metadata = {"message_type": "cron"}
+            send_metadata = _cron_delivery_metadata(job)
             if thread_id:
                 send_metadata["thread_id"] = thread_id
             try:
@@ -646,7 +724,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 cleaned_delivery_content,
                 thread_id=thread_id,
                 media_files=media_files,
-                metadata={"message_type": "cron"},
+                metadata=_cron_delivery_metadata(job),
             )
             try:
                 result = asyncio.run(coro)
@@ -666,7 +744,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             cleaned_delivery_content,
                             thread_id=thread_id,
                             media_files=media_files,
-                            metadata={"message_type": "cron"},
+                            metadata=_cron_delivery_metadata(job),
                         ),
                     )
                     result = future.result(timeout=30)
@@ -1721,6 +1799,17 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         return 0
 
     try:
+        try:
+            audit = audit_cron_jobs(repair=True)
+            if audit.get("issues_count"):
+                logger.warning(
+                    "Cron self-check repaired %s job record issue(s): %s",
+                    audit.get("issues_count"),
+                    audit.get("issues"),
+                )
+        except Exception as exc:
+            logger.warning("Cron self-check failed before tick: %s", exc)
+
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
@@ -1764,6 +1853,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
+            started_at = _hermes_now()
+            output_file = None
+            final_response = ""
+            error = None
+            delivery_error = None
+            success = False
+            silent = False
             try:
                 success, output, final_response, error = run_job(job)
 
@@ -1779,6 +1875,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
+                    silent = True
 
                 delivery_error = None
                 if should_deliver:
@@ -1796,11 +1893,34 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                _append_tick_history(
+                    job,
+                    started_at=started_at,
+                    finished_at=_hermes_now(),
+                    success=success,
+                    output_file=output_file,
+                    final_response=final_response,
+                    error=error,
+                    delivery_error=delivery_error,
+                    silent=silent,
+                )
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
+                error = str(e)
+                mark_job_run(job["id"], False, error)
+                _append_tick_history(
+                    job,
+                    started_at=started_at,
+                    finished_at=_hermes_now(),
+                    success=False,
+                    output_file=output_file,
+                    final_response=final_response,
+                    error=error,
+                    delivery_error=delivery_error,
+                    silent=silent,
+                )
                 return False
 
         # Partition due jobs: those with a per-job workdir mutate

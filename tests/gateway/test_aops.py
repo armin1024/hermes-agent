@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -39,6 +40,22 @@ class _CapturingAgent:
             "messages": [],
             "api_calls": 1,
         }
+
+
+def _approval_commands(actions):
+    return [action["command"] for action in actions]
+
+
+def _approval_displays(actions):
+    return [action["display"] for action in actions]
+
+
+class _RunningAgent:
+    def __init__(self):
+        self.interrupts = []
+
+    def interrupt(self, message):
+        self.interrupts.append(message)
 
 
 class _FakeResponse:
@@ -161,6 +178,19 @@ def _make_aops_event(text: str) -> MessageEvent:
     )
 
 
+def _make_aops_event_for_channel(text: str, *, channel_id: str = "conv-001", agent_key: str = "main") -> MessageEvent:
+    event = _make_aops_event(text)
+    event.source = SessionSource(
+        platform=Platform.AOPS,
+        user_id="user-001",
+        chat_id=channel_id,
+        user_name="AOPS User",
+        chat_type="dm",
+    )
+    event.raw_message = {"agentKey": agent_key}
+    return event
+
+
 def _make_silent_aops_event(text: str, *, metadata: dict | None = None) -> MessageEvent:
     event = _make_aops_event(text)
     event.raw_message = {
@@ -232,20 +262,33 @@ def _aops_messages_text(system_text: str, user_text: str) -> str:
     )
 
 
-def _read_aops_wire_records(hermes_home):
-    files = sorted((hermes_home / "logs" / "aops").glob("aops-wire-*.log"))
-    records = []
+def _read_aops_log_lines(hermes_home):
+    files = sorted((hermes_home / "logs" / "aops").glob("aops-*.log"))
+    lines = []
     for path in files:
-        records.extend(
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        )
-    return records
+        lines.extend(line for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    return lines
 
 
-def _aops_wire_actions(hermes_home):
-    return [record.get("action") for record in _read_aops_wire_records(hermes_home)]
+def _aops_log_raw(line: str):
+    return json.loads(line.split(" raw=", 1)[1])
+
+
+async def _drain_aops_dispatch_tasks(adapter: AopsAdapter):
+    tasks = list(getattr(adapter, "_dispatch_tasks", set()))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _aops_log_field(line: str, field: str) -> str:
+    prefix = f" {field}="
+    if field == line.split("=", 1)[0]:
+        return line.split("=", 1)[1].split(" ", 1)[0]
+    return line.split(prefix, 1)[1].split(" ", 1)[0]
+
+
+def _aops_log_events(hermes_home):
+    return [_aops_log_field(line, "event") for line in _read_aops_log_lines(hermes_home)]
 
 
 def test_platform_aops_registered():
@@ -389,6 +432,7 @@ async def test_aops_send_reply_event_inherits_silent_from_inbound_message():
     )
 
     assert result.success is True
+    assert fake_ws.sent[0]["data"]["title"] == ""
     assert fake_ws.sent[0]["data"]["silent"] is True
     assert fake_ws.sent[0]["data"]["messageType"] == "silent"
 
@@ -427,6 +471,163 @@ async def test_aops_send_defaults_message_type_to_common():
     end = adapter.send_reply_event.await_args_list[1].args[0]
     assert start["messageType"] == "common"
     assert end["messageType"] == "common"
+    assert start["title"] == ""
+    assert end["title"] == ""
+
+
+@pytest.mark.asyncio
+async def test_aops_send_includes_title_from_metadata():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+
+    result = await adapter.send("user-001", "hello", metadata={"title": "CPU 告警排查结果"})
+
+    assert result.success is True
+    start = adapter.send_reply_event.await_args_list[0].args[0]
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert start["title"] == "CPU 告警排查结果"
+    assert end["title"] == "CPU 告警排查结果"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_reply_event_uses_inbound_conversation_title():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._connected_event.set()
+    fake_ws = _FakeWebSocket()
+    adapter._ws = fake_ws
+
+    event = adapter._build_message_event({
+        "id": "msg-1",
+        "userId": "user-001",
+        "userName": "Alice",
+        "text": "hello",
+        "channelId": "conv-1",
+        "channelType": "direct",
+        "title": "CPU 告警排查结果",
+    })
+    assert event is not None
+
+    result = await adapter.send_reply_event({
+        "messageId": "botmsg-1",
+        "seq": 1,
+        "phase": "end",
+        "kind": "final",
+        "channelId": "conv-1",
+        "replyToId": "msg-1",
+        "conversationEnded": True,
+        "ts": 1,
+    })
+
+    assert result.success is True
+    assert fake_ws.sent[0]["data"]["title"] == "CPU 告警排查结果"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_reply_event_writes_readable_message_log(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._connected_event.set()
+    fake_ws = _FakeWebSocket()
+    adapter._ws = fake_ws
+
+    result = await adapter.send_reply_event(
+        {
+            "messageId": "botmsg-1",
+            "seq": 2,
+            "phase": "end",
+            "kind": "final",
+            "channelId": "conv-1",
+            "replyToId": "msg-1",
+            "runId": "sess-1",
+            "text": "已完成",
+            "title": "运维排查",
+            "conversationEnded": True,
+            "ts": 1,
+            "metadata": {"sessionKey": "aops:conv-1", "sessionId": "sess-1"},
+        }
+    )
+
+    assert result.success is True
+    lines = _read_aops_log_lines(tmp_path)
+    assert len(lines) == 1
+    assert " io=send " in lines[0]
+    assert "event=message_reply" in lines[0]
+    assert "messageType=common" in lines[0]
+    assert "channel=conv-1" in lines[0]
+    assert 'title="运维排查"' in lines[0]
+    assert 'text="已完成"' in lines[0]
+    assert "status=ok" in lines[0]
+    assert _aops_log_raw(lines[0])["event"] == "message_reply"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_reply_event_writes_approval_summary_log(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._connected_event.set()
+    adapter._ws = _FakeWebSocket()
+
+    await adapter.send_reply_event(
+        {
+            "messageId": "approval-1",
+            "seq": 1,
+            "phase": "actions",
+            "kind": "approval",
+            "channelId": "conv-1",
+            "replyToId": "msg-1",
+            "conversationEnded": True,
+            "ts": 1,
+            "content": [
+                {
+                    "type": "approval",
+                    "approvalKind": "exec",
+                    "allowedActions": [
+                        {"command": "/approve", "display": "仅本次允许"},
+                        {"command": "/approve always", "display": "始终允许"},
+                        {"command": "/deny", "display": "拒绝"},
+                    ],
+                    "command": "rm -rf /tmp/foo",
+                }
+            ],
+        }
+    )
+
+    line = _read_aops_log_lines(tmp_path)[0]
+    assert " io=send " in line
+    assert "event=message_reply" in line
+    assert "messageType=approval" in line
+    assert 'text="approval kind=exec actions=/approve,/approve always,/deny command=rm -rf /tmp/foo"' in line
+    assert _aops_log_raw(line)["data"]["content"][0]["approvalKind"] == "exec"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_reply_event_writes_silent_log_type(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._connected_event.set()
+    adapter._ws = _FakeWebSocket()
+
+    await adapter.send_reply_event(
+        {
+            "messageId": "silent-1",
+            "seq": 1,
+            "phase": "end",
+            "kind": "final",
+            "channelId": "conv-1",
+            "text": "/cron result",
+            "silent": True,
+            "conversationEnded": True,
+            "ts": 1,
+        }
+    )
+
+    line = _read_aops_log_lines(tmp_path)[0]
+    assert " io=send " in line
+    assert "event=message_reply" in line
+    assert "messageType=silent" in line
+    assert "silent=true" in line
+    assert 'text="/cron result"' in line
+    assert _aops_log_raw(line)["data"]["silent"] is True
 
 
 @pytest.mark.asyncio
@@ -441,6 +642,182 @@ async def test_aops_send_uses_cron_message_type_from_metadata():
     end = adapter.send_reply_event.await_args_list[1].args[0]
     assert start["messageType"] == "cron"
     assert end["messageType"] == "cron"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_includes_cron_bot_reply_extra_metadata():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+
+    result = await adapter.send(
+        "user-001",
+        "hello",
+        metadata={
+            "source": "claw",
+            "message_type": "cron",
+            "botReplyExtra": {
+                "messageType": "cron",
+                "id": "0798d2788a2d",
+                "name": "提醒查看数据库数据",
+            },
+        },
+    )
+
+    assert result.success is True
+    start = adapter.send_reply_event.await_args_list[0].args[0]
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert "metadata" not in start
+    assert "metadata" not in end
+    assert "botReplyExtra" not in start
+    assert "botReplyExtra" not in end
+    assert start["source"] == "claw"
+    assert end["source"] == "claw"
+    assert start["messageType"] == "cron"
+    assert end["messageType"] == "cron"
+    assert start["id"] == "0798d2788a2d"
+    assert end["id"] == "0798d2788a2d"
+    assert start["name"] == "提醒查看数据库数据"
+    assert end["name"] == "提醒查看数据库数据"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_uses_resolved_session_title_when_metadata_title_empty():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    adapter.set_title_resolver(lambda payload: "CPU 告警排查" if payload.get("runId") == "sess-1" else "")
+
+    result = await adapter.send(
+        "user-001",
+        "hello",
+        metadata={"run_id": "sess-1", "message_type": "cron"},
+    )
+
+    assert result.success is True
+    start = adapter.send_reply_event.await_args_list[0].args[0]
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert start["title"] == "CPU 告警排查"
+    assert end["title"] == "CPU 告警排查"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_reply_event_uses_resolved_session_title(monkeypatch):
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._connected_event.set()
+    adapter._ws = _FakeWebSocket()
+    adapter.set_title_resolver(lambda payload: "磁盘空间巡检" if payload.get("runId") == "sess-2" else "")
+
+    result = await adapter.send_reply_event(
+        {
+            "messageId": "reply-1",
+            "seq": 1,
+            "phase": "end",
+            "kind": "final",
+            "channelId": "conv-1",
+            "text": "ok",
+            "conversationEnded": True,
+            "runId": "sess-2",
+        }
+    )
+
+    assert result.success is True
+    sent = adapter._ws.sent[0]["data"]
+    assert sent["title"] == "磁盘空间巡检"
+
+
+@pytest.mark.asyncio
+async def test_aops_outbound_title_resolves_from_channel_session(tmp_path):
+    from gateway.session import SessionStore
+    from hermes_state import SessionDB
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=runner.config)
+    runner._session_db = SessionDB(db_path=tmp_path / "state.db")
+    source = SessionSource(platform=Platform.AOPS, chat_id="conv-1", chat_type="dm")
+    entry = runner.session_store.get_or_create_session(source)
+    runner._session_db.create_session(entry.session_id, source="aops")
+    runner._session_db.set_session_title(entry.session_id, "CPU 告警排查")
+
+    title = runner._aops_outbound_title_for_payload({"channelId": "conv-1"})
+
+    assert title == "CPU 告警排查"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_reply_event_flattens_nested_cron_bot_reply_extra():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._connected_event.set()
+    adapter._ws = _FakeWebSocket()
+
+    result = await adapter.send_reply_event(
+        {
+            "messageId": "cron-1",
+            "seq": 1,
+            "phase": "start",
+            "kind": "final",
+            "channelId": "conv-1",
+            "conversationEnded": False,
+            "messageType": "cron",
+            "source": "claw",
+            "botReplyExtra": {
+                "messageType": "cron",
+                "title": "",
+                "source": "claw",
+                "botReplyExtra": {
+                    "messageType": "cron",
+                    "id": "940bdb32d5af",
+                    "name": "双分钟祝福",
+                },
+            },
+        }
+    )
+
+    assert result.success is True
+    sent = adapter._ws.sent[0]["data"]
+    assert "metadata" not in sent
+    assert "botReplyExtra" not in sent
+    assert sent["source"] == "claw"
+    assert sent["messageType"] == "cron"
+    assert sent["id"] == "940bdb32d5af"
+    assert sent["name"] == "双分钟祝福"
+
+
+@pytest.mark.asyncio
+async def test_aops_send_flattens_nested_cron_bot_reply_extra():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+
+    result = await adapter.send(
+        "user-001",
+        "hello",
+        metadata={
+            "source": "claw",
+            "message_type": "cron",
+            "botReplyExtra": {
+                "messageType": "cron",
+                "title": "",
+                "source": "claw",
+                "botReplyExtra": {
+                    "messageType": "cron",
+                    "id": "940bdb32d5af",
+                    "name": "双分钟祝福",
+                },
+            },
+        },
+    )
+
+    assert result.success is True
+    start = adapter.send_reply_event.await_args_list[0].args[0]
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert "botReplyExtra" not in start
+    assert "botReplyExtra" not in end
+    assert start["source"] == "claw"
+    assert end["source"] == "claw"
+    assert start["messageType"] == "cron"
+    assert end["messageType"] == "cron"
+    assert start["id"] == "940bdb32d5af"
+    assert end["id"] == "940bdb32d5af"
+    assert start["name"] == "双分钟祝福"
+    assert end["name"] == "双分钟祝福"
 
 
 @pytest.mark.asyncio
@@ -490,6 +867,79 @@ async def test_aops_send_emits_structured_content_in_end_payload():
     assert end["phase"] == "end"
     assert end["content"][0]["type"] == "commandResult"
     assert end["content"][0]["items"][0]["slug"] == "knowledge-query"
+
+
+def test_aops_silent_reasoning_status_reads_current_config(tmp_path, monkeypatch):
+    import yaml
+    from gateway import aops_commands
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "agent": {"reasoning_effort": "high"},
+                "display": {"platforms": {"aops": {"show_reasoning": True}}},
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    result = aops_commands.maybe_local_command(_make_aops_event("/reasoning"))
+    payload = json.loads(result)
+
+    assert payload["type"] == "reasoning.status"
+    assert payload["ok"] is True
+    assert payload["level"] == "high"
+    assert payload["enabled"] is True
+    assert payload["showReasoning"] is True
+
+
+def test_aops_silent_reasoning_status_expands_default_level(tmp_path, monkeypatch):
+    import yaml
+    from gateway import aops_commands
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump({}, allow_unicode=True), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    result = aops_commands.maybe_local_command(_make_aops_event("/reasoning"))
+    payload = json.loads(result)
+
+    assert payload["type"] == "reasoning.status"
+    assert payload["ok"] is True
+    assert payload["level"] == "medium"
+    assert payload["enabled"] is True
+    assert payload["source"] == "default"
+    assert payload["isDefault"] is True
+    assert payload["defaultLevel"] == "medium"
+
+
+def test_aops_silent_reasoning_set_persists_global_config(tmp_path, monkeypatch):
+    import yaml
+    from gateway import aops_commands
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"agent": {"reasoning_effort": "low"}}, allow_unicode=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    result = aops_commands.maybe_local_command(_make_aops_event("/reasoning xhigh"))
+    payload = json.loads(result)
+    saved = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
+
+    assert payload["type"] == "reasoning.updated"
+    assert payload["ok"] is True
+    assert payload["level"] == "xhigh"
+    assert payload["enabled"] is True
+    assert payload["persisted"] is True
+    assert saved["agent"]["reasoning_effort"] == "xhigh"
 
 
 def test_resolve_aops_client_id_reads_existing_file(monkeypatch, tmp_path):
@@ -696,15 +1146,14 @@ async def test_aops_read_events_replies_to_server_ping(monkeypatch, tmp_path):
     assert fake_ws.sent[0]["event"] == "pong"
     assert fake_ws.sent[0]["data"]["ts"].endswith("Z")
     adapter._dispatch_payload.assert_not_awaited()
-    records = _read_aops_wire_records(tmp_path)
-    assert [record["action"] for record in records] == ["ws.receive", "ws.send"]
-    assert records[0]["direction"] == "in"
-    assert records[0]["event"] == "ping"
-    assert records[0]["payload"]["message"] == "heartbeat"
-    assert records[1]["direction"] == "out"
-    assert records[1]["event"] == "pong"
-    assert records[1]["ts"].endswith("Z")
-    assert records[1]["localTime"]
+    lines = _read_aops_log_lines(tmp_path)
+    assert [_aops_log_field(line, "io") for line in lines] == ["recv", "send"]
+    assert [_aops_log_field(line, "event") for line in lines] == ["ping", "pong"]
+    assert [_aops_log_field(line, "messageType") for line in lines] == ["ws", "ws"]
+    assert _aops_log_raw(lines[0])["event"] == "ping"
+    assert _aops_log_raw(lines[0])["message"] == "heartbeat"
+    assert _aops_log_raw(lines[1])["event"] == "pong"
+    assert lines[1].startswith(datetime.now().astimezone().strftime("%Y-%m-%dT"))
 
 
 @pytest.mark.asyncio
@@ -736,12 +1185,196 @@ async def test_aops_read_events_dispatches_message_posted_after_ping_support(mon
     adapter.handle_message = AsyncMock()
 
     await adapter._read_events()
+    await _drain_aops_dispatch_tasks(adapter)
 
     assert fake_ws.sent == []
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.message_id == "msg-1"
     assert event.text == "check cpu"
+
+
+@pytest.mark.asyncio
+async def test_aops_read_events_logs_ws_close_code(monkeypatch, tmp_path):
+    fake_aiohttp = types.SimpleNamespace(
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    fake_ws = _FakeWebSocket()
+    fake_ws.messages = [SimpleNamespace(type="CLOSE", data=4004, extra="policy")]
+    fake_ws.close_code = 4004
+    fake_ws.exception = lambda: RuntimeError("server closed")
+    adapter._ws = fake_ws
+    adapter._running = True
+
+    with pytest.raises(RuntimeError):
+        await adapter._read_events()
+
+    line = _read_aops_log_lines(tmp_path)[0]
+    assert " io=recv " in line
+    assert "event=ws.closed" in line
+    assert "messageType=ws" in line
+    assert 'text="closeCode=4004 reasonHint=server_closed_code_4004"' in line
+    assert _aops_log_raw(line)["closeCode"] == 4004
+
+
+@pytest.mark.asyncio
+async def test_aops_command_message_is_written_to_unified_log(monkeypatch, tmp_path):
+    fake_aiohttp = types.SimpleNamespace(
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    fake_ws = _FakeWebSocket()
+    payload = {
+        "event": "message_posted",
+        "data": {
+            "id": "msg-cmd-1",
+            "userId": "user-001",
+            "userName": "Alice",
+            "text": "/cron",
+            "channelId": "conv-1",
+            "channelType": "direct",
+            "timestamp": "2026-04-09T08:00:00.000Z",
+            "title": "运维排查",
+        },
+    }
+    fake_ws.messages = [SimpleNamespace(type="TEXT", data=json.dumps(payload))]
+    fake_ws.on_receive = lambda: setattr(adapter, "_running", False)
+    adapter._ws = fake_ws
+    adapter._running = True
+    adapter.handle_message = AsyncMock()
+
+    await adapter._read_events()
+    await _drain_aops_dispatch_tasks(adapter)
+
+    lines = _read_aops_log_lines(tmp_path)
+    assert len(lines) == 1
+    assert " io=recv " in lines[0]
+    assert "event=message_posted" in lines[0]
+    assert "messageType=-" in lines[0]
+    assert "msg=msg-cmd-1" in lines[0]
+    assert 'title="运维排查"' in lines[0]
+    assert 'text="/cron"' in lines[0]
+    assert _aops_log_raw(lines[0])["event"] == "message_posted"
+
+
+@pytest.mark.asyncio
+async def test_aops_read_events_keeps_ping_pong_while_message_dispatch_is_slow(monkeypatch, tmp_path):
+    fake_aiohttp = types.SimpleNamespace(
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    fake_ws = _FakeWebSocket()
+    fake_ws.messages = [
+        SimpleNamespace(
+            type="TEXT",
+            data=json.dumps({
+                "event": "message_posted",
+                "data": {
+                    "id": "msg-slow-1",
+                    "userId": "user-001",
+                    "userName": "Alice",
+                    "text": "/model status",
+                    "channelId": "conv-1",
+                    "channelType": "direct",
+                    "timestamp": "2026-04-09T08:00:00.000Z",
+                    "silent": True,
+                },
+            }),
+        ),
+        SimpleNamespace(
+            type="TEXT",
+            data=json.dumps({
+                "event": "ping",
+                "message": "heartbeat",
+                "data": {"ts": "2026-04-09T08:00:01Z", "timeoutMs": 30000},
+            }),
+        ),
+    ]
+    receive_count = 0
+
+    def on_receive():
+        nonlocal receive_count
+        receive_count += 1
+        if receive_count >= 2:
+            adapter._running = False
+
+    dispatch_started = asyncio.Event()
+    release_dispatch = asyncio.Event()
+
+    async def slow_dispatch(payload):
+        dispatch_started.set()
+        await release_dispatch.wait()
+
+    fake_ws.on_receive = on_receive
+    adapter._ws = fake_ws
+    adapter._running = True
+    adapter._dispatch_payload = slow_dispatch
+
+    await adapter._read_events()
+    await asyncio.wait_for(dispatch_started.wait(), timeout=0.5)
+
+    assert len(fake_ws.sent) == 1
+    assert fake_ws.sent[0]["event"] == "pong"
+    release_dispatch.set()
+    await _drain_aops_dispatch_tasks(adapter)
+
+
+@pytest.mark.asyncio
+async def test_aops_silent_command_bypasses_normal_message_channel(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+""",
+        encoding="utf-8",
+    )
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._connected_event.set()
+    adapter._ws = _FakeWebSocket()
+    adapter.handle_message = AsyncMock()
+    payload = _make_wire_silent_aops_payload("/model status", message_id="silent-msg-1")
+
+    await adapter._dispatch_payload(payload)
+
+    adapter.handle_message.assert_not_awaited()
+    sent = [item for item in adapter._ws.sent if item.get("event") == "message_reply"]
+    assert len(sent) == 1
+    data = sent[0]["data"]
+    assert data["phase"] == "end"
+    assert data["messageType"] == "silent"
+    assert data["silent"] is True
+    assert data["replyToId"] == "silent-msg-1"
+    assert json.loads(data["text"])["type"] == "model.status"
+    lines = _read_aops_log_lines(tmp_path)
+    assert any(" io=recv " in line and "event=message_posted" in line and "silent=true" in line for line in lines)
+    assert any(" io=send " in line and "event=message_reply" in line and "messageType=silent" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_aops_silent_help_returns_command_tree(monkeypatch):
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/help"))
+
+    payload = json.loads(result)
+    assert payload["schemaVersion"] == "local-command-tree.v2"
+    assert payload["type"] == "command.tree"
+    assert payload["ok"] is True
+    assert payload["command"] == "/help"
+    assert any(item["fullCommand"] == "/model" for item in payload["items"])
 
 
 @pytest.mark.asyncio
@@ -766,15 +1399,19 @@ async def test_aops_read_events_ignores_unknown_event_without_pong(monkeypatch, 
     adapter.handle_message.assert_not_awaited()
 
 
-def test_aops_wire_log_keeps_recent_seven_days(monkeypatch, tmp_path):
+def test_aops_log_keeps_recent_seven_days(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     log_dir = tmp_path / "logs" / "aops"
     log_dir.mkdir(parents=True)
     today = datetime.now(timezone.utc).date()
-    old_log = log_dir / f"aops-wire-{(today - timedelta(days=8)).isoformat()}.log"
-    recent_log = log_dir / f"aops-wire-{(today - timedelta(days=6)).isoformat()}.log"
+    old_log = log_dir / f"aops-{(today - timedelta(days=8)).isoformat()}.log"
+    recent_log = log_dir / f"aops-{(today - timedelta(days=6)).isoformat()}.log"
+    old_wire_log = log_dir / f"aops-wire-{(today - timedelta(days=8)).isoformat()}.log"
+    old_message_log = log_dir / f"aops-messages-{(today - timedelta(days=8)).isoformat()}.log"
     old_log.write_text('{"old": true}\n', encoding="utf-8")
     recent_log.write_text('{"recent": true}\n', encoding="utf-8")
+    old_wire_log.write_text('{"old": true}\n', encoding="utf-8")
+    old_message_log.write_text('{"old": true}\n', encoding="utf-8")
 
     adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
     adapter._log_wire(
@@ -797,19 +1434,92 @@ def test_aops_wire_log_keeps_recent_seven_days(monkeypatch, tmp_path):
     )
 
     assert not old_log.exists()
+    assert not old_wire_log.exists()
+    assert not old_message_log.exists()
     assert recent_log.exists()
-    records = _read_aops_wire_records(tmp_path)
-    current = next(record for record in records if record.get("messageId") == "botmsg-1")
-    assert current["ts"].endswith("Z")
-    assert current["localTime"]
-    assert current["event"] == "message_reply"
-    assert current["seq"] == 2
-    assert current["phase"] == "end"
-    assert current["kind"] == "final"
-    assert current["channelId"] == "conv-1"
-    assert current["replyToId"] == "msg-1"
-    assert current["runId"] == "run-1"
-    assert current["payload"]["data"]["text"] == "完整正文"
+    current = next(line for line in _read_aops_log_lines(tmp_path) if "msg=botmsg-1" in line)
+    assert current.startswith(datetime.now().astimezone().strftime("%Y-%m-%dT"))
+    assert " io=send " in current
+    assert "event=message_reply" in current
+    assert "messageType=-" in current
+    assert "channel=conv-1" in current
+    assert "replyTo=msg-1" in current
+    assert _aops_log_raw(current)["data"]["text"] == "完整正文"
+
+
+def test_aops_log_retention_days_can_be_overridden_by_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AOPS_LOG_RETENTION_DAYS", "7")
+    log_dir = tmp_path / "logs" / "aops"
+    log_dir.mkdir(parents=True)
+    today = datetime.now(timezone.utc).date()
+    old_log = log_dir / f"aops-{(today - timedelta(days=4)).isoformat()}.log"
+    old_log.write_text("old\n", encoding="utf-8")
+
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"base_url": "https://aops.example.com", "log_retention_days": 3},
+        )
+    )
+
+    adapter._log_wire("info", direction="out", action="ws.send", payload={"event": "pong"})
+
+    assert not old_log.exists()
+
+
+def test_aops_log_retention_days_can_be_overridden_by_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AOPS_LOG_RETENTION_DAYS", "3")
+    log_dir = tmp_path / "logs" / "aops"
+    log_dir.mkdir(parents=True)
+    today = datetime.now(timezone.utc).date()
+    old_log = log_dir / f"aops-{(today - timedelta(days=4)).isoformat()}.log"
+    old_log.write_text("old\n", encoding="utf-8")
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+
+    adapter._log_wire("info", direction="out", action="ws.send", payload={"event": "pong"})
+
+    assert not old_log.exists()
+
+
+@pytest.mark.asyncio
+async def test_aops_agent_registration_request_and_response_are_written_to_unified_log(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    fake_ws = _FakeWebSocket()
+    fake_session = _FakeClientSession(fake_ws)
+    fake_session.get_responses.append(_FakeResponse(payload={"id": "bot-001", "name": "AOPS Bot"}))
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={
+                "base_url": "https://aops.example.com",
+                "agent_routes": {"devops": {"workspace": "~/.hermes/devops"}},
+            },
+        )
+    )
+    adapter._session = fake_session
+
+    bot_info = await adapter._fetch_bot_me(request_kwargs={})
+    adapter._bot_id = bot_info["id"]
+    await adapter._report_agents(request_kwargs={})
+
+    lines = _read_aops_log_lines(tmp_path)
+    events = _aops_log_events(tmp_path)
+    assert events == [
+        "http.bot_me.request",
+        "http.bot_me.response",
+        "http.agent_report.request",
+        "http.agent_report.response",
+    ]
+    agent_request_raw = _aops_log_raw(lines[2])
+    assert agent_request_raw["method"] == "POST"
+    assert agent_request_raw["body"]["botId"] == "bot-001"
+    assert agent_request_raw["body"]["agents"][0]["id"] == "devops"
+    assert _aops_log_raw(lines[3])["status"] == 200
 
 
 def test_message_posted_maps_to_message_event_and_agent_route():
@@ -921,9 +1631,8 @@ async def test_aops_inbound_attachment_downloads_to_media_event(monkeypatch, tmp
     assert fake_session.get_calls[0][0] == "https://aops.example.com/api/v1/attachments/cms_file_001/download"
     assert fake_session.get_calls[0][1]["headers"]["Authorization"] == "Bearer tok"
     assert "tec-client-ip" in fake_session.get_calls[0][1]["headers"]
-    actions = _aops_wire_actions(tmp_path)
-    assert "attachment.download.start" in actions
-    assert "attachment.download.success" in actions
+    actions = _aops_log_events(tmp_path)
+    assert actions == ["http.attachment.request", "http.attachment.response"]
 
 
 @pytest.mark.asyncio
@@ -980,7 +1689,7 @@ async def test_aops_silent_inbound_attachment_is_ignored(tmp_path, monkeypatch):
 
     assert event.media_urls == []
     assert fake_session.get_calls == []
-    assert "attachment.download.skipped" in _aops_wire_actions(tmp_path)
+    assert _read_aops_log_lines(tmp_path) == []
 
 
 @pytest.mark.asyncio
@@ -1009,7 +1718,7 @@ async def test_aops_inbound_attachment_failure_keeps_text_event(tmp_path, monkey
     assert "无法识别" in event.text
     assert event.message_type == MessageType.TEXT
     assert event.media_urls == []
-    assert "attachment.download.failed" in _aops_wire_actions(tmp_path)
+    assert _aops_log_events(tmp_path) == ["http.attachment.request", "http.attachment.response"]
 
 
 def test_aops_extracts_user_content_from_messages_json():
@@ -1127,6 +1836,23 @@ async def test_aops_bridge_emits_segmented_stream_events():
 
 
 @pytest.mark.asyncio
+async def test_aops_bridge_final_uses_latest_title():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    bridge = AopsLiveReplyBridge(adapter, chat_id="user-001", reply_to_id="msg-1", run_id="run-1")
+
+    task = asyncio.create_task(bridge.run())
+    bridge.update_title("CPU 告警排查")
+    bridge.send_final("done", conversation_ended=True)
+    bridge.finish()
+    await task
+
+    events = [call.args[0] for call in adapter.send_reply_event.await_args_list]
+    assert events[-1]["phase"] == "end"
+    assert events[-1]["title"] == "CPU 告警排查"
+
+
+@pytest.mark.asyncio
 async def test_aops_bridge_drops_internal_thinking_progress(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
@@ -1147,16 +1873,13 @@ async def test_aops_bridge_drops_internal_thinking_progress(monkeypatch, tmp_pat
     })
 
     adapter.send_reply_event.assert_not_awaited()
-    records = _read_aops_wire_records(tmp_path)
-    assert [record["action"] for record in records] == [
-        "tool_progress.dropped",
-        "tool_progress.dropped",
-    ]
-    assert all(record["direction"] == "drop" for record in records)
-    assert records[0]["payload"]["event_type"] == "reasoning.available"
-    assert records[0]["payload"]["preview"] == "测试收到。我是 数智运维专家。"
-    assert records[0]["ts"].endswith("Z")
-    assert records[0]["localTime"]
+    lines = _read_aops_log_lines(tmp_path)
+    assert [_aops_log_field(line, "io") for line in lines] == ["send", "send"]
+    assert [_aops_log_field(line, "messageType") for line in lines] == ["filtered", "filtered"]
+    assert [_aops_log_field(line, "status") for line in lines] == ["skipped", "skipped"]
+    assert _aops_log_raw(lines[0])["data"]["event_type"] == "reasoning.available"
+    assert _aops_log_raw(lines[0])["data"]["preview"] == "测试收到。我是 数智运维专家。"
+    assert 'text="filtered reason=internal_thinking tool=_thinking"' in lines[0]
 
 
 @pytest.mark.asyncio
@@ -1192,13 +1915,194 @@ async def test_send_exec_approval_puts_approval_in_end_content(monkeypatch):
         description="dangerous command",
         metadata={"reply_to": "msg-1"},
     )
-    end_payload = adapter.send_reply_event.await_args_list[1].args[0]
-    approval = end_payload["content"][0]
-    assert end_payload["phase"] == "end"
+    action_payload = adapter.send_reply_event.await_args.args[0]
+    approval = action_payload["content"][0]
+    assert action_payload["phase"] == "actions"
+    assert action_payload["kind"] == "approval"
+    assert action_payload["text"] == ""
+    assert action_payload["replyToId"] == "msg-1"
     assert approval["type"] == "approval"
     assert approval["approvalKind"] == "exec"
-    assert approval["allowedActions"] == ["allow-once", "allow-always", "deny"]
+    assert _approval_commands(approval["allowedActions"]) == ["/approve", "/approve always", "/deny"]
+    assert _approval_displays(approval["allowedActions"]) == ["仅本次允许", "始终允许", "拒绝"]
     assert approval["expiresAtMs"] > 1760000000000
+    assert "检测到需要审批" in approval["message"]
+    assert approval["replyContent"] == approval["message"]
+    assert "rm -rf /tmp/foo" in approval["message"]
+
+
+@pytest.mark.asyncio
+async def test_send_exec_approval_without_permanent_uses_session_action():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+
+    await adapter.send_exec_approval(
+        chat_id="user-001",
+        command="apply_patch",
+        session_key="session-1",
+        description="Codex requests to apply a patch",
+        metadata={"allow_permanent": False},
+    )
+
+    action_payload = adapter.send_reply_event.await_args.args[0]
+    approval = action_payload["content"][0]
+    assert action_payload["phase"] == "actions"
+    assert action_payload["kind"] == "approval"
+    assert _approval_commands(approval["allowedActions"]) == ["/approve", "/approve session", "/deny"]
+    assert _approval_displays(approval["allowedActions"]) == ["仅本次允许", "本会话允许", "拒绝"]
+    assert approval["allowPermanent"] is False
+    assert approval["replyContent"] == approval["message"]
+    assert "本会话允许" in approval["message"]
+    assert "始终允许" not in approval["message"]
+
+
+@pytest.mark.asyncio
+async def test_send_slash_confirm_puts_approval_actions_in_content():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+
+    result = await adapter.send_slash_confirm(
+        chat_id="conv-001",
+        title="/new",
+        message="Confirm /new",
+        session_key="session-1",
+        confirm_id="confirm-1",
+        metadata={"reply_to": "msg-1"},
+    )
+
+    assert result.success is True
+    action_payload = adapter.send_reply_event.await_args.args[0]
+    approval = action_payload["content"][0]
+    assert action_payload["phase"] == "actions"
+    assert action_payload["kind"] == "approval"
+    assert action_payload["text"] == ""
+    assert action_payload["replyToId"] == "msg-1"
+    assert approval["type"] == "approval"
+    assert approval["approvalKind"] == "slash"
+    assert _approval_commands(approval["allowedActions"]) == ["/approve", "/always", "/cancel"]
+    assert _approval_displays(approval["allowedActions"]) == ["执行本次", "始终执行", "取消"]
+    assert approval["id"] == "confirm-1"
+    assert approval["message"] == "Confirm /new"
+    assert approval["replyContent"] == "Confirm /new"
+
+
+def test_aops_approval_action_payload_maps_to_approve_command():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-approval-1",
+            "userId": "user-001",
+            "userName": "Alice",
+            "text": "",
+            "channelId": "conv-001",
+            "channelType": "direct",
+            "timestamp": "2026-04-09T08:00:00.000Z",
+            "content": {"type": "approval", "id": "approval-1", "action": "allow-always"},
+        }
+    )
+
+    assert event is not None
+    assert event.text == "/approve always"
+    assert event.raw_message["metadata"]["aopsApprovalAction"] is True
+    assert event.raw_message["metadata"]["aopsApprovalId"] == "approval-1"
+
+
+def test_aops_approval_action_payload_accepts_direct_command_value():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-approval-direct",
+            "userId": "user-001",
+            "userName": "Alice",
+            "text": "",
+            "channelId": "conv-001",
+            "channelType": "direct",
+            "timestamp": "2026-04-09T08:00:00.000Z",
+            "content": {"type": "approval", "id": "approval-1", "action": "/approve always"},
+        }
+    )
+
+    assert event is not None
+    assert event.text == "/approve always"
+    assert event.raw_message["metadata"]["aopsApprovalAction"] is True
+    assert event.raw_message["metadata"]["aopsApprovalId"] == "approval-1"
+
+
+def test_aops_slash_approval_action_maps_to_slash_confirm_command():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-approval-slash",
+            "userId": "user-001",
+            "userName": "Alice",
+            "text": "",
+            "channelId": "conv-001",
+            "channelType": "direct",
+            "timestamp": "2026-04-09T08:00:00.000Z",
+            "content": {
+                "type": "approval",
+                "approvalKind": "slash",
+                "id": "confirm-1",
+                "action": "allow-always",
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.text == "/always"
+    assert event.raw_message["metadata"]["aopsApprovalAction"] is True
+    assert event.raw_message["metadata"]["aopsApprovalId"] == "confirm-1"
+
+
+def test_aops_slash_approval_action_accepts_direct_command_value():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-approval-slash-direct",
+            "userId": "user-001",
+            "userName": "Alice",
+            "text": "",
+            "channelId": "conv-001",
+            "channelType": "direct",
+            "timestamp": "2026-04-09T08:00:00.000Z",
+            "content": {
+                "type": "approval",
+                "approvalKind": "slash",
+                "id": "confirm-1",
+                "action": "/always",
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.text == "/always"
+    assert event.raw_message["metadata"]["aopsApprovalAction"] is True
+    assert event.raw_message["metadata"]["aopsApprovalId"] == "confirm-1"
+
+
+def test_aops_approval_action_metadata_maps_to_deny_command():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+
+    event = adapter._build_message_event(
+        {
+            "id": "msg-approval-2",
+            "userId": "user-001",
+            "userName": "Alice",
+            "text": "",
+            "channelId": "conv-001",
+            "channelType": "direct",
+            "timestamp": "2026-04-09T08:00:00.000Z",
+            "metadata": {"approvalId": "approval-2", "approvalAction": "deny"},
+        }
+    )
+
+    assert event is not None
+    assert event.text == "/deny"
+    assert event.raw_message["metadata"]["aopsApprovalId"] == "approval-2"
 
 
 def test_agent_report_payload_uses_agent_routes():
@@ -1366,7 +2270,7 @@ async def test_aops_cron_local_command_returns_document_fields(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
-async def test_aops_cron_history_returns_structured_list(monkeypatch, tmp_path):
+async def test_aops_cron_local_command_accepts_duration_aliases(monkeypatch, tmp_path):
     import cron.jobs as cron_jobs
 
     monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
@@ -1380,9 +2284,118 @@ async def test_aops_cron_history_returns_structured_list(monkeypatch, tmp_path):
             "job_name": job["name"],
             "job_description": "Daily report",
             "status": "ok",
+            "started_at": "2026-05-08T09:00:00Z",
+            "finished_at": "2026-05-08T09:01:30Z",
+            "durationMs": "90000",
+        }
+    )
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/cron"))
+
+    payload = json.loads(result)
+    assert payload["items"][0]["lastDurationMs"] == 90000
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_local_command_hides_disabled_next_run(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Stand up", schedule="every 1m", name="站立提醒")
+    jobs = cron_jobs.load_jobs()
+    jobs[0]["enabled"] = False
+    jobs[0]["state"] = "paused"
+    jobs[0]["next_run_at"] = "2026-06-05T10:00:00+00:00"
+    cron_jobs.save_jobs(jobs)
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/cron"))
+
+    payload = json.loads(result)
+    assert payload["items"][0]["id"] == job["id"]
+    assert payload["items"][0]["enabled"] is False
+    assert payload["items"][0]["state"] == "paused"
+    assert payload["items"][0]["nextRunAtMs"] is None
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_local_command_flags_once_schedule_as_one_shot(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Stand up", schedule="1m", name="站立提醒")
+    jobs = cron_jobs.load_jobs()
+    jobs[0]["repeat"]["times"] = None
+    cron_jobs.save_jobs(jobs)
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/cron"))
+
+    payload = json.loads(result)
+    item = payload["items"][0]
+    assert item["id"] == job["id"]
+    assert item["scheduleKind"] == "once"
+    assert item["isOneShot"] is True
+    assert item["deleteAfterRun"] is True
+    assert "once schedule" in item["scheduleWarning"]
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_local_command_describes_script_job_without_prompt(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="", schedule="every 1h", name="CPU watchdog", script="cpu_watch.sh", no_agent=True)
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/cron"))
+
+    payload = json.loads(result)
+    assert payload["items"][0]["id"] == job["id"]
+    assert payload["items"][0]["description"] == "CPU watchdog"
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_history_returns_structured_list(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Daily report", schedule="every 1h", name="Daily report")
+    next_run_at = "2026-05-08T10:00:00+00:00"
+    jobs = cron_jobs.load_jobs()
+    jobs[0]["next_run_at"] = next_run_at
+    cron_jobs.save_jobs(jobs)
+    cron_jobs.append_cron_history(
+        {
+            "job_id": job["id"],
+            "job_name": job["name"],
+            "job_description": "Daily report",
+            "status": "ok",
             "started_at": "2026-05-08T09:00:00+00:00",
             "finished_at": "2026-05-08T09:01:00+00:00",
             "duration_ms": 60000,
+            "session_id": "session-1",
+            "session_key": "aops:conv-1:main",
+            "model": "aops-model",
+            "provider": "custom",
+            "usage": {"inputTokens": 12, "outputTokens": 5},
             "response_preview": "报告已生成",
         }
     )
@@ -1401,6 +2414,75 @@ async def test_aops_cron_history_returns_structured_list(monkeypatch, tmp_path):
     assert payload["items"][0]["description"] == "Daily report"
     assert payload["items"][0]["summary"] == "报告已生成"
     assert payload["items"][0]["durationMs"] == 60000
+    assert payload["items"][0]["nextRunAtMs"] == int(datetime.fromisoformat(next_run_at).timestamp() * 1000)
+    assert payload["items"][0]["usage"] == {"inputTokens": 12, "outputTokens": 5, "durationMs": 60000}
+    assert payload["items"][0]["sessionId"] == "session-1"
+    assert payload["items"][0]["sessionKey"] == "aops:conv-1:main"
+    assert payload["items"][0]["model"] == "aops-model"
+    assert payload["items"][0]["provider"] == "custom"
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_history_falls_back_to_job_description_when_history_missing_description(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="", schedule="every 1h", name="CPU watchdog", script="cpu_watch.sh", no_agent=True)
+    cron_jobs.append_cron_history(
+        {
+            "job_id": job["id"],
+            "job_name": job["name"],
+            "status": "ok",
+            "started_at": "2026-05-08T09:00:00+00:00",
+            "finished_at": "2026-05-08T09:01:00+00:00",
+            "response_preview": "CPU 正常",
+        }
+    )
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event(f"/cron history {job['id']}"))
+
+    payload = json.loads(result)
+    assert payload["summary"]["task"]["description"] == "CPU watchdog"
+    assert payload["items"][0]["description"] == "CPU watchdog"
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_history_prefers_recorded_next_run(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Daily report", schedule="every 1h", name="Daily report")
+    recorded_next_run = 1778238000000
+    cron_jobs.append_cron_history(
+        {
+            "job_id": job["id"],
+            "job_name": job["name"],
+            "job_description": "Daily report",
+            "status": "ok",
+            "startedAt": "2026-05-08T09:00:00Z",
+            "finishedAt": "2026-05-08T09:01:00Z",
+            "durationMs": "60000",
+            "nextRunAtMs": recorded_next_run,
+            "response_preview": "报告已生成",
+        }
+    )
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event(f"/cron history {job['id']}"))
+
+    payload = json.loads(result)
+    assert payload["items"][0]["durationMs"] == 60000
+    assert payload["items"][0]["nextRunAtMs"] == recorded_next_run
+    assert payload["items"][0]["usage"] == {"durationMs": 60000}
 
 
 @pytest.mark.asyncio
@@ -1438,6 +2520,129 @@ async def test_aops_cron_history_returns_newest_first(monkeypatch, tmp_path):
 
     payload = json.loads(result)
     assert [item["summary"] for item in payload["items"]] == ["third"]
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_history_explains_deleted_one_shot_with_history(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job_id = "deleted-once-1"
+    cron_jobs.append_cron_history(
+        {
+            "job_id": job_id,
+            "job_name": "Stand up once",
+            "job_description": "1分钟后提醒我站起来",
+            "status": "ok",
+            "started_at": "2026-05-08T09:00:00+00:00",
+            "finished_at": "2026-05-08T09:01:00+00:00",
+            "duration_ms": 60000,
+            "response_preview": "站起来活动一下。",
+            "schedule_display": "once in 1m",
+        }
+    )
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event(f"/cron history {job_id}"))
+
+    payload = json.loads(result)
+    assert payload["ok"] is True
+    assert payload["context"]["jobDeleted"] is True
+    assert payload["summary"]["jobDeleted"] is True
+    assert "执行后已自动删除" in payload["summary"]["message"]
+    assert payload["items"][0]["summary"] == "站起来活动一下。"
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_history_falls_back_to_saved_output(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job_id = "output-only-1"
+    output_dir = Path(cron_jobs.OUTPUT_DIR) / job_id
+    output_dir.mkdir(parents=True)
+    output_file = output_dir / "20260508_090000.md"
+    output_file.write_text("定时任务已执行，输出来自保存文件。", encoding="utf-8")
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event(f"/cron history {job_id}"))
+
+    payload = json.loads(result)
+    assert payload["ok"] is True
+    assert payload["context"]["jobDeleted"] is True
+    assert payload["items"][0]["jobId"] == job_id
+    assert payload["items"][0]["summary"] == "定时任务已执行，输出来自保存文件。"
+    assert payload["items"][0]["outputPath"] == str(output_file)
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_list_works_while_agent_running(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Daily report", schedule="every 1h", name="Daily report")
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event("/cron")
+    session_key = runner._session_key_for_source(event.source)
+    running_agent = _RunningAgent()
+    runner._running_agents[session_key] = running_agent
+    runner._running_agents_ts[session_key] = time.time()
+
+    result = await runner._handle_message(event)
+
+    payload = json.loads(result)
+    assert payload["type"] == "cron.list"
+    assert payload["items"][0]["id"] == job["id"]
+    assert running_agent.interrupts == []
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_history_works_while_agent_running(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Daily report", schedule="every 1h", name="Daily report")
+    cron_jobs.append_cron_history(
+        {
+            "job_id": job["id"],
+            "job_name": job["name"],
+            "job_description": "Daily report",
+            "status": "ok",
+            "started_at": "2026-05-08T09:00:00+00:00",
+            "finished_at": "2026-05-08T09:01:00+00:00",
+            "duration_ms": 60000,
+            "response_preview": "报告已生成",
+        }
+    )
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event(f"/cron history {job['id']}")
+    session_key = runner._session_key_for_source(event.source)
+    running_agent = _RunningAgent()
+    runner._running_agents[session_key] = running_agent
+    runner._running_agents_ts[session_key] = time.time()
+
+    result = await runner._handle_message(event)
+
+    payload = json.loads(result)
+    assert payload["type"] == "cron.history.list"
+    assert payload["items"][0]["summary"] == "报告已生成"
+    assert running_agent.interrupts == []
 
 
 @pytest.mark.asyncio
@@ -1564,6 +2769,149 @@ async def test_aops_help_uses_structured_required_flags_for_cron_history():
 
 
 @pytest.mark.asyncio
+async def test_aops_security_command_updates_approval_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/security set smart"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "security.updated"
+    assert payload["ok"] is True
+    assert payload["current"]["mode"] == "smart"
+    import hermes_cli.config as hermes_config
+
+    cfg = hermes_config.load_config()
+    assert cfg["approvals"]["mode"] == "smart"
+    assert cfg["approvals"]["destructive_slash_confirm"] is True
+    assert payload["destructiveSlashConfirm"] is True
+
+
+@pytest.mark.asyncio
+async def test_aops_security_set_off_disables_destructive_slash_confirm(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/security set off"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "security.updated"
+    assert payload["current"]["mode"] == "off"
+    assert payload["destructiveSlashConfirm"] is False
+    import hermes_cli.config as hermes_config
+
+    cfg = hermes_config.load_config()
+    assert cfg["approvals"]["mode"] == "off"
+    assert cfg["approvals"]["destructive_slash_confirm"] is False
+
+
+@pytest.mark.asyncio
+async def test_aops_security_set_manual_reenables_destructive_slash_confirm(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_cli.config as hermes_config
+
+    hermes_config.save_config({"approvals": {"mode": "off", "destructive_slash_confirm": False}})
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/security set manual"))
+
+    payload = json.loads(result)
+    assert payload["current"]["mode"] == "manual"
+    assert payload["destructiveSlashConfirm"] is True
+    cfg = hermes_config.load_config()
+    assert cfg["approvals"]["mode"] == "manual"
+    assert cfg["approvals"]["destructive_slash_confirm"] is True
+
+
+@pytest.mark.asyncio
+async def test_aops_securty_alias_sets_security_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/securty set off"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "security.updated"
+    assert payload["current"]["mode"] == "off"
+    assert payload["destructiveSlashConfirm"] is False
+
+
+@pytest.mark.asyncio
+async def test_aops_help_includes_security_command():
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/help"))
+
+    payload = json.loads(result)
+    security = next(item for item in payload["items"] if item["fullCommand"] == "/security")
+    assert security["type"] == "configuration"
+    assert security["executable"] is True
+    set_child = next(child for child in security["children"] if child["command"] == "set")
+    assert set_child["usage"] == "/security set <off|manual|smart>"
+
+
+@pytest.mark.asyncio
+async def test_aops_help_includes_registered_extension_command():
+    from gateway import aops_commands
+
+    aops_commands.register_aops_command_extension(
+        aops_commands.AopsCommandExtension(
+            name="diagnose",
+            type="tools",
+            description="运行诊断指令。",
+            usage="/diagnose <target>",
+            executable=False,
+            completions=[
+                {
+                    "name": "target",
+                    "description": "诊断目标。",
+                    "required": True,
+                    "choices": [],
+                }
+            ],
+            children=[
+                {
+                    "command": "status",
+                    "description": "查看诊断状态。",
+                    "usage": "/diagnose status",
+                    "executable": True,
+                }
+            ],
+        )
+    )
+    try:
+        runner = _make_runner(extra={"dm_policy": "open"})
+        result = await runner._handle_message(_make_aops_event("/help"))
+        payload = json.loads(result)
+        diagnose = next(item for item in payload["items"] if item["fullCommand"] == "/diagnose")
+        status = next(child for child in diagnose["children"] if child["command"] == "status")
+        assert aops_commands.is_supported_command("diagnose") is True
+        assert diagnose["type"] == "tools"
+        assert diagnose["usage"] == "/diagnose <target>"
+        assert diagnose["completions"][0]["name"] == "target"
+        assert status["fullCommand"] == "/diagnose status"
+        assert status["executable"] is True
+    finally:
+        aops_commands.unregister_aops_command_extension("diagnose")
+
+
+@pytest.mark.asyncio
+async def test_aops_help_hides_blocked_registered_extension_command():
+    from gateway import aops_commands
+
+    aops_commands.register_aops_command_extension(
+        aops_commands.AopsCommandExtension(name="diagnose", description="运行诊断指令。")
+    )
+    try:
+        runner = _make_runner(extra={"dm_policy": "open", "blocked_commands": ["/diagnose"]})
+        result = await runner._handle_message(_make_aops_event("/help"))
+        payload = json.loads(result)
+        assert "/diagnose" not in {item["fullCommand"] for item in payload["items"]}
+    finally:
+        aops_commands.unregister_aops_command_extension("diagnose")
+
+
+@pytest.mark.asyncio
 async def test_aops_cli_only_command_is_rejected():
     runner = _make_runner(extra={"dm_policy": "open"})
     event = _make_aops_event("/skills search kubernetes")
@@ -1571,6 +2919,528 @@ async def test_aops_cli_only_command_is_rejected():
     result = await runner._handle_message(event)
 
     assert "not supported on AOPS" in result
+
+
+@pytest.mark.asyncio
+async def test_aops_new_uses_actions_slash_confirm(monkeypatch):
+    from tools import slash_confirm as slash_confirm
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    runner.adapters[Platform.AOPS] = adapter
+    event = _make_aops_event("/new")
+    session_key = runner._session_key_for_source(event.source)
+    slash_confirm.clear(session_key)
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    action_payload = adapter.send_reply_event.await_args.args[0]
+    approval = action_payload["content"][0]
+    assert action_payload["phase"] == "actions"
+    assert action_payload["kind"] == "approval"
+    assert action_payload["replyToId"] == "msg-1"
+    assert action_payload["messageType"] == "common"
+    assert approval["approvalKind"] == "slash"
+    assert _approval_commands(approval["allowedActions"]) == ["/approve", "/always", "/cancel"]
+    assert _approval_displays(approval["allowedActions"]) == ["执行本次", "始终执行", "取消"]
+    assert "Confirm /new" in approval["message"]
+    assert slash_confirm.get_pending(session_key) is not None
+    slash_confirm.clear(session_key)
+
+
+@pytest.mark.asyncio
+async def test_aops_model_list_fetches_current_gateway_models(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AOPS_MODEL_GATEWAY_KEY", "key-from-env")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+model:
+  provider: tec01-gateway
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+  api_key: ${AOPS_MODEL_GATEWAY_KEY}
+""",
+        encoding="utf-8",
+    )
+    import hermes_cli.models as models
+
+    captured = {}
+
+    def fake_probe(api_key, base_url, timeout=5.0, api_mode=None, try_alternate=True):
+        captured.update({
+            "api_key": api_key,
+            "base_url": base_url,
+            "timeout": timeout,
+            "api_mode": api_mode,
+            "try_alternate": try_alternate,
+        })
+        return {
+            "models": ["qwen-coder", "deepseek-r1"],
+            "probed_url": "http://model-gateway.internal/v1/models",
+            "resolved_base_url": "http://model-gateway.internal/v1",
+            "used_fallback": False,
+        }
+
+    monkeypatch.setattr(models, "probe_api_models", fake_probe)
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/model list"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "model.list"
+    assert payload["ok"] is True
+    assert payload["itemType"] == "model"
+    assert [item["id"] for item in payload["items"]] == ["qwen-coder", "deepseek-r1"]
+    assert payload["items"][0]["current"] is True
+    assert payload["items"][1]["command"] == "/model use tec01-gateway deepseek-r1"
+    assert payload["context"]["baseUrl"] == "http://model-gateway.internal/v1"
+    assert payload["context"]["apiKeyConfigured"] is True
+    assert payload["context"]["probedUrl"] == "http://model-gateway.internal/v1/models"
+    assert captured["api_key"] == "key-from-env"
+    assert captured["base_url"] == "http://model-gateway.internal/v1"
+    assert captured["timeout"] <= 1.5
+    assert captured["try_alternate"] is False
+
+
+@pytest.mark.asyncio
+async def test_aops_model_list_accepts_camelcase_api_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "camel-key")
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+  apiKey: MODEL_GATEWAY_API_KEY
+""",
+        encoding="utf-8",
+    )
+    import hermes_cli.models as models
+
+    captured = {}
+
+    def fake_probe(api_key, base_url, timeout=5.0, api_mode=None, try_alternate=True):
+        captured["api_key"] = api_key
+        return {"models": ["qwen-coder"], "probed_url": f"{base_url}/models"}
+
+    monkeypatch.setattr(models, "probe_api_models", fake_probe)
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/model"))
+
+    payload = json.loads(result)
+    assert payload["ok"] is True
+    assert payload["items"][0]["id"] == "qwen-coder"
+    assert payload["context"]["apiKeyConfigured"] is True
+    assert captured["api_key"] == "camel-key"
+
+
+@pytest.mark.asyncio
+async def test_aops_model_list_accepts_api_key_ref(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "ref-key")
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+  api_key_ref: MODEL_GATEWAY_API_KEY
+""",
+        encoding="utf-8",
+    )
+    import hermes_cli.models as models
+
+    captured = {}
+
+    def fake_probe(api_key, base_url, timeout=5.0, api_mode=None, try_alternate=True):
+        captured["api_key"] = api_key
+        return {"models": ["qwen-coder"], "probed_url": f"{base_url}/models"}
+
+    monkeypatch.setattr(models, "probe_api_models", fake_probe)
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/model list"))
+
+    payload = json.loads(result)
+    assert payload["ok"] is True
+    assert payload["context"]["apiKeyConfigured"] is True
+    assert captured["api_key"] == "ref-key"
+
+
+@pytest.mark.asyncio
+async def test_aops_model_list_ignores_unresolved_api_key_template(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "real-key")
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+  api_key: '{model.api_key}'
+""",
+        encoding="utf-8",
+    )
+    import hermes_cli.models as models
+
+    captured = {}
+
+    def fake_probe(api_key, base_url, timeout=5.0, api_mode=None, try_alternate=True):
+        captured["api_key"] = api_key
+        return {"models": ["qwen-coder"], "probed_url": f"{base_url}/models"}
+
+    monkeypatch.setattr(models, "probe_api_models", fake_probe)
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/model list"))
+
+    payload = json.loads(result)
+    assert payload["ok"] is True
+    assert payload["context"]["apiKeyConfigured"] is True
+    assert captured["api_key"] == "real-key"
+
+
+@pytest.mark.asyncio
+async def test_aops_model_use_persists_channel_preference(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_cli.model_switch as model_switch
+    from gateway import aops_state
+
+    captured = {}
+
+    def fake_switch_model(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            success=True,
+            new_model="custom-model",
+            target_provider="openrouter",
+            provider_label="OpenRouter",
+            api_key="key-1",
+            base_url="https://openrouter.example/v1",
+            api_mode="chat",
+            model_info=None,
+            error_message=None,
+        )
+
+    monkeypatch.setattr(model_switch, "switch_model", fake_switch_model)
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    event = _make_aops_event_for_channel("/model use openrouter custom-model", channel_id="conv-abc", agent_key="oma")
+    session_key = runner._session_key_for_source(event.source)
+
+    result = await runner._handle_message(event)
+
+    payload = json.loads(result)
+    assert payload["type"] == "model.switch"
+    assert payload["ok"] is True
+    assert payload["scope"] == "aops-channel"
+    assert payload["persisted"] is True
+    assert captured["raw_input"] == "custom-model"
+    assert captured["explicit_provider"] == "openrouter"
+    pref_key = aops_state.preference_key(platform="aops", channel_id="conv-abc", agent_key="oma")
+    pref = aops_state.get_model_preference(pref_key)
+    assert pref["model"] == "custom-model"
+    assert pref["provider"] == "openrouter"
+    runner._load_aops_model_preference_for_event(event, session_key)
+    assert runner._session_model_overrides[session_key]["model"] == "custom-model"
+
+
+@pytest.mark.asyncio
+async def test_aops_model_use_custom_uses_current_configured_gateway_without_restart(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AOPS_MODEL_GATEWAY_KEY", "key-from-env")
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+  api_key: ${AOPS_MODEL_GATEWAY_KEY}
+  api_mode: chat
+""",
+        encoding="utf-8",
+    )
+    from gateway import aops_state
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event_for_channel("/model use custom qwen35-122b", channel_id="conv-abc", agent_key="main")
+    session_key = runner._session_key_for_source(event.source)
+
+    result = await runner._handle_message(event)
+
+    payload = json.loads(result)
+    assert payload["type"] == "model.switch"
+    assert payload["ok"] is True
+    assert payload["model"] == "qwen35-122b"
+    assert payload["provider"] == "custom"
+    assert payload["baseUrl"] == "http://model-gateway.internal/v1"
+    assert payload["apiKeyConfigured"] is True
+    pref_key = aops_state.preference_key(platform="aops", channel_id="conv-abc", agent_key="main")
+    pref = aops_state.get_model_preference(pref_key)
+    assert pref["model"] == "qwen35-122b"
+    assert pref["api_key"] == "key-from-env"
+    assert runner._session_model_overrides[session_key]["model"] == "qwen35-122b"
+    assert runner._session_model_overrides[session_key]["base_url"] == "http://model-gateway.internal/v1"
+    assert payload["configUpdated"] is True
+    saved = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+    assert "default: qwen35-122b" in saved
+    assert "model: qwen35-122b" in saved
+    assert "api_key: ${AOPS_MODEL_GATEWAY_KEY}" in saved
+
+
+@pytest.mark.asyncio
+async def test_aops_model_use_replaces_unresolved_api_key_template_with_env_ref(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "key-from-env")
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+  api_key: '{model.api_key}'
+  api_key_env: MODEL_GATEWAY_API_KEY
+  api_mode: chat
+""",
+        encoding="utf-8",
+    )
+    import hermes_cli.models as models
+
+    captured = {}
+
+    def fake_probe(api_key, base_url, timeout=5.0, api_mode=None, try_alternate=True):
+        captured["api_key"] = api_key
+        return {"models": ["qwen35-122b"], "probed_url": f"{base_url}/models"}
+
+    monkeypatch.setattr(models, "probe_api_models", fake_probe)
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event_for_channel("/model use custom qwen35-122b", channel_id="conv-abc", agent_key="main")
+
+    switch_result = await runner._handle_message(event)
+    switch_payload = json.loads(switch_result)
+    assert switch_payload["ok"] is True
+
+    saved = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+    assert "{model.api_key}" not in saved
+    assert "api_key_env: MODEL_GATEWAY_API_KEY" in saved
+
+    list_result = await runner._handle_message(_make_aops_event_for_channel("/model list", channel_id="conv-abc", agent_key="main"))
+    list_payload = json.loads(list_result)
+    assert list_payload["ok"] is True
+    assert list_payload["context"]["apiKeyConfigured"] is True
+    assert captured["api_key"] == "key-from-env"
+
+
+@pytest.mark.asyncio
+async def test_aops_model_status_does_not_switch_to_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+""",
+        encoding="utf-8",
+    )
+    import hermes_cli.models as models
+    import agent.models_dev as models_dev
+    from gateway import aops_state
+
+    monkeypatch.setattr(models, "probe_api_models", lambda *a, **k: pytest.fail("status must not query /models"))
+    monkeypatch.setattr(models_dev, "fetch_models_dev", lambda *a, **k: pytest.fail("status must not query models.dev"))
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event_for_channel("/model status", channel_id="conv-abc", agent_key="main")
+
+    result = await runner._handle_message(event)
+
+    payload = json.loads(result)
+    assert payload["type"] == "model.status"
+    assert payload["ok"] is True
+    assert payload["modelId"] == "qwen-coder"
+    assert payload["model"] == "qwen-coder"
+    assert payload["provider"] == "custom"
+    assert payload["baseUrl"] == "http://model-gateway.internal/v1"
+    assert payload["scope"] == "config"
+    assert payload["configPath"] == str(tmp_path / "config.yaml")
+    pref_key = aops_state.preference_key(platform="aops", channel_id="conv-abc", agent_key="main")
+    assert aops_state.get_model_preference(pref_key) is None
+
+
+@pytest.mark.asyncio
+async def test_aops_model_status_typo_does_not_switch_to_stutus(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+""",
+        encoding="utf-8",
+    )
+    import hermes_cli.models as models
+    import hermes_cli.model_switch as model_switch
+    from gateway import aops_state
+
+    monkeypatch.setattr(models, "probe_api_models", lambda *a, **k: pytest.fail("stutus must be treated as status"))
+    monkeypatch.setattr(model_switch, "switch_model", lambda **kwargs: pytest.fail("stutus must not switch model"))
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event_for_channel("/model stutus", channel_id="conv-abc", agent_key="main")
+
+    result = await runner._handle_message(event)
+
+    payload = json.loads(result)
+    assert payload["type"] == "model.status"
+    assert payload["ok"] is True
+    assert payload["modelId"] == "qwen-coder"
+    pref_key = aops_state.preference_key(platform="aops", channel_id="conv-abc", agent_key="main")
+    assert aops_state.get_model_preference(pref_key) is None
+
+
+@pytest.mark.asyncio
+async def test_aops_model_status_typo_stattus_does_not_switch(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+""",
+        encoding="utf-8",
+    )
+    import hermes_cli.models as models
+    import hermes_cli.model_switch as model_switch
+    from gateway import aops_state
+
+    monkeypatch.setattr(models, "probe_api_models", lambda *a, **k: pytest.fail("stattus must be treated as status"))
+    monkeypatch.setattr(model_switch, "switch_model", lambda **kwargs: pytest.fail("stattus must not switch model"))
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event_for_channel("/model stattus", channel_id="conv-abc", agent_key="main")
+
+    result = await runner._handle_message(event)
+
+    payload = json.loads(result)
+    assert payload["type"] == "model.status"
+    assert payload["modelId"] == "qwen-coder"
+    pref_key = aops_state.preference_key(platform="aops", channel_id="conv-abc", agent_key="main")
+    assert aops_state.get_model_preference(pref_key) is None
+
+
+@pytest.mark.asyncio
+async def test_aops_model_implicit_switch_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+""",
+        encoding="utf-8",
+    )
+    import hermes_cli.model_switch as model_switch
+    from gateway import aops_state
+
+    monkeypatch.setattr(model_switch, "switch_model", lambda **kwargs: pytest.fail("implicit AOPS /model switch is disabled"))
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event_for_channel("/model qwen3", channel_id="conv-abc", agent_key="main")
+
+    result = await runner._handle_message(event)
+
+    payload = json.loads(result)
+    assert payload["type"] == "model.switch"
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "MODEL_USAGE"
+    pref_key = aops_state.preference_key(platform="aops", channel_id="conv-abc", agent_key="main")
+    assert aops_state.get_model_preference(pref_key) is None
+
+
+@pytest.mark.asyncio
+async def test_aops_model_handler_status_typo_guard(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+""",
+        encoding="utf-8",
+    )
+    import hermes_cli.model_switch as model_switch
+
+    monkeypatch.setattr(model_switch, "switch_model", lambda **kwargs: pytest.fail("stutus must not switch model"))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_model_command(_make_aops_event_for_channel("/model stutus", channel_id="conv-abc", agent_key="main"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "model.status"
+    assert payload["modelId"] == "qwen-coder"
+
+
+@pytest.mark.asyncio
+async def test_aops_model_status_ignores_stale_reserved_channel_preference(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+  api_key_env: MODEL_GATEWAY_API_KEY
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "key-from-env")
+    from gateway import aops_state
+
+    pref_key = aops_state.preference_key(platform="aops", channel_id="conv-abc", agent_key="main")
+    aops_state.set_model_preference(
+        pref_key,
+        {
+            "model": "status]",
+            "provider": "custom",
+            "base_url": "http://model-gateway.internal/v1",
+            "api_key_ref": "MODEL_GATEWAY_API_KEY",
+            "api_mode": "chat_completions",
+        },
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event_for_channel("/model current", channel_id="conv-abc", agent_key="main"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "model.status"
+    assert payload["modelId"] == "qwen-coder"
+    assert payload["model"] == "qwen-coder"
+    assert payload["source"] == "config.model"
+    assert aops_state.get_model_preference(pref_key) is None
+
+
+@pytest.mark.asyncio
+async def test_aops_model_preference_loader_drops_stale_reserved_model(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway import aops_state
+
+    pref_key = aops_state.preference_key(platform="aops", channel_id="conv-abc", agent_key="main")
+    aops_state.set_model_preference(pref_key, {"model": "status]", "provider": "custom"})
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event_for_channel("/model current", channel_id="conv-abc", agent_key="main")
+    session_key = runner._session_key_for_source(event.source)
+
+    runner._load_aops_model_preference_for_event(event, session_key)
+
+    assert runner._session_model_overrides == {}
+    assert aops_state.get_model_preference(pref_key) is None
 
 
 @pytest.mark.asyncio
@@ -1743,13 +3613,11 @@ async def test_aops_silent_skillhub_reply_links_to_user_message_id(monkeypatch):
         await asyncio.gather(*list(adapter._background_tasks))
 
     sent = [payload["data"] for payload in adapter._ws.sent if payload.get("event") == "message_reply"]
-    assert len(sent) == 2
-    assert [item["phase"] for item in sent] == ["start", "end"]
+    assert len(sent) == 1
+    assert sent[0]["phase"] == "end"
     assert sent[0]["replyToId"] == "2106450357"
-    assert sent[1]["replyToId"] == "2106450357"
     assert sent[0]["messageType"] == "silent"
-    assert sent[1]["messageType"] == "silent"
-    assert sent[1]["content"][0]["context"]["parentMessageId"] == "2106450357"
+    assert sent[0]["content"][0]["context"]["parentMessageId"] == "2106450357"
 
 
 @pytest.mark.asyncio

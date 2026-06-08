@@ -34,6 +34,29 @@ from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname
 
 
+def _looks_unresolved_secret_ref(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text and re.search(r"\{[^}]*\}", text))
+
+
+def _usable_secret(value: Any) -> bool:
+    return has_usable_secret(value) and not _looks_unresolved_secret_ref(value)
+
+
+def _model_config_api_key(model_cfg: Dict[str, Any]) -> str:
+    for hint_key in ("key_env", "api_key_env"):
+        env_var = str(model_cfg.get(hint_key) or "").strip()
+        if env_var:
+            value = os.getenv(env_var, "").strip()
+            if _usable_secret(value):
+                return value
+    for key in ("api_key", "api"):
+        value = str(model_cfg.get(key) or "").strip()
+        if _usable_secret(value):
+            return value
+    return ""
+
+
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
 
@@ -559,11 +582,13 @@ def _resolve_named_custom_runtime(
             return pool_result
         api_key_candidates = [
             (explicit_api_key or "").strip(),
+            os.getenv("MODEL_GATEWAY_API_KEY", "").strip(),
+            os.getenv("AOPS_MODEL_GATEWAY_KEY", "").strip(),
             os.getenv("OPENAI_API_KEY", "").strip(),
             os.getenv("OPENROUTER_API_KEY", "").strip(),
         ]
         api_key = next(
-            (c for c in api_key_candidates if has_usable_secret(c)),
+            (c for c in api_key_candidates if _usable_secret(c)),
             "",
         ) or "no-key-required"
         return {
@@ -600,10 +625,12 @@ def _resolve_named_custom_runtime(
         (explicit_api_key or "").strip(),
         str(custom_provider.get("api_key", "") or "").strip(),
         os.getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
+        os.getenv("MODEL_GATEWAY_API_KEY", "").strip(),
+        os.getenv("AOPS_MODEL_GATEWAY_KEY", "").strip(),
         os.getenv("OPENAI_API_KEY", "").strip(),
         os.getenv("OPENROUTER_API_KEY", "").strip(),
     ]
-    api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
+    api_key = next((candidate for candidate in api_key_candidates if _usable_secret(candidate)), "")
 
     result = {
         "provider": "custom",
@@ -630,12 +657,7 @@ def _resolve_openrouter_runtime(
     model_cfg = _get_model_config()
     cfg_base_url = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
     cfg_provider = model_cfg.get("provider") if isinstance(model_cfg.get("provider"), str) else ""
-    cfg_api_key = ""
-    for k in ("api_key", "api"):
-        v = model_cfg.get(k)
-        if isinstance(v, str) and v.strip():
-            cfg_api_key = v.strip()
-            break
+    cfg_api_key = _model_config_api_key(model_cfg)
     requested_norm = (requested_provider or "").strip().lower()
     cfg_provider = cfg_provider.strip().lower()
 
@@ -688,11 +710,13 @@ def _resolve_openrouter_runtime(
             explicit_api_key,
             (cfg_api_key if use_config_base_url else ""),
             (os.getenv("OLLAMA_API_KEY") if _is_ollama_url else ""),
+            os.getenv("MODEL_GATEWAY_API_KEY"),
+            os.getenv("AOPS_MODEL_GATEWAY_KEY"),
             os.getenv("OPENAI_API_KEY"),
             os.getenv("OPENROUTER_API_KEY"),
         ]
     api_key = next(
-        (str(candidate or "").strip() for candidate in api_key_candidates if has_usable_secret(candidate)),
+        (str(candidate or "").strip() for candidate in api_key_candidates if _usable_secret(candidate)),
         "",
     )
 

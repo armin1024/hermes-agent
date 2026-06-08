@@ -367,6 +367,14 @@ class TestBlockingApprovalE2E:
         os.environ.pop("HERMES_GATEWAY_SESSION", None)
         os.environ.pop("HERMES_EXEC_ASK", None)
         os.environ.pop("HERMES_SESSION_KEY", None)
+        self._tirith_patcher = patch(
+            "tools.tirith_security.check_command_security",
+            return_value={"action": "allow", "findings": [], "summary": ""},
+        )
+        self._tirith_patcher.start()
+
+    def teardown_method(self):
+        self._tirith_patcher.stop()
 
     def test_blocking_approval_approve_once(self):
         """check_all_command_guards blocks until resolve_gateway_approval is called."""
@@ -409,8 +417,63 @@ class TestBlockingApprovalE2E:
 
         assert len(notified) == 1
         assert "rm -rf /important" in notified[0]["command"]
+        assert notified[0]["allow_permanent"] is True
 
         resolve_gateway_approval(session_key, "once")
+        t.join(timeout=5)
+
+        assert result_holder[0] is not None
+        assert result_holder[0]["approved"] is True
+        unregister_gateway_notify(session_key)
+
+    def test_blocking_approval_tirith_disables_permanent_action(self):
+        """Gateway approval data marks Tirith warnings as session-only."""
+        from tools.approval import (
+            register_gateway_notify, unregister_gateway_notify,
+            resolve_gateway_approval, check_all_command_guards,
+        )
+        import tools.tirith_security
+
+        tools.tirith_security.check_command_security.return_value = {
+            "action": "warn",
+            "findings": [{"rule_id": "shortened_url", "title": "Short URL", "severity": "medium"}],
+            "summary": "shortened URL detected",
+        }
+
+        session_key = "e2e-tirith"
+        notified = []
+        register_gateway_notify(session_key, lambda d: notified.append(d))
+        result_holder = [None]
+
+        def agent_thread():
+            from tools.approval import reset_current_session_key, set_current_session_key
+
+            token = set_current_session_key(session_key)
+            os.environ["HERMES_GATEWAY_SESSION"] = "1"
+            os.environ["HERMES_EXEC_ASK"] = "1"
+            os.environ["HERMES_SESSION_KEY"] = session_key
+            try:
+                result_holder[0] = check_all_command_guards(
+                    "curl https://bit.ly/example", "local"
+                )
+            finally:
+                os.environ.pop("HERMES_GATEWAY_SESSION", None)
+                os.environ.pop("HERMES_EXEC_ASK", None)
+                os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_session_key(token)
+
+        t = threading.Thread(target=agent_thread)
+        t.start()
+
+        for _ in range(50):
+            if notified:
+                break
+            time.sleep(0.05)
+
+        assert len(notified) == 1
+        assert notified[0]["allow_permanent"] is False
+
+        resolve_gateway_approval(session_key, "session")
         t.join(timeout=5)
 
         assert result_holder[0] is not None

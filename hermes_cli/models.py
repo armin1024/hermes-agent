@@ -3063,6 +3063,7 @@ def probe_api_models(
     base_url: Optional[str],
     timeout: float = 5.0,
     api_mode: Optional[str] = None,
+    try_alternate: bool = True,
 ) -> dict[str, Any]:
     """Probe a ``/models`` endpoint with light URL heuristics.
 
@@ -3097,7 +3098,7 @@ def probe_api_models(
         alternate_base = normalized + "/v1"
 
     candidates: list[tuple[str, bool]] = [(normalized, False)]
-    if alternate_base and alternate_base != normalized:
+    if try_alternate and alternate_base and alternate_base != normalized:
         candidates.append((alternate_base, True))
 
     tried: list[str] = []

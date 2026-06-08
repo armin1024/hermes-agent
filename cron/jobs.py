@@ -46,6 +46,256 @@ _jobs_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
+_CN_NUMERAL_MAP = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_RECURRING_MINUTE_RE = re.compile(
+    r"(?:每\s*(?:隔\s*)?(?P<cn>[一二两三四五六七八九十百]+)?\s*分钟"
+    r"|每\s*(?:隔\s*)?(?P<num>\d+)\s*(?:m|min|minute|minutes|分钟)"
+    r"|(?P<cn_once>[一二两三四五六七八九十百]+)\s*分钟\s*(?:执行)?一次"
+    r"|(?P<num_once>\d+)\s*分钟\s*(?:执行)?一次)",
+    re.IGNORECASE,
+)
+_RECURRING_INTENT_RE = re.compile(
+    r"(每|每隔|周期|循环|定期|every|recurr|interval|hourly|daily|weekly|monthly)",
+    re.IGNORECASE,
+)
+_ONE_SHOT_INTENT_RE = re.compile(
+    r"(分钟后|小时后|天后|只执行一次|仅执行一次|一次性|执行一次就|one[-\s]?shot|only\s+once|just\s+once|after\s+\d+)",
+    re.IGNORECASE,
+)
+_DURATION_ONCE_DISPLAY_RE = re.compile(
+    r"^\s*(?:once\s+in\s+)?(?P<num>\d+)\s*(?P<unit>m|min|minute|minutes|h|hr|hour|hours|d|day|days)\s*$",
+    re.IGNORECASE,
+)
+_SCRIPT_UNSAFE_CHARS_RE = re.compile(r"""[\s'"`$;&|<>]""")
+_SCRIPT_ALLOWED_SUFFIXES = {".py", ".sh", ".bash"}
+
+
+def _parse_simple_cn_number(value: str | None) -> Optional[int]:
+    text = str(value or "").strip()
+    if not text:
+        return 1
+    if text == "十":
+        return 10
+    if "百" in text:
+        left, _, right = text.partition("百")
+        hundreds = _parse_simple_cn_number(left) if left else 1
+        tail = _parse_simple_cn_number(right) if right else 0
+        return (hundreds or 0) * 100 + (tail or 0)
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = _parse_simple_cn_number(left) if left else 1
+        ones = _parse_simple_cn_number(right) if right else 0
+        return (tens or 0) * 10 + (ones or 0)
+    total = 0
+    for char in text:
+        if char not in _CN_NUMERAL_MAP:
+            return None
+        total = total * 10 + _CN_NUMERAL_MAP[char]
+    return total or None
+
+
+def _recurring_minutes_from_text(value: str) -> Optional[int]:
+    match = _RECURRING_MINUTE_RE.search(value)
+    if not match:
+        return None
+    if match.group("num"):
+        try:
+            minutes = int(match.group("num"))
+        except ValueError:
+            return None
+    elif match.group("num_once"):
+        try:
+            minutes = int(match.group("num_once"))
+        except ValueError:
+            return None
+    elif match.group("cn_once"):
+        minutes = _parse_simple_cn_number(match.group("cn_once"))
+    else:
+        minutes = _parse_simple_cn_number(match.group("cn"))
+    return minutes if minutes and minutes > 0 else None
+
+
+def _duration_once_minutes(value: str) -> Optional[int]:
+    text = str(value or "").strip()
+    if text in {"一分钟", "一 分钟"}:
+        return 1
+    match = _DURATION_ONCE_DISPLAY_RE.match(text)
+    if not match:
+        return None
+    try:
+        amount = int(match.group("num"))
+    except ValueError:
+        return None
+    unit = match.group("unit").lower()
+    if unit.startswith("m"):
+        return amount
+    if unit.startswith("h"):
+        return amount * 60
+    if unit.startswith("d"):
+        return amount * 24 * 60
+    return None
+
+
+def recurring_interval_from_once_duration(schedule: str, *, minutes: Optional[int] = None) -> Optional[str]:
+    duration_minutes = _duration_once_minutes(schedule)
+    if not duration_minutes:
+        return None
+    return f"every {minutes or duration_minutes}m"
+
+
+def _normalize_schedule_for_recurring_intent(schedule: str, prompt: Optional[str], name: Optional[str] = None) -> str:
+    """Prevent recurring natural-language requests from being stored as one-shot durations."""
+    raw_schedule = str(schedule or "").strip()
+    combined = "\n".join(str(part or "") for part in (raw_schedule, prompt, name))
+    if not raw_schedule or _ONE_SHOT_INTENT_RE.search(combined):
+        return raw_schedule
+    minutes = _recurring_minutes_from_text(combined)
+    if not minutes:
+        return raw_schedule
+    parse_candidate = raw_schedule
+    if raw_schedule.lower().startswith("once in "):
+        parse_candidate = raw_schedule[8:].strip()
+    try:
+        parsed = parse_schedule(parse_candidate)
+    except Exception:
+        parsed = {}
+    interval = recurring_interval_from_once_duration(raw_schedule, minutes=minutes)
+    if parsed.get("kind") == "once" and interval:
+        return interval
+    if raw_schedule in {"一分钟", "一 分钟"}:
+        return f"every {minutes}m"
+    return raw_schedule
+
+
+def _script_reference_error(script: Optional[str], *, require_relative: bool = True, require_exists: bool = False) -> Optional[str]:
+    if script is None:
+        return None
+    raw = str(script).strip()
+    if not raw:
+        return None
+    if _SCRIPT_UNSAFE_CHARS_RE.search(raw):
+        return (
+            "Script must be a script filename/path under ~/.hermes/scripts, not an inline shell command. "
+            f"Got: {raw!r}"
+        )
+    path = Path(raw).expanduser()
+    if require_relative and (path.is_absolute() or raw.startswith("~") or (len(raw) >= 2 and raw[1] == ":")):
+        return (
+            "Script path must be relative to ~/.hermes/scripts/. "
+            f"Got absolute or home-relative path: {raw!r}."
+        )
+    if any(part == ".." for part in path.parts):
+        return f"Script path escapes the scripts directory via traversal: {raw!r}"
+    if path.suffix.lower() not in _SCRIPT_ALLOWED_SUFFIXES:
+        return (
+            "Script path must point to a .py, .sh, or .bash file under ~/.hermes/scripts/. "
+            f"Got: {raw!r}"
+        )
+    if require_exists:
+        candidate = (get_hermes_home() / "scripts" / path).resolve()
+        if not candidate.exists():
+            return f"Script file does not exist under ~/.hermes/scripts/: {raw!r}"
+        if not candidate.is_file():
+            return f"Script path is not a file under ~/.hermes/scripts/: {raw!r}"
+    return None
+
+
+def _repair_job_record(job: Dict[str, Any]) -> tuple[Dict[str, Any], list[str]]:
+    """Best-effort repair for legacy cron records that bypassed current validation."""
+    repaired = dict(job)
+    changes: list[str] = []
+    schedule = repaired.get("schedule")
+    schedule_display = _schedule_display_for_job(repaired)
+    prompt = _coerce_job_text(repaired.get("prompt"))
+    name = _coerce_job_text(repaired.get("name"))
+    if isinstance(schedule, dict) and schedule.get("kind") == "once":
+        normalized_display = _normalize_schedule_for_recurring_intent(schedule_display, prompt, name)
+        if normalized_display != schedule_display:
+            try:
+                parsed = parse_schedule(normalized_display)
+            except Exception:
+                parsed = None
+            if parsed and parsed.get("kind") in {"interval", "cron"}:
+                repaired["schedule"] = parsed
+                repaired["schedule_display"] = parsed.get("display", normalized_display)
+                repeat = dict(repaired.get("repeat") or {})
+                repeat["times"] = None
+                repaired["repeat"] = repeat
+                if repaired.get("enabled", True) and repaired.get("state") != "paused":
+                    repaired["next_run_at"] = repaired.get("next_run_at") or compute_next_run(parsed, repaired.get("last_run_at"))
+                    repaired["state"] = "scheduled"
+                changes.append("schedule_once_to_recurring")
+
+    schedule_kind = (repaired.get("schedule") or {}).get("kind") if isinstance(repaired.get("schedule"), dict) else None
+    repeat = repaired.get("repeat")
+    if schedule_kind in {"interval", "cron"} and isinstance(repeat, dict) and repeat.get("times") == 1:
+        repeat = dict(repeat)
+        repeat["times"] = None
+        repaired["repeat"] = repeat
+        changes.append("recurring_repeat_one_to_forever")
+
+    if (not repaired.get("enabled", True) or repaired.get("state") == "paused") and repaired.get("next_run_at"):
+        repaired["next_run_at"] = None
+        changes.append("disabled_next_run_cleared")
+
+    script = repaired.get("script")
+    if script:
+        script_error = _script_reference_error(str(script), require_relative=False, require_exists=False)
+        if script_error:
+            repaired["script"] = None
+            if repaired.get("no_agent") and prompt:
+                repaired["no_agent"] = False
+                changes.append("bad_script_cleared_no_agent_disabled")
+            elif repaired.get("no_agent"):
+                repaired["enabled"] = False
+                repaired["state"] = "error"
+                repaired["last_error"] = script_error
+                changes.append("bad_script_disabled_no_agent_job")
+            else:
+                changes.append("bad_script_cleared")
+            repaired["script_validation_error"] = script_error
+    return repaired, changes
+
+
+def audit_cron_jobs(*, repair: bool = False) -> Dict[str, Any]:
+    """Inspect cron storage for known bad records; optionally repair in-place."""
+    with _jobs_file_lock:
+        jobs = _load_jobs_unlocked(auto_repair=False)
+        reports: list[dict[str, Any]] = []
+        changed = False
+        repaired_jobs: list[dict[str, Any]] = []
+        for job in jobs:
+            repaired, changes = _repair_job_record(job)
+            if changes:
+                reports.append({
+                    "job_id": job.get("id"),
+                    "job_name": job.get("name"),
+                    "changes": changes,
+                })
+                changed = True
+            repaired_jobs.append(repaired if repair else job)
+        if repair and changed:
+            save_jobs(repaired_jobs)
+        return {
+            "jobs_scanned": len(jobs),
+            "issues": reports,
+            "issues_count": len(reports),
+            "repaired": bool(repair and changed),
+        }
+
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
     """Normalize legacy/single-skill and multi-skill inputs into a unique ordered list."""
@@ -78,6 +328,29 @@ def _coerce_job_text(value: Any, fallback: str = "") -> str:
     if value is None:
         return fallback
     return str(value)
+
+
+def job_description(job: Dict[str, Any], *, limit: int = 160) -> str:
+    """Return a stable human-readable description for cron list/history views."""
+    if not isinstance(job, dict):
+        return ""
+    skills = _normalize_skill_list(job.get("skill"), job.get("skills"))
+    candidates = (
+        job.get("description"),
+        job.get("prompt"),
+        job.get("name"),
+        skills[0] if skills else None,
+        job.get("script"),
+        job.get("id"),
+    )
+    for value in candidates:
+        text = " ".join(_coerce_job_text(value).split()).strip()
+        if not text:
+            continue
+        if limit > 0 and len(text) > limit:
+            return text[: limit - 1].rstrip() + "…"
+        return text
+    return ""
 
 
 def _schedule_display_for_job(job: Dict[str, Any]) -> str:
@@ -122,6 +395,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         )
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
+    normalized["description"] = job_description(normalized)
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
 
     state = _coerce_job_text(normalized.get("state")).strip()
@@ -399,8 +673,7 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 # Job CRUD Operations
 # =============================================================================
 
-def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
+def _load_jobs_unlocked(*, auto_repair: bool = True) -> List[Dict[str, Any]]:
     ensure_dirs()
     if not JOBS_FILE.exists():
         return []
@@ -408,7 +681,25 @@ def load_jobs() -> List[Dict[str, Any]]:
     try:
         with open(JOBS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            return data.get("jobs", [])
+            jobs = data.get("jobs", [])
+            if not auto_repair:
+                return jobs
+            repaired_jobs = []
+            changed = False
+            for job in jobs:
+                repaired, changes = _repair_job_record(job)
+                repaired_jobs.append(repaired)
+                changed = changed or bool(changes)
+                if changes:
+                    logger.warning(
+                        "Auto-repaired cron job '%s' (%s): %s",
+                        job.get("name") or job.get("id"),
+                        job.get("id"),
+                        ", ".join(changes),
+                    )
+            if changed:
+                save_jobs(repaired_jobs)
+            return repaired_jobs
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         try:
@@ -426,6 +717,11 @@ def load_jobs() -> List[Dict[str, Any]]:
     except IOError as e:
         logger.error("IOError reading jobs.json: %s", e)
         raise RuntimeError(f"Failed to read cron database: {e}") from e
+
+
+def load_jobs() -> List[Dict[str, Any]]:
+    """Load all jobs from storage."""
+    return _load_jobs_unlocked()
 
 
 def save_jobs(jobs: List[Dict[str, Any]]):
@@ -545,10 +841,14 @@ def create_job(
     Returns:
         The created job dict
     """
+    original_schedule = str(schedule or "").strip()
+    schedule = _normalize_schedule_for_recurring_intent(schedule, prompt, name)
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
     if repeat is not None and repeat <= 0:
+        repeat = None
+    if repeat == 1 and schedule != original_schedule and parsed_schedule.get("kind") in {"interval", "cron"}:
         repeat = None
 
     # Auto-set repeat=1 for one-shot schedules if not specified
@@ -571,6 +871,9 @@ def create_job(
     normalized_base_url = normalized_base_url or None
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    script_error = _script_reference_error(normalized_script, require_relative=False, require_exists=False)
+    if script_error:
+        raise ValueError(script_error)
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
@@ -629,6 +932,7 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    job["description"] = job_description(job)
 
     jobs = load_jobs()
     jobs.append(job)
@@ -708,6 +1012,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             else:
                 updates["workdir"] = _normalize_workdir(_wd)
 
+        if "script" in updates:
+            _script = updates["script"]
+            if _script is None or _script is False or (isinstance(_script, str) and not _script.strip()):
+                updates["script"] = None
+            else:
+                script_error = _script_reference_error(str(_script), require_relative=False, require_exists=False)
+                if script_error:
+                    raise ValueError(script_error)
+                updates["script"] = str(_script).strip()
+
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates
 
@@ -718,6 +1032,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
         if schedule_changed:
             updated_schedule = updated["schedule"]
+            if isinstance(updated_schedule, str):
+                updated_schedule = _normalize_schedule_for_recurring_intent(
+                    updated_schedule,
+                    updated.get("prompt"),
+                    updated.get("name"),
+                )
+                updated["schedule"] = updated_schedule
             # The API may pass schedule as a raw string (e.g. "every 10m")
             # instead of a pre-parsed dict.  Normalize it the same way
             # create_job() does so downstream code can call .get() safely.
@@ -730,6 +1051,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             )
             if updated.get("state") != "paused":
                 updated["next_run_at"] = compute_next_run(updated_schedule)
+
+        if not updated.get("enabled", True) or updated.get("state") == "paused":
+            updated["next_run_at"] = None
 
         if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
             updated["next_run_at"] = compute_next_run(updated["schedule"])
@@ -840,6 +1164,15 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     # Check if we've hit the repeat limit
                     times = job["repeat"].get("times")
                     completed = job["repeat"]["completed"]
+                    schedule_kind = (job.get("schedule") or {}).get("kind")
+                    if schedule_kind in {"interval", "cron"} and times == 1:
+                        logger.warning(
+                            "Recurring job '%s' (%s) had repeat.times=1; treating it as unlimited to avoid deleting a periodic task after its first run.",
+                            job.get("name", job_id),
+                            job_id,
+                        )
+                        job["repeat"]["times"] = None
+                        times = None
                     if times is not None and times > 0 and completed >= times:
                         # Remove the job (limit reached)
                         jobs.pop(i)

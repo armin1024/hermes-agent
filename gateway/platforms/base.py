@@ -3099,8 +3099,10 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
             _response_content = None
+            _response_metadata = None
             if hasattr(response, "text") and hasattr(response, "content"):
                 _response_content = getattr(response, "content", None)
+                _response_metadata = getattr(response, "metadata", None)
                 response = getattr(response, "text", "") or ""
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -3215,6 +3217,8 @@ class BasePlatformAdapter(ABC):
                         _thread_metadata = {"notify": True}
                     if _response_content:
                         _thread_metadata["content"] = _response_content
+                    if isinstance(_response_metadata, dict):
+                        _thread_metadata.update(_response_metadata)
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,

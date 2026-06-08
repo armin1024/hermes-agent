@@ -64,6 +64,13 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_AOPS_RESERVED_MODEL_TOKENS = {"status", "current", "list", "use", "stutus", "stauts", "stattus", "statsu", "curent"}
+
+
+def _is_aops_reserved_model_token(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    normalized = re.sub(r"^[^a-z0-9_.:/-]+|[^a-z0-9_.:/-]+$", "", text)
+    return normalized in _AOPS_RESERVED_MODEL_TOKENS
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
@@ -1278,6 +1285,7 @@ class GatewayRunner:
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
         self._session_model_overrides: Dict[str, Dict[str, str]] = {}
+        self._aops_model_preferences_loaded: set[str] = set()
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
@@ -1701,6 +1709,11 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
+    async def _run_aops_local_command(self, event: MessageEvent):
+        from gateway import aops_commands as _aops_commands
+
+        return await asyncio.to_thread(_aops_commands.maybe_local_command, event)
+
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
@@ -1843,7 +1856,7 @@ class GatewayRunner:
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
             }
-            if override_runtime.get("api_key"):
+            if override_runtime.get("base_url"):
                 logger.debug(
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
                     resolved_session_key or "", model, override_model,
@@ -1894,6 +1907,179 @@ class GatewayRunner:
                 pass
 
         return model, runtime_kwargs
+
+    def _aops_preference_key_for_event(self, event: MessageEvent) -> Optional[str]:
+        source = event.source
+        if not source or source.platform != Platform.AOPS:
+            return None
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        agent_key = str(raw.get("agentKey") or raw.get("agentId") or "main")
+        try:
+            from gateway import aops_state
+            return aops_state.preference_key(
+                platform=source.platform.value,
+                channel_id=str(source.chat_id or ""),
+                agent_key=agent_key,
+            )
+        except Exception:
+            return None
+
+    def _aops_session_title_metadata_for_event(self, event: MessageEvent) -> dict[str, str]:
+        if not event.source or event.source.platform != Platform.AOPS:
+            return {}
+        title = ""
+        session_id = ""
+        try:
+            session_entry = self.session_store.get_or_create_session(event.source) if self.session_store else None
+            session_id = getattr(session_entry, "session_id", None)
+            if session_id and self._session_db:
+                title = self._session_db.get_session_title(session_id) or ""
+        except Exception:
+            title = ""
+            session_id = ""
+        data = {
+            "sessionKey": self._session_key_for_source(event.source),
+            "title": str(title or ""),
+        }
+        if session_id:
+            data["sessionId"] = str(session_id)
+        return data
+
+    def _aops_session_title_for_id(self, session_id: str | None) -> str:
+        if not session_id or not self._session_db:
+            return ""
+        try:
+            return str(self._session_db.get_session_title(session_id) or "")
+        except Exception:
+            return ""
+
+    def _aops_outbound_title_for_payload(self, payload: dict) -> str:
+        if not self._session_db:
+            return ""
+        session_id = str(payload.get("runId") or payload.get("sessionId") or "").strip()
+        session_key = str(payload.get("sessionKey") or "").strip()
+        if not session_id:
+            if session_key and self.session_store:
+                try:
+                    self.session_store._ensure_loaded()
+                    entry = self.session_store._entries.get(session_key)
+                    session_id = str(getattr(entry, "session_id", "") or "")
+                except Exception:
+                    session_id = ""
+        if not session_id and self.session_store:
+            channel_id = str(payload.get("channelId") or "").strip()
+            if channel_id:
+                try:
+                    from gateway.session import SessionSource
+                    source = SessionSource(
+                        platform=Platform.AOPS,
+                        chat_id=channel_id,
+                        chat_type="dm",
+                    )
+                    session_key = self._session_key_for_source(source)
+                    self.session_store._ensure_loaded()
+                    entry = self.session_store._entries.get(session_key)
+                    session_id = str(getattr(entry, "session_id", "") or "")
+                except Exception:
+                    session_id = ""
+        return self._aops_session_title_for_id(session_id)
+
+    def _load_aops_model_preference_for_event(self, event: MessageEvent, session_key: str) -> None:
+        if not hasattr(self, "_aops_model_preferences_loaded"):
+            self._aops_model_preferences_loaded = set()
+        if not session_key or session_key in self._session_model_overrides:
+            return
+        pref_key = self._aops_preference_key_for_event(event)
+        if not pref_key or pref_key in self._aops_model_preferences_loaded:
+            return
+        try:
+            from gateway import aops_state
+            pref = aops_state.get_model_preference(pref_key)
+        except Exception as exc:
+            logger.debug("Failed to load AOPS model preference: %s", exc)
+            pref = None
+        self._aops_model_preferences_loaded.add(pref_key)
+        if not pref:
+            return
+        override = {k: pref.get(k) for k in ("model", "provider", "api_key", "base_url", "api_mode") if pref.get(k)}
+        model = str(override.get("model") or "").strip()
+        if _is_aops_reserved_model_token(model):
+            logger.warning("Ignoring invalid AOPS model preference for session %s: model=%s", session_key, model)
+            try:
+                from gateway import aops_state
+                aops_state.delete_model_preference(pref_key)
+            except Exception as exc:
+                logger.debug("Failed to delete invalid AOPS model preference %s: %s", pref_key, exc)
+            return
+        if override.get("model"):
+            self._session_model_overrides[session_key] = override
+            logger.info("Loaded AOPS model preference for session %s: %s/%s", session_key, override.get("provider"), override.get("model"))
+
+    def _remember_aops_model_preference(self, event: MessageEvent, session_key: str, preference: dict[str, Any]) -> None:
+        if not hasattr(self, "_aops_model_preferences_loaded"):
+            self._aops_model_preferences_loaded = set()
+        pref_key = self._aops_preference_key_for_event(event)
+        if not pref_key:
+            return
+        override = {
+            key: preference.get(key)
+            for key in ("model", "provider", "api_key", "base_url", "api_mode")
+            if preference.get(key)
+        }
+        model = str(override.get("model") or "").strip()
+        if _is_aops_reserved_model_token(model):
+            logger.warning("Ignoring invalid AOPS model switch preference for session %s: model=%s", session_key, model)
+            try:
+                from gateway import aops_state
+                aops_state.delete_model_preference(pref_key)
+            except Exception as exc:
+                logger.debug("Failed to delete invalid AOPS model switch preference %s: %s", pref_key, exc)
+            return
+        try:
+            from gateway import aops_state
+            aops_state.set_model_preference(pref_key, preference)
+            self._aops_model_preferences_loaded.add(pref_key)
+        except Exception as exc:
+            logger.warning("Failed to persist AOPS model preference: %s", exc)
+        if override.get("model"):
+            self._session_model_overrides[session_key] = override
+            self._evict_cached_agent(session_key)
+
+    def _apply_model_switch_result(self, session_key: str, result: Any, current_model: str) -> dict[str, Any]:
+        cached_entry = None
+        _cache_lock = getattr(self, "_agent_cache_lock", None)
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache_lock and _cache is not None:
+            with _cache_lock:
+                cached_entry = _cache.get(session_key)
+        if cached_entry and cached_entry[0] is not None:
+            try:
+                cached_entry[0].switch_model(
+                    new_model=result.new_model,
+                    new_provider=result.target_provider,
+                    api_key=result.api_key,
+                    base_url=result.base_url,
+                    api_mode=result.api_mode,
+                )
+            except Exception as exc:
+                logger.warning("In-place model switch failed for cached agent: %s", exc)
+        if not hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes = {}
+        self._pending_model_notes[session_key] = (
+            f"[Note: model was just switched from {current_model} to {result.new_model} "
+            f"via {result.provider_label or result.target_provider}. "
+            f"Adjust your self-identification accordingly.]"
+        )
+        override = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+        }
+        self._session_model_overrides[session_key] = override
+        self._evict_cached_agent(session_key)
+        return override
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
@@ -3576,6 +3762,8 @@ class GatewayRunner:
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            if platform == Platform.AOPS and hasattr(adapter, "set_title_resolver"):
+                adapter.set_title_resolver(self._aops_outbound_title_for_payload)
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -5831,6 +6019,11 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+        if source and source.platform == Platform.AOPS:
+            try:
+                self._load_aops_model_preference_for_event(event, self._session_key_for_source(source))
+            except Exception as exc:
+                logger.debug("AOPS model preference load skipped: %s", exc)
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -6143,6 +6336,19 @@ class GatewayRunner:
             )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+            if _evt_cmd and source.platform == Platform.AOPS:
+                from gateway import aops_commands as _aops_commands
+
+                _raw_args_inner = event.get_command_args().strip()
+                _canonical_inner = _cmd_def_inner.name if _cmd_def_inner else _evt_cmd
+                if _aops_commands.is_blocked(self.config, _evt_cmd, _raw_args_inner, _canonical_inner):
+                    return _aops_commands.block_message(_evt_cmd)
+                if _canonical_inner == "cron":
+                    local_reply = await self._run_aops_local_command(event)
+                    if local_reply is not None:
+                        return local_reply
+                    if not _aops_commands.is_supported_command(_evt_cmd, _raw_args_inner, _canonical_inner):
+                        return _aops_commands.unsupported_message(_evt_cmd)
 
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
@@ -6469,8 +6675,47 @@ class GatewayRunner:
             if _aops_commands.is_blocked(self.config, command, raw_command_args, canonical):
                 return _aops_commands.block_message(command)
 
-            local_reply = _aops_commands.maybe_local_command(event)
+            local_reply = await self._run_aops_local_command(event)
             if local_reply is not None:
+                if canonical == "model":
+                    try:
+                        text = getattr(local_reply, "text", local_reply)
+                        payload = json.loads(text) if isinstance(text, str) else None
+                        if isinstance(payload, dict) and payload.get("type") == "model.switch" and payload.get("ok", True):
+                            preference = None
+                            pref_key = payload.get("preferenceKey")
+                            if pref_key:
+                                try:
+                                    from gateway import aops_state
+                                    preference = aops_state.get_model_preference(str(pref_key))
+                                except Exception:
+                                    preference = None
+                            if not isinstance(preference, dict):
+                                preference = {
+                                    key: payload.get(key)
+                                    for key in ("model", "provider", "api_key", "base_url", "api_mode")
+                                    if payload.get(key)
+                                }
+                            if preference.get("model"):
+                                self._remember_aops_model_preference(
+                                    event,
+                                    self._session_key_for_source(source),
+                                    preference,
+                                )
+                    except Exception as exc:
+                        logger.debug("AOPS model local command preference sync skipped: %s", exc)
+                if hasattr(local_reply, "metadata"):
+                    existing_meta = getattr(local_reply, "metadata", None)
+                    title_meta = self._aops_session_title_metadata_for_event(event)
+                    base_meta = existing_meta if isinstance(existing_meta, dict) else {}
+                    merged_meta = {**title_meta, **base_meta}
+                    if not str(base_meta.get("title") or "").strip() and title_meta.get("title"):
+                        merged_meta["title"] = title_meta["title"]
+                    local_reply = _aops_commands.LocalCommandResult(
+                        text=getattr(local_reply, "text", "") or "",
+                        content=getattr(local_reply, "content", None),
+                        metadata=merged_meta,
+                    )
                 return local_reply
 
             if not _aops_commands.is_supported_command(command, raw_command_args, canonical):
@@ -7253,6 +7498,7 @@ class GatewayRunner:
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+        context.message_text = event.text or ""
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -7693,7 +7939,11 @@ class GatewayRunner:
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        if (
+            not history
+            and source.platform
+            and source.platform not in {Platform.LOCAL, Platform.WEBHOOK, Platform.AOPS}
+        ):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             if not os.getenv(env_key):
@@ -9199,6 +9449,8 @@ class GatewayRunner:
 
         # Parse --provider and --global flags
         model_input, explicit_provider, persist_global = parse_model_flags(raw_args)
+        model_status_tokens = {"status", "current", "stutus", "stauts", "stattus", "statsu", "curent"}
+        model_reserved_tokens = {*model_status_tokens, "list"}
 
         # Read current model/provider from config
         current_model = ""
@@ -9234,6 +9486,14 @@ class GatewayRunner:
             current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+
+        if source.platform == Platform.AOPS:
+            return await self._run_aops_local_command(event)
+
+        if model_input.strip().lower() in model_reserved_tokens and not explicit_provider:
+            if source.platform == Platform.AOPS:
+                return await self._run_aops_local_command(event)
+            model_input = ""
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -12552,7 +12812,11 @@ class GatewayRunner:
         _slash_confirm_mod.register(session_key, confirm_id, command, handler)
 
         adapter = self.adapters.get(source.platform)
-        metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+        reply_anchor = self._reply_anchor_for_event(event)
+        metadata = self._thread_metadata_for_source(source, reply_anchor)
+        if reply_anchor is not None:
+            metadata = dict(metadata or {})
+            metadata.setdefault("reply_to", str(reply_anchor))
 
         used_buttons = False
         if adapter is not None:
@@ -13373,6 +13637,7 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            message_text=str(getattr(context, "message_text", "") or ""),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -14722,6 +14987,7 @@ class GatewayRunner:
                         chat_id=source.chat_id,
                         reply_to_id=event_message_id,
                         run_id=session_id,
+                        title=self._aops_session_title_for_id(session_id),
                     )
                     # AOPS has its own websocket message_reply stream. Disable
                     # generic progress bubbles so tool events are not dropped by
@@ -14729,6 +14995,28 @@ class GatewayRunner:
                     progress_queue = None
             except Exception as exc:
                 logger.debug("AOPS native reply bridge unavailable: %s", exc)
+
+        def _aops_current_title_metadata(session_id_override: str | None = None) -> dict[str, str]:
+            if source.platform != Platform.AOPS:
+                return {}
+            meta: dict[str, str] = {}
+            if session_key:
+                meta["sessionKey"] = session_key
+            sid = session_id_override or session_id
+            if sid:
+                meta["sessionId"] = str(sid)
+            title = self._aops_session_title_for_id(sid)
+            if title:
+                meta["title"] = title
+            return meta
+
+        def _merge_aops_title_metadata(metadata: Optional[dict[str, Any]], session_id_override: str | None = None) -> dict[str, Any] | None:
+            base = dict(metadata or {})
+            title_meta = _aops_current_title_metadata(session_id_override)
+            merged = {**title_meta, **base}
+            if not str(base.get("title") or "").strip() and title_meta.get("title"):
+                merged["title"] = title_meta["title"]
+            return merged or None
 
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
@@ -15658,6 +15946,7 @@ class GatewayRunner:
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+                allow_permanent = bool(approval_data.get("allow_permanent", True))
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
@@ -15670,7 +15959,10 @@ class GatewayRunner:
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata={
+                                    **(_status_thread_metadata or {}),
+                                    "allow_permanent": allow_permanent,
+                                },
                             ),
                             _loop_for_step,
                             logger=logger,
@@ -15853,13 +16145,10 @@ class GatewayRunner:
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
 
-            # Signal the stream consumer that the agent is done
-            if native_reply_bridge is not None:
-                native_reply_bridge.send_final(
-                    result.get("final_response") or "",
-                    conversation_ended=True,
-                )
-                native_reply_bridge.finish()
+            # Signal the generic stream consumer that the agent is done.  AOPS
+            # native final delivery is intentionally deferred until after
+            # auto-title generation below so the outgoing title matches the
+            # current session title when a new title is created this turn.
             if _stream_consumer is not None:
                 _stream_consumer.finish()
             
@@ -15881,6 +16170,9 @@ class GatewayRunner:
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                if native_reply_bridge is not None:
+                    native_reply_bridge.send_final(error_msg, conversation_ended=True)
+                    native_reply_bridge.finish()
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -15990,6 +16282,8 @@ class GatewayRunner:
                             effective_session_id,
                             title,
                         )
+                    elif source.platform == Platform.AOPS and native_reply_bridge is not None:
+                        maybe_auto_title_kwargs["title_callback"] = native_reply_bridge.update_title
                     maybe_auto_title(
                         self._session_db,
                         effective_session_id,
@@ -16000,6 +16294,13 @@ class GatewayRunner:
                     )
                 except Exception:
                     pass
+
+            if native_reply_bridge is not None:
+                native_reply_bridge.send_final(
+                    final_response,
+                    conversation_ended=True,
+                )
+                native_reply_bridge.finish()
 
             return {
                 "final_response": final_response,
@@ -16154,7 +16455,7 @@ class GatewayRunner:
                     _notify_res = await _notify_adapter.send(
                         source.chat_id,
                         f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
-                        metadata=_status_thread_metadata,
+                        metadata=_merge_aops_title_metadata(_status_thread_metadata),
                     )
                     if (
                         _cleanup_progress
@@ -16254,7 +16555,7 @@ class GatewayRunner:
                                     f"If the agent does not respond soon, it will "
                                     f"be timed out in {_remaining_mins} min. "
                                     f"You can continue waiting or use /reset.",
-                                    metadata=_status_thread_metadata,
+                                    metadata=_merge_aops_title_metadata(_status_thread_metadata),
                                 )
                             except Exception as _warn_err:
                                 logger.debug("Inactivity warning send error: %s", _warn_err)
@@ -16489,7 +16790,7 @@ class GatewayRunner:
                             await adapter.send(
                                 source.chat_id,
                                 first_response,
-                                metadata=_status_thread_metadata,
+                                metadata=_merge_aops_title_metadata(_status_thread_metadata, result.get("session_id")),
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
@@ -16558,7 +16859,7 @@ class GatewayRunner:
                     try:
                         await _followup_adapter.send_typing(
                             source.chat_id,
-                            metadata=_status_thread_metadata,
+                            metadata=_merge_aops_title_metadata(_status_thread_metadata),
                         )
                     except Exception:
                         pass

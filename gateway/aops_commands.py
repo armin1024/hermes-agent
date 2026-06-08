@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import re
 import shlex
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +38,8 @@ _AOPS_NATIVE_COMMANDS = {
     "footer",
     "yolo",
     "model",
+    "security",
+    "securty",
     "personality",
     "retry",
     "undo",
@@ -102,6 +106,8 @@ _DESCRIPTION_ZH = {
     "curator": "后台技能维护（状态、运行、固定、归档）。",
     "skills": "列出已安装技能。",
     "cron": "查看定时任务。",
+    "security": "查看或切换安全审批策略。",
+    "securty": "查看或切换安全审批策略。",
 }
 
 def _choice(value: str, description: str) -> dict[str, str]:
@@ -133,9 +139,19 @@ _USAGE_COMPLETIONS = {
     "steer": [_param("prompt", "下一次工具调用后注入的提示内容。", required=True)],
     "resume": [_param("name", "之前命名的会话名称。", required=False)],
     "model": [
-        _param("model", "模型名称。", required=False),
+        _param(
+            "subcommand",
+            "模型子指令。",
+            required=False,
+            choices=[
+                _choice("list", "获取当前模型网关可用模型列表。"),
+                _choice("status", "获取当前生效模型信息，不请求模型列表接口。"),
+                _choice("current", "同 status，获取当前生效模型信息。"),
+                _choice("use", "切换模型。"),
+            ],
+        ),
         _param("provider", "provider 名称。", required=False),
-        _param("global", "是否将切换持久化为全局设置。", required=False),
+        _param("model", "模型名称。", required=False),
     ],
     "personality": [_param("name", "人格名称。", required=False)],
     "reasoning": [
@@ -210,6 +226,18 @@ _USAGE_COMPLETIONS = {
     "insights": [_param("days", "统计天数。", required=False)],
     "skills": [],
     "cron": [],
+    "security": [
+        _param(
+            "mode",
+            "安全策略模式。",
+            required=False,
+            choices=[
+                _choice("off", "完全访问权限，不触发普通危险命令审批。"),
+                _choice("manual", "默认权限，危险命令需要人工审批。"),
+                _choice("smart", "自动审查，低风险自动通过，高风险请求审批。"),
+            ],
+        )
+    ],
 }
 
 _SUBCOMMAND_DESCRIPTION_ZH = {
@@ -275,6 +303,45 @@ class HelpNode:
 class LocalCommandResult:
     text: str
     content: list[dict[str, Any]] | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class AopsCommandExtension:
+    name: str
+    type: str = "custom"
+    description: str = ""
+    usage: str | None = None
+    executable: bool = True
+    completions: list[dict[str, Any]] | None = None
+    children: list[dict[str, Any]] | None = None
+
+
+_AOPS_COMMAND_EXTENSIONS: dict[str, AopsCommandExtension] = {}
+
+
+def register_aops_command_extension(extension: AopsCommandExtension) -> None:
+    """Register an AOPS-only command so /help and support checks stay in sync."""
+    name = str(extension.name or "").strip().lower().replace("_", "-").lstrip("/")
+    if not name:
+        raise ValueError("AOPS command extension name is required")
+    _AOPS_COMMAND_EXTENSIONS[name] = AopsCommandExtension(
+        name=name,
+        type=extension.type or "custom",
+        description=extension.description or f"执行 /{name} 指令。",
+        usage=extension.usage or f"/{name}",
+        executable=bool(extension.executable),
+        completions=list(extension.completions or []),
+        children=list(extension.children or []),
+    )
+
+
+def unregister_aops_command_extension(name: str) -> None:
+    _AOPS_COMMAND_EXTENSIONS.pop(str(name or "").strip().lower().replace("_", "-").lstrip("/"), None)
+
+
+def _aops_registered_command_names() -> set[str]:
+    return set(_AOPS_COMMAND_EXTENSIONS.keys())
 
 
 def is_aops_event(event: MessageEvent) -> bool:
@@ -380,6 +447,30 @@ def _tokens(raw_args: str) -> list[str]:
         return raw_args.split()
 
 
+def _cron_schedule_flags(job: dict[str, Any]) -> dict[str, Any]:
+    schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+    repeat = job.get("repeat") if isinstance(job.get("repeat"), dict) else {}
+    kind = str(schedule.get("kind") or "").strip() or None
+    times = repeat.get("times")
+    completed = repeat.get("completed", 0) or 0
+    is_one_shot = bool(kind == "once")
+    schedule_warning = None
+    if kind == "once" and times is None:
+        schedule_warning = "once schedule with forever repeat is terminal after one run; convert schedule to an interval for recurring execution"
+    if times is None:
+        repeat_text = "forever" if kind in {"interval", "cron"} else None
+    elif times == 1:
+        repeat_text = "once"
+    else:
+        repeat_text = f"{completed}/{times}" if completed else f"{times} times"
+    return {
+        "scheduleKind": kind,
+        "repeatText": repeat_text,
+        "isOneShot": is_one_shot,
+        "scheduleWarning": schedule_warning,
+    }
+
+
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
 
@@ -445,7 +536,10 @@ def is_supported_command(command: str | None, raw_args: str = "", canonical: str
             return True
     except Exception:
         pass
-    return normalized in _AOPS_NATIVE_COMMANDS and normalized not in _REMOVED_AOPS_COMMANDS
+    return (
+        normalized in (_AOPS_NATIVE_COMMANDS | _aops_registered_command_names())
+        and normalized not in _REMOVED_AOPS_COMMANDS
+    )
 
 
 def _list_response(
@@ -479,6 +573,194 @@ def _list_response(
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def _single_response(
+    *,
+    type_: str,
+    command: str,
+    data: dict[str, Any],
+    ok: bool = True,
+    error: dict[str, Any] | None = None,
+) -> str:
+    payload = {
+        "schemaVersion": LOCAL_LIST_SCHEMA,
+        "type": type_,
+        "ok": ok,
+        "command": command,
+        **data,
+        "error": error,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _cfg_get(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    current: Any = data
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def _reasoning_status_payload(command_text: str, cfg: dict[str, Any]) -> str:
+    from hermes_constants import get_hermes_home, parse_reasoning_effort
+
+    raw_effort = str(_cfg_get(cfg, "agent", "reasoning_effort", default="") or "").strip().lower()
+    parsed = parse_reasoning_effort(raw_effort)
+    if parsed is None:
+        level = "medium"
+        enabled = True
+        source = "default" if not raw_effort else "invalid_config_default"
+        is_default = True
+    elif parsed.get("enabled") is False:
+        level = "none"
+        enabled = False
+        source = "config"
+        is_default = False
+    else:
+        level = str(parsed.get("effort") or "medium")
+        enabled = True
+        source = "config"
+        is_default = False
+    show_reasoning = _cfg_get(
+        cfg,
+        "display",
+        "platforms",
+        "aops",
+        "show_reasoning",
+        default=_cfg_get(cfg, "display", "show_reasoning", default=False),
+    )
+    return _single_response(
+        type_="reasoning.status",
+        command=command_text,
+        data={
+            "level": level,
+            "enabled": enabled,
+            "source": source,
+            "isDefault": is_default,
+            "defaultLevel": "medium",
+            "configuredLevel": raw_effort or None,
+            "showReasoning": bool(show_reasoning),
+            "scope": "global",
+            "configPath": str(get_hermes_home() / "config.yaml"),
+            "commands": {
+                "status": "/reasoning",
+                "set": "/reasoning <none|minimal|low|medium|high|xhigh>",
+                "show": "/reasoning show",
+                "hide": "/reasoning hide",
+            },
+        },
+    )
+
+
+def _reasoning_command(command_text: str, args: list[str]) -> str:
+    from hermes_cli.config import load_config, save_config
+    from hermes_constants import get_hermes_home, parse_reasoning_effort
+
+    cfg = load_config()
+    if not args or args == ["status"]:
+        return _reasoning_status_payload(command_text, cfg)
+    if len(args) != 1:
+        return _single_response(
+            type_="reasoning.status",
+            command=command_text,
+            data={"allowed": ["none", "minimal", "low", "medium", "high", "xhigh", "show", "hide", "on", "off", "status"]},
+            ok=False,
+            error={"code": "REASONING_USAGE", "message": "Usage: /reasoning [none|minimal|low|medium|high|xhigh|show|hide|status]"},
+        )
+    option = str(args[0] or "").strip().lower().replace("_", "-")
+    if option in {"show", "on"}:
+        display = cfg.setdefault("display", {})
+        if not isinstance(display, dict):
+            display = {}
+            cfg["display"] = display
+        platforms = display.setdefault("platforms", {})
+        if not isinstance(platforms, dict):
+            platforms = {}
+            display["platforms"] = platforms
+        aops_display = platforms.setdefault("aops", {})
+        if not isinstance(aops_display, dict):
+            aops_display = {}
+            platforms["aops"] = aops_display
+        aops_display["show_reasoning"] = True
+        save_config(cfg)
+        return _single_response(
+            type_="reasoning.updated",
+            command=command_text,
+            data={
+                "level": _reasoning_level_from_config(cfg),
+                "showReasoning": True,
+                "scope": "global",
+                "persisted": True,
+                "configPath": str(get_hermes_home() / "config.yaml"),
+            },
+        )
+    if option in {"hide", "off"}:
+        display = cfg.setdefault("display", {})
+        if not isinstance(display, dict):
+            display = {}
+            cfg["display"] = display
+        platforms = display.setdefault("platforms", {})
+        if not isinstance(platforms, dict):
+            platforms = {}
+            display["platforms"] = platforms
+        aops_display = platforms.setdefault("aops", {})
+        if not isinstance(aops_display, dict):
+            aops_display = {}
+            platforms["aops"] = aops_display
+        aops_display["show_reasoning"] = False
+        save_config(cfg)
+        return _single_response(
+            type_="reasoning.updated",
+            command=command_text,
+            data={
+                "level": _reasoning_level_from_config(cfg),
+                "showReasoning": False,
+                "scope": "global",
+                "persisted": True,
+                "configPath": str(get_hermes_home() / "config.yaml"),
+            },
+        )
+    parsed = parse_reasoning_effort(option)
+    if parsed is None:
+        return _single_response(
+            type_="reasoning.status",
+            command=command_text,
+            data={"allowed": ["none", "minimal", "low", "medium", "high", "xhigh", "show", "hide", "status"]},
+            ok=False,
+            error={"code": "REASONING_INVALID_OPTION", "message": f"Unsupported reasoning option: {args[0]}"},
+        )
+    agent = cfg.setdefault("agent", {})
+    if not isinstance(agent, dict):
+        agent = {}
+        cfg["agent"] = agent
+    agent["reasoning_effort"] = option
+    save_config(cfg)
+    return _single_response(
+        type_="reasoning.updated",
+        command=command_text,
+        data={
+            "level": "none" if parsed.get("enabled") is False else str(parsed.get("effort") or option),
+            "enabled": parsed.get("enabled"),
+            "showReasoning": bool(_cfg_get(cfg, "display", "platforms", "aops", "show_reasoning", default=_cfg_get(cfg, "display", "show_reasoning", default=False))),
+            "scope": "global",
+            "persisted": True,
+            "configPath": str(get_hermes_home() / "config.yaml"),
+        },
+    )
+
+
+def _reasoning_level_from_config(cfg: dict[str, Any]) -> str:
+    from hermes_constants import parse_reasoning_effort
+
+    raw_effort = str(_cfg_get(cfg, "agent", "reasoning_effort", default="") or "").strip().lower()
+    parsed = parse_reasoning_effort(raw_effort)
+    if parsed is None:
+        return "medium"
+    if parsed.get("enabled") is False:
+        return "none"
+    return str(parsed.get("effort") or "medium")
+
+
 def _safe_relative(path: Path, root: Path) -> str:
     try:
         return str(path.resolve().relative_to(root.resolve()))
@@ -487,14 +769,51 @@ def _safe_relative(path: Path, root: Path) -> str:
 
 
 def _to_ms(value: Any) -> Optional[int]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        timestamp = int(value)
+        if timestamp <= 0:
+            return None
+        return timestamp if timestamp >= 10_000_000_000 else timestamp * 1000
     text = str(value or "").strip()
     if not text:
         return None
     try:
-        dt = datetime.fromisoformat(text)
+        numeric = float(text)
+    except ValueError:
+        numeric = None
+    if numeric is not None:
+        timestamp = int(numeric)
+        if timestamp <= 0:
+            return None
+        return timestamp if timestamp >= 10_000_000_000 else timestamp * 1000
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
     return int(dt.timestamp() * 1000)
+
+
+def _coerce_non_negative_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _first_history_value(entry: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key not in entry:
+            continue
+        value = entry.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
 
 
 def _duration_ms(started_at: Any, finished_at: Any) -> Optional[int]:
@@ -503,12 +822,56 @@ def _duration_ms(started_at: Any, finished_at: Any) -> Optional[int]:
     if not started or not finished:
         return None
     try:
-        started_dt = datetime.fromisoformat(started)
-        finished_dt = datetime.fromisoformat(finished)
+        started_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        finished_dt = datetime.fromisoformat(finished.replace("Z", "+00:00"))
     except ValueError:
         return None
     delta_ms = int((finished_dt - started_dt).total_seconds() * 1000)
     return delta_ms if delta_ms >= 0 else None
+
+
+def _history_duration_ms(entry: dict[str, Any]) -> Optional[int]:
+    duration = _coerce_non_negative_int(
+        _first_history_value(
+            entry,
+            "durationMs",
+            "duration_ms",
+            "elapsedMs",
+            "elapsed_ms",
+            "latencyMs",
+            "latency_ms",
+            "usage",
+        )
+    )
+    if duration is not None:
+        return duration
+    return _duration_ms(entry.get("started_at") or entry.get("startedAt"), entry.get("finished_at") or entry.get("finishedAt"))
+
+
+def _history_next_run_ms(entry: dict[str, Any], job: dict[str, Any]) -> Optional[int]:
+    for value in (
+        _first_history_value(entry, "nextRunAtMs", "next_run_at_ms"),
+        _first_history_value(entry, "next_run_at", "nextRunAt", "next_run_at_after", "nextRunAtAfter"),
+        job.get("next_run_at"),
+        _first_history_value(entry, "scheduled_for", "scheduledFor"),
+    ):
+        ms = _to_ms(value)
+        if ms is not None:
+            return ms
+    return None
+
+
+def _history_usage(entry: dict[str, Any], duration_ms: Optional[int]) -> dict[str, Any] | None:
+    raw_usage = entry.get("usage")
+    usage: dict[str, Any] = dict(raw_usage) if isinstance(raw_usage, dict) else {}
+    for key in ("usage_details", "usageDetails", "token_usage", "tokenUsage"):
+        value = entry.get(key)
+        if isinstance(value, dict):
+            for usage_key, usage_value in value.items():
+                usage.setdefault(usage_key, usage_value)
+    if duration_ms is not None:
+        usage.setdefault("durationMs", duration_ms)
+    return usage or None
 
 
 def _compact_text(value: Any, *, limit: int = 160) -> Optional[str]:
@@ -521,10 +884,28 @@ def _compact_text(value: Any, *, limit: int = 160) -> Optional[str]:
 
 
 def _job_description(job: dict[str, Any]) -> Optional[str]:
+    try:
+        from cron.jobs import job_description as _cron_job_description
+
+        description = _cron_job_description(job)
+        if description:
+            return description
+    except Exception:
+        pass
     explicit = _compact_text(job.get("description"))
     if explicit:
         return explicit
-    return _compact_text(job.get("prompt"))
+    for key in ("prompt", "name", "script", "id"):
+        value = _compact_text(job.get(key))
+        if value:
+            return value
+    skills = job.get("skills")
+    if isinstance(skills, list) and skills:
+        return _compact_text(skills[0])
+    skill = _compact_text(job.get("skill"))
+    if skill:
+        return skill
+    return None
 
 
 def _status_to_delivery(status: str | None, delivery_error: str | None, delivered: Optional[bool]) -> str:
@@ -537,6 +918,42 @@ def _status_to_delivery(status: str | None, delivery_error: str | None, delivere
     if status == "ok":
         return "unknown"
     return "not-requested"
+
+
+def _iter_jsonl_reverse(path: Path, *, chunk_size: int = 64 * 1024):
+    """Yield text lines from a JSONL file newest-first without reading it all."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            buffer = b""
+            while position > 0:
+                read_size = min(chunk_size, position)
+                position -= read_size
+                handle.seek(position)
+                buffer = handle.read(read_size) + buffer
+                parts = buffer.split(b"\n")
+                buffer = parts[0]
+                for raw_line in reversed(parts[1:]):
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if line:
+                        yield line
+            if buffer.strip():
+                yield buffer.decode("utf-8", errors="replace").strip()
+    except OSError:
+        return
+
+
+def _iter_cron_history_entries_newest_first(path: Path):
+    if not path.exists():
+        return
+    for line in _iter_jsonl_reverse(path):
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(entry, dict):
+            yield entry
 
 
 def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -607,17 +1024,14 @@ def _cron_items() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
     jobs = cron_jobs.load_jobs()
     history_path = Path(cron_jobs.HISTORY_FILE)
     history_by_job: dict[str, dict[str, Any]] = {}
-    if history_path.exists():
-        for line in history_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                entry = json.loads(line)
-            except Exception:
-                continue
+    wanted_job_ids = {str(job.get("id") or "").strip() for job in jobs if str(job.get("id") or "").strip()}
+    if history_path.exists() and wanted_job_ids:
+        for entry in _iter_cron_history_entries_newest_first(history_path):
             job_id = str(entry.get("job_id") or "").strip()
-            if job_id:
+            if job_id and job_id in wanted_job_ids and job_id not in history_by_job:
                 history_by_job[job_id] = entry
+                if len(history_by_job) >= len(wanted_job_ids):
+                    break
     items: list[dict[str, Any]] = []
     enabled = 0
     disabled = 0
@@ -625,9 +1039,11 @@ def _cron_items() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
         latest_entry = history_by_job.get(str(job.get("id")), {})
         state = str(job.get("state") or "").lower()
         is_enabled = bool(job.get("enabled", True))
+        is_schedulable = is_enabled and state not in {"paused", "completed", "deleted", "disabled"}
         enabled += 1 if is_enabled else 0
         disabled += 0 if is_enabled else 1
         schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+        schedule_flags = _cron_schedule_flags(job)
         items.append(
             {
                 "id": job.get("id"),
@@ -638,7 +1054,8 @@ def _cron_items() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
                 "sessionKey": None,
                 "sessionTarget": None,
                 "wakeMode": None,
-                "deleteAfterRun": bool(job.get("repeat", {}).get("times") == 1 and schedule.get("kind") == "once"),
+                "deleteAfterRun": schedule_flags["isOneShot"],
+                **schedule_flags,
                 "createdAtMs": _to_ms(job.get("created_at")),
                 "updatedAtMs": _to_ms(job.get("updated_at") or job.get("created_at")),
                 "scheduleText": job.get("schedule_display") or schedule.get("display"),
@@ -652,16 +1069,13 @@ def _cron_items() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
                 "payloadLightContext": None,
                 "payloadToolsAllow": job.get("enabled_toolsets"),
                 "payloadExternalContentSource": None,
-                "nextRunAtMs": _to_ms(job.get("next_run_at")),
+                "nextRunAtMs": _to_ms(job.get("next_run_at")) if is_schedulable else None,
                 "lastRunAtMs": _to_ms(job.get("last_run_at")),
                 "runningAtMs": None,
                 "lastRunStatus": job.get("last_status"),
                 "lastError": job.get("last_error"),
                 "lastErrorReason": None,
-                "lastDurationMs": (
-                    latest_entry.get("duration_ms")
-                    or _duration_ms(latest_entry.get("started_at"), latest_entry.get("finished_at"))
-                ),
+                "lastDurationMs": _history_duration_ms(latest_entry),
                 "consecutiveErrors": None,
                 "lastFailureAlertAtMs": None,
                 "scheduleErrorCount": None,
@@ -689,10 +1103,701 @@ def _cron_items() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
     return items, context, summary
 
 
+def _expand_env_ref(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"\${([^}]+)}", lambda m: os.environ.get(m.group(1), m.group(0)), text)
+
+
+_SECRET_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_MODEL_KEY_FIELDS = ("api_key", "apiKey", "apikey", "key", "token", "authorization", "auth_token")
+_MODEL_KEY_ENV_FIELDS = (
+    "key_env",
+    "api_key_env",
+    "apiKeyEnv",
+    "apikey_env",
+    "apiKeyENV",
+    "token_env",
+    "api_key_ref",
+    "apiKeyRef",
+)
+_MODEL_STATUS_TOKENS = {"status", "current", "stutus", "stauts", "stattus", "statsu", "curent"}
+_MODEL_LIST_TOKENS = {"list"}
+_MODEL_RESERVED_TOKENS = {*_MODEL_STATUS_TOKENS, *_MODEL_LIST_TOKENS, "use"}
+_MODEL_LIST_CACHE: dict[tuple[str, str, str, str, str], tuple[float, dict[str, Any]]] = {}
+
+
+def _model_list_cache_key(endpoint: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    api_key = str(endpoint.get("apiKey") or "")
+    api_key_digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12] if api_key else ""
+    return (
+        str(endpoint.get("provider") or ""),
+        str(endpoint.get("baseUrl") or ""),
+        str(endpoint.get("apiMode") or ""),
+        str(endpoint.get("apiKeyRef") or ""),
+        api_key_digest,
+    )
+
+
+def _infer_aops_api_mode(provider: Any, base_url: Any) -> str:
+    provider_text = str(provider or "").strip().lower()
+    url_lower = str(base_url or "").strip().rstrip("/").lower()
+    hostname = ""
+    if url_lower:
+        try:
+            from urllib.parse import urlparse
+
+            hostname = urlparse(url_lower).hostname or ""
+        except Exception:
+            hostname = ""
+    if url_lower.endswith("/anthropic") or hostname == "api.anthropic.com":
+        return "anthropic_messages"
+    if hostname == "api.kimi.com" and "/coding" in url_lower:
+        return "anthropic_messages"
+    if hostname == "api.openai.com":
+        return "codex_responses"
+    if provider_text == "bedrock" or (hostname.startswith("bedrock-runtime.") and hostname.endswith("amazonaws.com")):
+        return "bedrock_converse"
+    return "chat_completions"
+
+
+def _looks_unresolved_secret_ref(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text and re.search(r"\{[^}]*\}", text))
+
+
+def _env_value(name: Any) -> str:
+    key = str(name or "").strip()
+    if not key:
+        return ""
+    value = os.environ.get(key)
+    if value:
+        return value
+    try:
+        from hermes_cli.config import get_env_value
+
+        return str(get_env_value(key) or "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_secret_ref(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("env:"):
+        return _env_value(text[4:])
+    if text.startswith("$") and "{" not in text:
+        return _env_value(text[1:])
+    expanded = _expand_env_ref(text)
+    if expanded != text:
+        return expanded
+    if _SECRET_ENV_NAME_RE.match(text):
+        return _env_value(text) or text
+    if _looks_unresolved_secret_ref(text):
+        return ""
+    return expanded
+
+
+def _first_mapping_value(mapping: Any, fields: Iterable[str]) -> Any:
+    if not isinstance(mapping, dict):
+        return None
+    for field in fields:
+        value = mapping.get(field)
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def _resolve_model_api_key(mapping: Any) -> tuple[str, str]:
+    raw_value = _first_mapping_value(mapping, _MODEL_KEY_FIELDS)
+    if raw_value is not None:
+        resolved = _resolve_secret_ref(raw_value)
+        return (resolved if not _looks_unresolved_secret_ref(resolved) else ""), str(raw_value).strip()
+    env_name = _first_mapping_value(mapping, _MODEL_KEY_ENV_FIELDS)
+    if env_name is not None:
+        return _env_value(env_name), str(env_name).strip()
+    return "", ""
+
+
+def _is_reserved_model_token(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    normalized = re.sub(r"^[^a-z0-9_.:/-]+|[^a-z0-9_.:/-]+$", "", text)
+    return normalized in _MODEL_RESERVED_TOKENS
+
+
+def _redact_secret(value: str) -> str:
+    text = str(value or "")
+    if len(text) <= 8:
+        return "***" if text else ""
+    return f"{text[:4]}...{text[-4:]}"
+
+
+def _resolve_aops_model_endpoint(event: MessageEvent | None = None) -> dict[str, Any]:
+    from gateway import aops_state
+    from hermes_cli.config import get_compatible_custom_providers, load_config
+
+    cfg = load_config()
+    pref = None
+    pref_key = None
+    raw = event.raw_message if event and isinstance(event.raw_message, dict) else {}
+    agent_key = str(raw.get("agentKey") or raw.get("agentId") or "main")
+    if event and event.source:
+        pref_key = aops_state.preference_key(
+            platform=str(event.source.platform.value if event.source.platform else "aops"),
+            channel_id=str(event.source.chat_id or ""),
+            agent_key=agent_key,
+        )
+        pref = aops_state.get_model_preference(pref_key)
+        if pref and _is_reserved_model_token(pref.get("model")):
+            try:
+                aops_state.delete_model_preference(pref_key)
+            except Exception:
+                pass
+            pref = None
+
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    current_model = ""
+    current_provider = "custom"
+    base_url = ""
+    api_key = ""
+    api_key_ref = ""
+    api_mode = ""
+    source = "config.model"
+    if isinstance(model_cfg, dict):
+        current_model = str(model_cfg.get("default") or model_cfg.get("model") or model_cfg.get("name") or "")
+        current_provider = str(model_cfg.get("provider") or current_provider)
+        base_url = _expand_env_ref(model_cfg.get("base_url"))
+        api_key, api_key_ref = _resolve_model_api_key(model_cfg)
+        api_mode = str(model_cfg.get("api_mode") or "")
+    elif isinstance(model_cfg, str):
+        current_model = model_cfg
+
+    if pref:
+        current_model = str(pref.get("model") or current_model)
+        current_provider = str(pref.get("provider") or current_provider)
+        base_url = _expand_env_ref(pref.get("base_url")) or base_url
+        pref_api_key, pref_api_key_ref = _resolve_model_api_key(pref)
+        api_key = pref_api_key or api_key
+        api_key_ref = pref_api_key_ref or api_key_ref
+        api_mode = str(pref.get("api_mode") or api_mode)
+        source = "aops.channelPreference"
+
+    if isinstance(cfg, dict):
+        try:
+            custom_providers = get_compatible_custom_providers(cfg)
+        except Exception:
+            custom_providers = cfg.get("custom_providers") if isinstance(cfg.get("custom_providers"), list) else []
+        provider_norm = current_provider.strip().lower()
+        for entry in custom_providers or []:
+            if not isinstance(entry, dict):
+                continue
+            names = {
+                str(entry.get("name") or "").strip().lower(),
+                str(entry.get("provider_key") or "").strip().lower(),
+            }
+            if provider_norm and provider_norm not in names and provider_norm.replace("custom:", "") not in names:
+                continue
+            base_url = base_url or _expand_env_ref(entry.get("base_url") or entry.get("url") or entry.get("api"))
+            entry_api_key, entry_api_key_ref = _resolve_model_api_key(entry)
+            api_key = api_key or entry_api_key
+            api_key_ref = api_key_ref or entry_api_key_ref
+            api_mode = api_mode or str(entry.get("api_mode") or entry.get("transport") or "")
+            source = source if source == "aops.channelPreference" else "config.custom_providers"
+            break
+
+    if isinstance(cfg, dict) and not base_url:
+        providers = cfg.get("providers")
+        if isinstance(providers, dict):
+            entry = providers.get(current_provider) or providers.get(current_provider.strip().lower())
+            if isinstance(entry, dict):
+                base_url = _expand_env_ref(entry.get("base_url") or entry.get("api") or entry.get("url"))
+                api_key, api_key_ref = _resolve_model_api_key(entry)
+                api_mode = api_mode or str(entry.get("api_mode") or entry.get("transport") or "")
+                source = "config.providers"
+
+    if not api_key:
+        for env_name in ("MODEL_GATEWAY_API_KEY", "AOPS_MODEL_GATEWAY_KEY", "CUSTOM_API_KEY", "MODEL_API_KEY", "LM_API_KEY"):
+            api_key = _env_value(env_name)
+            if api_key:
+                api_key_ref = env_name
+                break
+
+    api_mode = api_mode or _infer_aops_api_mode(current_provider, base_url)
+    return {
+        "provider": current_provider,
+        "model": current_model,
+        "baseUrl": base_url.rstrip("/"),
+        "apiKey": api_key,
+        "apiKeyRef": api_key_ref,
+        "apiMode": api_mode,
+        "source": source,
+        "preferenceKey": pref_key,
+    }
+
+
+def _model_item(model_id: str, *, current_model: str = "", provider: str = "custom") -> dict[str, Any]:
+    return {
+        "id": model_id,
+        "model": model_id,
+        "displayName": model_id,
+        "current": bool(current_model and model_id == current_model),
+        "command": f"/model use {provider or 'custom'} {model_id}",
+    }
+
+
+def _current_model_payload(event: MessageEvent | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    from hermes_constants import get_hermes_home
+    from hermes_cli.models import probe_api_models
+
+    endpoint = _resolve_aops_model_endpoint(event)
+    started = time.monotonic()
+    models: list[str] | None = None
+    probe: dict[str, Any] = {}
+    error: dict[str, Any] | None = None
+    if not endpoint["baseUrl"]:
+        error = {
+            "code": "MODEL_GATEWAY_NOT_CONFIGURED",
+            "message": "当前用户未配置模型网关 base_url，无法查询模型列表。",
+        }
+    else:
+        cache_ttl = 0.0
+        try:
+            cache_ttl = float(os.getenv("AOPS_MODEL_LIST_CACHE_TTL_SECONDS", "60"))
+        except ValueError:
+            cache_ttl = 60.0
+        cache_key = _model_list_cache_key(endpoint)
+        cached = _MODEL_LIST_CACHE.get(cache_key)
+        if cached and cache_ttl > 0 and (time.monotonic() - cached[0]) <= cache_ttl:
+            probe = dict(cached[1])
+            probe["cache_hit"] = True
+        else:
+            probe = {}
+        try_alternate = os.getenv("AOPS_MODEL_LIST_TRY_ALTERNATE", "").strip().lower() in {"1", "true", "yes", "on"}
+        if not probe:
+            probe = probe_api_models(
+                endpoint["apiKey"],
+                endpoint["baseUrl"],
+                timeout=float(os.getenv("AOPS_MODEL_LIST_TIMEOUT", "1.5")),
+                api_mode=endpoint["apiMode"],
+                try_alternate=try_alternate,
+            )
+            if isinstance(probe.get("models"), list):
+                _MODEL_LIST_CACHE[cache_key] = (time.monotonic(), dict(probe))
+        raw_models = probe.get("models")
+        if isinstance(raw_models, list):
+            models = [str(item) for item in raw_models if str(item or "").strip()]
+        else:
+            error = {
+                "code": "MODEL_GATEWAY_FETCH_FAILED",
+                "message": "无法从当前模型网关获取模型列表。",
+                "details": {
+                    "probedUrl": probe.get("probed_url"),
+                    "resolvedBaseUrl": probe.get("resolved_base_url"),
+                    "suggestedBaseUrl": probe.get("suggested_base_url"),
+                    "baseUrl": endpoint["baseUrl"],
+                    "apiKeyConfigured": bool(endpoint["apiKey"]),
+                    "apiKeyPreview": _redact_secret(endpoint["apiKey"]),
+                    "apiMode": endpoint["apiMode"],
+                },
+            }
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    current_model = str(endpoint.get("model") or "")
+    payload = {
+        "providers": [
+            {
+                "slug": endpoint["provider"],
+                "name": endpoint["provider"],
+                "baseUrl": endpoint["baseUrl"],
+                "apiMode": endpoint["apiMode"],
+                "source": endpoint["source"],
+                "authenticated": bool(endpoint["apiKey"]),
+                "models": models or [],
+                "totalModels": len(models or []),
+                "isCurrent": True,
+            }
+        ] if endpoint["baseUrl"] else [],
+        "items": [
+            _model_item(model_id, current_model=current_model, provider=endpoint["provider"])
+            for model_id in (models or [])
+        ],
+        "model": current_model,
+        "provider": endpoint["provider"],
+        "selected": {
+            "model": current_model,
+            "provider": endpoint["provider"],
+            "base_url": endpoint["baseUrl"],
+            "api_mode": endpoint["apiMode"],
+        },
+        "error": error,
+    }
+    context = {
+        "preferenceKey": endpoint["preferenceKey"],
+        "statePath": str(get_hermes_home() / "aops" / "channel-state.json"),
+        "source": endpoint["source"],
+        "baseUrl": endpoint["baseUrl"],
+        "apiKeyConfigured": bool(endpoint["apiKey"]),
+        "apiKeyPreview": _redact_secret(endpoint["apiKey"]),
+        "apiMode": endpoint["apiMode"],
+        "probedUrl": probe.get("probed_url"),
+        "resolvedBaseUrl": probe.get("resolved_base_url"),
+        "suggestedBaseUrl": probe.get("suggested_base_url"),
+        "usedFallback": probe.get("used_fallback"),
+        "cacheHit": bool(probe.get("cache_hit")),
+        "elapsedMs": elapsed_ms,
+    }
+    return payload, context
+
+
+def _aops_model_list(command_text: str, event: MessageEvent) -> str:
+    payload, context = _current_model_payload(event)
+    return _list_response(
+        type_="model.list",
+        command=command_text,
+        item_type="model",
+        items=payload.get("items") or [],
+        context={
+            **context,
+            "currentModel": payload.get("model"),
+            "currentProvider": payload.get("provider"),
+            "selected": payload.get("selected"),
+            "providers": payload.get("providers") or [],
+        },
+        summary={"model": payload.get("model"), "provider": payload.get("provider")},
+        error=payload.get("error"),
+    )
+
+
+def _aops_model_status(command_text: str, event: MessageEvent) -> str:
+    from hermes_constants import get_hermes_home
+    from hermes_cli.config import get_config_path
+
+    endpoint = _resolve_aops_model_endpoint(event)
+    data = {
+        "model": endpoint.get("model") or "",
+        "modelId": endpoint.get("model") or "",
+        "provider": endpoint.get("provider") or "",
+        "providerLabel": endpoint.get("provider") or "",
+        "baseUrl": endpoint.get("baseUrl") or "",
+        "apiMode": endpoint.get("apiMode") or "",
+        "apiKeyConfigured": bool(endpoint.get("apiKey")),
+        "apiKeyPreview": _redact_secret(str(endpoint.get("apiKey") or "")),
+        "source": endpoint.get("source") or "",
+        "scope": "aops-channel" if endpoint.get("source") == "aops.channelPreference" else "config",
+        "preferenceKey": endpoint.get("preferenceKey"),
+        "statePath": str(get_hermes_home() / "aops" / "channel-state.json"),
+        "configPath": str(get_config_path()),
+        "commands": {
+            "list": "/model list",
+            "status": "/model status",
+            "switch": f"/model use {endpoint.get('provider') or 'custom'} <model>",
+        },
+    }
+    return _single_response(
+        type_="model.status",
+        command=command_text,
+        data=data,
+    )
+
+
+def _persist_aops_model_config(
+    *,
+    model: str,
+    provider: str,
+    base_url: str,
+    api_key: str,
+    api_key_ref: str,
+    api_mode: str,
+) -> dict[str, Any]:
+    from hermes_cli.config import get_config_path, load_config, read_raw_config, save_config
+
+    cfg = load_config()
+    if not isinstance(cfg, dict):
+        cfg = {}
+    raw_cfg = read_raw_config()
+    raw_model = raw_cfg.get("model") if isinstance(raw_cfg, dict) else {}
+    model_cfg = cfg.get("model")
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+        cfg["model"] = model_cfg
+
+    model_cfg["provider"] = provider or "custom"
+    model_cfg["default"] = model
+    model_cfg["model"] = model
+    if base_url:
+        model_cfg["base_url"] = base_url
+    if api_mode:
+        model_cfg["api_mode"] = api_mode
+    raw_key = _first_mapping_value(raw_model, _MODEL_KEY_FIELDS) if isinstance(raw_model, dict) else None
+    raw_key_env = _first_mapping_value(raw_model, _MODEL_KEY_ENV_FIELDS) if isinstance(raw_model, dict) else None
+    if raw_key is not None and not _looks_unresolved_secret_ref(raw_key):
+        model_cfg["api_key"] = str(raw_key).strip()
+    elif raw_key_env is not None:
+        model_cfg["api_key_env"] = str(raw_key_env).strip()
+        model_cfg.pop("api_key", None)
+    elif api_key_ref and _SECRET_ENV_NAME_RE.match(api_key_ref):
+        model_cfg["api_key_env"] = api_key_ref
+        model_cfg.pop("api_key", None)
+    elif api_key:
+        model_cfg["api_key"] = api_key
+
+    save_config(cfg)
+    return {"updated": True, "path": str(get_config_path())}
+
+
+def _aops_model_use(command_text: str, event: MessageEvent, args: list[str]) -> str:
+    from gateway import aops_state
+    from hermes_cli.model_switch import switch_model
+    from hermes_cli.config import load_config
+
+    if args[:1] == ["use"]:
+        if len(args) < 3:
+            return _single_response(
+                type_="model.switch",
+                command=command_text,
+                data={"allowedUsage": "/model use <provider> <model>"},
+                ok=False,
+                error={"code": "MODEL_USAGE", "message": "Usage: /model use <provider> <model>"},
+            )
+        explicit_provider = args[1]
+        model_input = " ".join(args[2:]).strip()
+    else:
+        return _single_response(
+            type_="model.switch",
+            command=command_text,
+            data={"allowedUsage": "/model use <provider> <model>"},
+            ok=False,
+            error={"code": "MODEL_USAGE", "message": "Usage: /model use <provider> <model>"},
+        )
+
+    if not model_input or _is_reserved_model_token(model_input):
+        return _single_response(
+            type_="model.switch",
+            command=command_text,
+            data={"allowedUsage": "/model use <provider> <model>"},
+            ok=False,
+            error={"code": "MODEL_USAGE", "message": "Usage: /model use <provider> <model>"},
+        )
+
+    cfg = load_config()
+    endpoint = _resolve_aops_model_endpoint(event)
+    current_model = str(endpoint.get("model") or "")
+    current_provider = str(endpoint.get("provider") or "custom")
+    current_base_url = str(endpoint.get("baseUrl") or "")
+    current_api_key = str(endpoint.get("apiKey") or "")
+    current_api_key_ref = str(endpoint.get("apiKeyRef") or "")
+    current_api_mode = str(endpoint.get("apiMode") or "")
+
+    provider_alias = str(explicit_provider or "").strip().lower()
+    current_provider_aliases = {
+        "",
+        "custom",
+        current_provider.strip().lower(),
+        str(endpoint.get("source") or "").strip().lower(),
+    }
+    if provider_alias in current_provider_aliases or provider_alias.startswith("custom:"):
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        agent_key = str(raw.get("agentKey") or raw.get("agentId") or "main")
+        pref_key = aops_state.preference_key(
+            platform=str(event.source.platform.value if event.source and event.source.platform else "aops"),
+            channel_id=str(event.source.chat_id if event.source else ""),
+            agent_key=agent_key,
+        )
+        target_provider = explicit_provider or current_provider or "custom"
+        preference = {
+            "model": model_input,
+            "provider": target_provider,
+            "api_key": current_api_key,
+            "api_key_ref": current_api_key_ref,
+            "base_url": current_base_url,
+            "api_mode": current_api_mode,
+        }
+        aops_state.set_model_preference(pref_key, preference)
+        config_update = _persist_aops_model_config(
+            model=model_input,
+            provider=target_provider,
+            base_url=current_base_url,
+            api_key=current_api_key,
+            api_key_ref=current_api_key_ref,
+            api_mode=current_api_mode,
+        )
+        return _single_response(
+            type_="model.switch",
+            command=command_text,
+            data={
+                "model": model_input,
+                "provider": target_provider,
+                "providerLabel": target_provider,
+                "baseUrl": current_base_url,
+                "apiMode": current_api_mode,
+                "apiKeyConfigured": bool(current_api_key),
+                "scope": "aops-channel",
+                "persisted": True,
+                "configUpdated": config_update["updated"],
+                "configPath": config_update["path"],
+                "preferenceKey": pref_key,
+                "source": endpoint.get("source"),
+            },
+        )
+
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+        custom_providers = get_compatible_custom_providers(cfg)
+    except Exception:
+        custom_providers = cfg.get("custom_providers") if isinstance(cfg, dict) else None
+    user_providers = cfg.get("providers") if isinstance(cfg, dict) else None
+
+    result = switch_model(
+        raw_input=model_input,
+        current_provider=current_provider,
+        current_model=current_model,
+        current_base_url=current_base_url,
+        current_api_key=current_api_key,
+        is_global=False,
+        explicit_provider=explicit_provider,
+        user_providers=user_providers,
+        custom_providers=custom_providers,
+    )
+    if not result.success:
+        return _single_response(
+            type_="model.switch",
+            command=command_text,
+            data={"requestedModel": model_input, "requestedProvider": explicit_provider},
+            ok=False,
+            error={"code": "MODEL_SWITCH_FAILED", "message": result.error_message},
+        )
+
+    raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+    agent_key = str(raw.get("agentKey") or raw.get("agentId") or "main")
+    pref_key = aops_state.preference_key(
+        platform=str(event.source.platform.value if event.source and event.source.platform else "aops"),
+        channel_id=str(event.source.chat_id if event.source else ""),
+        agent_key=agent_key,
+    )
+    preference = {
+        "model": result.new_model,
+        "provider": result.target_provider,
+        "api_key": result.api_key,
+        "api_key_ref": current_api_key_ref,
+        "base_url": result.base_url,
+        "api_mode": result.api_mode,
+    }
+    aops_state.set_model_preference(pref_key, preference)
+    config_update = _persist_aops_model_config(
+        model=result.new_model,
+        provider=result.target_provider,
+        base_url=result.base_url,
+        api_key=result.api_key,
+        api_key_ref=current_api_key_ref,
+        api_mode=result.api_mode,
+    )
+    return _single_response(
+        type_="model.switch",
+        command=command_text,
+        data={
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "providerLabel": result.provider_label or result.target_provider,
+            "scope": "aops-channel",
+            "persisted": True,
+            "configUpdated": config_update["updated"],
+            "configPath": config_update["path"],
+            "preferenceKey": pref_key,
+        },
+    )
+
+
+def _security_mode_info(mode: str) -> dict[str, str]:
+    labels = {
+        "off": "完全访问权限",
+        "manual": "默认权限",
+        "smart": "自动审查",
+    }
+    descriptions = {
+        "off": "普通危险命令审批关闭；hardline 禁止项仍不可绕过。",
+        "manual": "危险命令需要用户人工审批。",
+        "smart": "低风险命令可由辅助模型自动通过，高风险或不确定场景继续请求审批。",
+    }
+    return {"mode": mode, "label": labels.get(mode, mode), "description": descriptions.get(mode, "")}
+
+
+def _security_command(command_text: str, args: list[str]) -> str:
+    from hermes_cli.config import load_config, save_config
+    from hermes_constants import get_hermes_home
+
+    aliases = {
+        "full": "off",
+        "full-access": "off",
+        "完全访问权限": "off",
+        "default": "manual",
+        "默认权限": "manual",
+        "auto": "smart",
+        "自动审查": "smart",
+    }
+    cfg = load_config()
+    approvals = cfg.setdefault("approvals", {})
+    if not isinstance(approvals, dict):
+        approvals = {}
+        cfg["approvals"] = approvals
+    current = str(approvals.get("mode") or "manual").strip().lower()
+    destructive_slash_confirm = bool(approvals.get("destructive_slash_confirm", True))
+    if not args or args == ["status"]:
+        return _single_response(
+            type_="security.status",
+            command=command_text,
+            data={
+                "current": _security_mode_info(current),
+                "destructiveSlashConfirm": destructive_slash_confirm,
+                "configPath": str(get_hermes_home() / "config.yaml"),
+            },
+        )
+    if args[0] != "set" or len(args) < 2:
+        return _single_response(
+            type_="security.status",
+            command=command_text,
+            data={
+                "current": _security_mode_info(current),
+                "destructiveSlashConfirm": destructive_slash_confirm,
+                "allowedModes": ["off", "manual", "smart"],
+            },
+            ok=False,
+            error={"code": "SECURITY_USAGE", "message": "Usage: /security set <off|manual|smart>"},
+        )
+    requested = aliases.get(str(args[1]).strip().lower(), str(args[1]).strip().lower())
+    if requested not in {"off", "manual", "smart"}:
+        return _single_response(
+            type_="security.status",
+            command=command_text,
+            data={
+                "current": _security_mode_info(current),
+                "destructiveSlashConfirm": destructive_slash_confirm,
+                "allowedModes": ["off", "manual", "smart"],
+            },
+            ok=False,
+            error={"code": "SECURITY_INVALID_MODE", "message": f"Unsupported security mode: {args[1]}"},
+        )
+    approvals["mode"] = requested
+    approvals["destructive_slash_confirm"] = requested != "off"
+    save_config(cfg)
+    return _single_response(
+        type_="security.updated",
+        command=command_text,
+        data={
+            "previous": _security_mode_info(current),
+            "current": _security_mode_info(requested),
+            "destructiveSlashConfirm": bool(approvals.get("destructive_slash_confirm", True)),
+            "persisted": True,
+            "configPath": str(get_hermes_home() / "config.yaml"),
+        },
+    )
+
+
 def _history_summary_item(job: dict[str, Any] | None) -> dict[str, Any] | None:
     if not job:
         return None
     schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+    schedule_flags = _cron_schedule_flags(job)
     return {
         "id": job.get("id"),
         "name": job.get("name"),
@@ -700,6 +1805,8 @@ def _history_summary_item(job: dict[str, Any] | None) -> dict[str, Any] | None:
         "enabled": job.get("enabled"),
         "state": job.get("state"),
         "scheduleText": job.get("schedule_display") or schedule.get("display"),
+        "deleteAfterRun": schedule_flags["isOneShot"],
+        **schedule_flags,
         "nextRunAtMs": _to_ms(job.get("next_run_at")),
         "lastRunAtMs": _to_ms(job.get("last_run_at")),
     }
@@ -717,6 +1824,35 @@ def _history_error(command: str, context: dict[str, Any], code: str, message: st
         limit=20,
         error={"code": code, "message": message, "details": details or {}},
     )
+
+
+def _read_output_history_entries(cron_jobs: Any, job_id: str) -> list[dict[str, Any]]:
+    output_dir = Path(cron_jobs.OUTPUT_DIR) / str(job_id)
+    if not output_dir.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    for path in sorted(output_dir.glob("*.md"), key=lambda item: item.stat().st_mtime):
+        try:
+            stat = path.stat()
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        dt = datetime.fromtimestamp(stat.st_mtime).astimezone()
+        entries.append({
+            "job_id": job_id,
+            "job_name": None,
+            "job_description": None,
+            "status": "ok",
+            "error": None,
+            "response_preview": _compact_text(text, limit=300),
+            "delivery_error": None,
+            "finished_at": dt.isoformat(),
+            "started_at": None,
+            "timestamp": dt.isoformat(),
+            "duration_ms": None,
+            "output_path": str(path),
+        })
+    return entries
 
 
 def _read_cron_history(command_text: str, args: list[str]) -> str:
@@ -778,31 +1914,68 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
                     {"anchor": args[2]},
                 )
 
-    job = cron_jobs.get_job(job_id)
-    if job is None:
-        return _history_error(
-            command_text,
-            {"storePath": str(cron_jobs.JOBS_FILE), "logPath": str(cron_jobs.HISTORY_FILE), "jobId": job_id, "direction": direction, "requestedAnchorTs": requested_anchor, "anchorTs": None, "anchorEntry": None},
-            "CRON_JOB_NOT_FOUND",
-            f"Cron job `{job_id}` not found.",
-        )
-
     entries: list[dict[str, Any]] = []
     history_path = Path(cron_jobs.HISTORY_FILE)
     try:
         if history_path.exists():
-            for line in history_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                raw = json.loads(line)
+            found_anchor = requested_anchor is None
+            collected_after_anchor = 0
+            for raw in _iter_cron_history_entries_newest_first(history_path):
                 if str(raw.get("job_id") or "") == str(job_id):
                     entries.append(raw)
+                    if requested_anchor is None and direction == "latest" and len(entries) >= 20:
+                        break
+                    raw_ts = _to_ms(
+                        _first_history_value(
+                            raw,
+                            "finished_at",
+                            "finishedAt",
+                            "timestamp",
+                            "ts",
+                            "started_at",
+                            "startedAt",
+                        )
+                    )
+                    if requested_anchor is not None:
+                        if raw_ts == requested_anchor:
+                            found_anchor = True
+                        elif found_anchor and direction in {"latest", "before"}:
+                            collected_after_anchor += 1
+                            if collected_after_anchor >= 20:
+                                break
     except Exception as exc:
         return _history_error(
             command_text,
             {"storePath": str(cron_jobs.JOBS_FILE), "logPath": str(cron_jobs.HISTORY_FILE), "jobId": job_id, "direction": direction, "requestedAnchorTs": requested_anchor, "anchorTs": None, "anchorEntry": None},
             "CRON_HISTORY_READ_FAILED",
             str(exc),
+        )
+    if not entries:
+        entries = _read_output_history_entries(cron_jobs, str(job_id))
+
+    job = cron_jobs.get_job(job_id)
+    job_deleted = job is None
+    if job is None and entries:
+        latest = entries[-1]
+        job = {
+            "id": job_id,
+            "name": latest.get("job_name"),
+            "description": latest.get("job_description") or latest.get("job_name") or latest.get("response_preview") or "",
+            "prompt": latest.get("job_description") or latest.get("response_preview") or "",
+            "enabled": False,
+            "state": "deleted",
+            "schedule": {"kind": "once", "display": "deleted"},
+            "schedule_display": latest.get("schedule_display") or "deleted",
+            "next_run_at": None,
+            "last_run_at": latest.get("finished_at") or latest.get("timestamp"),
+            "repeat": {"times": 1, "completed": 1},
+        }
+    if job is None:
+        return _history_error(
+            command_text,
+            {"storePath": str(cron_jobs.JOBS_FILE), "logPath": str(cron_jobs.HISTORY_FILE), "jobId": job_id, "direction": direction, "requestedAnchorTs": requested_anchor, "anchorTs": None, "anchorEntry": None},
+            "CRON_JOB_NOT_FOUND",
+            f"Cron job `{job_id}` not found.",
         )
 
     if not entries:
@@ -815,14 +1988,25 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
 
     normalized: list[dict[str, Any]] = []
     for entry in entries:
-        ts = _to_ms(entry.get("finished_at") or entry.get("timestamp") or entry.get("started_at"))
+        ts = _to_ms(
+            _first_history_value(
+                entry,
+                "finished_at",
+                "finishedAt",
+                "timestamp",
+                "ts",
+                "started_at",
+                "startedAt",
+            )
+        )
         delivered = None if entry.get("delivery_error") is None else False
         status = str(entry.get("status") or "ok").lower()
+        duration_ms = _history_duration_ms(entry)
         normalized.append(
             {
                 "ts": ts,
                 "jobId": entry.get("job_id"),
-                "description": entry.get("job_description") or _job_description(job),
+                "description": entry.get("job_description") or _job_description(job) or _compact_text(entry.get("job_name")),
                 "action": "finished",
                 "status": status,
                 "error": entry.get("error"),
@@ -830,15 +2014,16 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
                 "delivered": delivered,
                 "deliveryStatus": _status_to_delivery(status, entry.get("delivery_error"), delivered),
                 "deliveryError": entry.get("delivery_error"),
-                "sessionId": None,
-                "sessionKey": None,
-                "runAtMs": _to_ms(entry.get("started_at") or entry.get("timestamp")),
-                "durationMs": entry.get("duration_ms") or _duration_ms(entry.get("started_at"), entry.get("finished_at")),
-                "nextRunAtMs": _to_ms(entry.get("scheduled_for")),
-                "model": job.get("model"),
-                "provider": job.get("provider"),
-                "usage": None,
+                "sessionId": entry.get("session_id") or entry.get("sessionId"),
+                "sessionKey": entry.get("session_key") or entry.get("sessionKey"),
+                "runAtMs": _to_ms(_first_history_value(entry, "started_at", "startedAt", "run_at", "runAt", "timestamp")),
+                "durationMs": duration_ms,
+                "nextRunAtMs": _history_next_run_ms(entry, job),
+                "model": entry.get("model") or job.get("model"),
+                "provider": entry.get("provider") or job.get("provider"),
+                "usage": _history_usage(entry, duration_ms),
                 "jobName": entry.get("job_name") or job.get("name"),
+                "outputPath": entry.get("output_path"),
             }
         )
 
@@ -881,8 +2066,13 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
         "requestedAnchorTs": requested_anchor,
         "anchorTs": anchor_entry.get("ts"),
         "anchorEntry": anchor_entry,
+        "jobDeleted": job_deleted,
     }
-    summary = {"task": _history_summary_item(job)}
+    summary = {
+        "task": _history_summary_item(job),
+        "jobDeleted": job_deleted,
+        "message": "该定时任务当前不存在；根据历史记录判断，它可能是一次性任务，执行后已自动删除。" if job_deleted else None,
+    }
     return _list_response(
         type_="cron.history.list",
         command=command_text,
@@ -952,6 +2142,35 @@ def maybe_local_command(event: MessageEvent) -> str | LocalCommandResult | None:
         if args[:1] == ["history"]:
             return _read_cron_history(full_command, args)
 
+    if canonical == "model":
+        try:
+            normalized_args = [arg.lower() for arg in args]
+            if len(normalized_args) == 1 and normalized_args[0] in _MODEL_STATUS_TOKENS:
+                return _aops_model_status(full_command, event)
+            if not args or (len(normalized_args) == 1 and normalized_args[0] in _MODEL_LIST_TOKENS):
+                return _aops_model_list(full_command, event)
+            return _aops_model_use(full_command, event, args)
+        except Exception as exc:
+            normalized_args = [arg.lower() for arg in args]
+            is_status = len(normalized_args) == 1 and normalized_args[0] in _MODEL_STATUS_TOKENS
+            is_list = (not args) or (len(normalized_args) == 1 and normalized_args[0] in _MODEL_LIST_TOKENS)
+            return _single_response(
+                type_="model.status" if is_status else ("model.list" if is_list else "model.switch"),
+                command=full_command,
+                data={},
+                ok=False,
+                error={
+                    "code": "MODEL_STATUS_FAILED" if is_status else ("MODEL_LIST_FAILED" if is_list else "MODEL_SWITCH_FAILED"),
+                    "message": str(exc),
+                },
+            )
+
+    if canonical == "reasoning":
+        return _reasoning_command(full_command, args)
+
+    if canonical in {"security", "securty"}:
+        return _security_command(full_command, args)
+
     return None
 
 
@@ -998,7 +2217,7 @@ def _build_official_nodes(config: Any) -> list[HelpNode]:
     overrides = _resolve_config_gates()
     nodes: list[HelpNode] = []
     for cmd in COMMAND_REGISTRY:
-        if cmd.name in _REMOVED_AOPS_COMMANDS or cmd.name in {"skills", "cron"}:
+        if cmd.name in _REMOVED_AOPS_COMMANDS or cmd.name in {"skills", "cron", "security", "securty"}:
             continue
         if cmd.name not in _AOPS_NATIVE_COMMANDS:
             continue
@@ -1037,6 +2256,54 @@ def _skill_command_nodes(config: Any) -> list[HelpNode]:
                 dangerous=_dangerous(config, cmd_key),
                 usage=f"{cmd_key} [prompt]",
                 executable=True,
+            )
+        )
+    return nodes
+
+
+def _extension_child_node(config: Any, parent: str, child: dict[str, Any]) -> HelpNode:
+    child_name = str(child.get("command") or child.get("name") or "").strip().lower().replace("_", "-").lstrip("/")
+    child_full = str(child.get("fullCommand") or child.get("full_command") or "").strip()
+    if not child_full:
+        child_full = f"/{parent} {child_name}".strip()
+    return _node(
+        type_=str(child.get("type") or "custom"),
+        command=child_name,
+        full_command=child_full,
+        description=str(child.get("description") or f"执行 {child_full}。"),
+        dangerous=_dangerous(config, child_full),
+        usage=str(child.get("usage") or child_full),
+        executable=bool(child.get("executable", True)),
+        completions=list(child.get("completions") or []),
+        children=[
+            _extension_child_node(config, parent, nested)
+            for nested in child.get("children", [])
+            if isinstance(nested, dict)
+        ],
+    )
+
+
+def _extension_nodes(config: Any) -> list[HelpNode]:
+    nodes: list[HelpNode] = []
+    for name, extension in sorted(_AOPS_COMMAND_EXTENSIONS.items()):
+        full_command = f"/{name}"
+        if is_blocked(config, name):
+            continue
+        nodes.append(
+            _node(
+                type_=extension.type,
+                command=full_command,
+                full_command=full_command,
+                description=extension.description,
+                dangerous=_dangerous(config, full_command),
+                usage=extension.usage or full_command,
+                executable=extension.executable,
+                completions=list(extension.completions or []),
+                children=[
+                    _extension_child_node(config, name, child)
+                    for child in (extension.children or [])
+                    if isinstance(child, dict)
+                ],
             )
         )
     return nodes
@@ -1137,6 +2404,33 @@ def _cron_node(config: Any) -> HelpNode:
     )
 
 
+def _security_node(config: Any) -> HelpNode:
+    full_command = "/security"
+    set_full = "/security set"
+    return _node(
+        type_="configuration",
+        command=full_command,
+        full_command=full_command,
+        description=_DESCRIPTION_ZH["security"],
+        dangerous=_dangerous(config, full_command),
+        usage="/security",
+        executable=True,
+        completions=list(_USAGE_COMPLETIONS.get("security", [])),
+        children=[
+            _node(
+                type_="configuration",
+                command="set",
+                full_command=set_full,
+                description="切换安全审批策略。",
+                dangerous=_dangerous(config, set_full),
+                usage="/security set <off|manual|smart>",
+                executable=False,
+                completions=list(_USAGE_COMPLETIONS.get("security", [])),
+            )
+        ],
+    )
+
+
 def _curator_node(config: Any) -> HelpNode:
     full_command = "/curator"
     children: list[HelpNode] = []
@@ -1188,20 +2482,32 @@ def _count_nodes(nodes: list[HelpNode]) -> tuple[int, int, int]:
     return total, executable, dangerous
 
 
-def help_tree_response(config: Any) -> str:
+def help_tree_response(config: Any, command_text: str = "/help") -> str:
     nodes = _build_official_nodes(config)
     nodes.append(_skills_node(config))
     nodes.append(_cron_node(config))
+    if not is_blocked(config, "security"):
+        nodes.append(_security_node(config))
     nodes = [node for node in nodes if node.full_command != "/curator"]
     nodes.append(_curator_node(config))
+    nodes.extend(_extension_nodes(config))
     nodes.extend(_skill_command_nodes(config))
+    deduped: list[HelpNode] = []
+    seen: set[str] = set()
+    for node in nodes:
+        key = node.full_command.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(node)
+    nodes = deduped
     top_level_count = len(nodes)
     total_count, executable_count, dangerous_count = _count_nodes(nodes)
     payload = {
         "schemaVersion": HELP_TREE_SCHEMA,
         "type": "command.tree",
         "ok": True,
-        "command": "/help",
+        "command": command_text,
         "context": {"channel": "aops"},
         "summary": {
             "topLevelCount": top_level_count,
@@ -1247,6 +2553,8 @@ def aops_text_command_lines() -> list[str]:
         "`/cron history <id> [tsMs]` -- Show cron run history",
         "`/cron history before <id> [tsMs]` -- Show cron history before an anchor",
         "`/cron history after <id> <tsMs>` -- Show cron history after an anchor",
+        "`/security` -- Show current approval policy",
+        "`/security set <off|manual|smart>` -- Switch approval policy",
     ]
 
 

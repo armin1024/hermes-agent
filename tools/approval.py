@@ -1197,6 +1197,7 @@ def check_all_command_guards(command: str, env_type: str,
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": combined_desc,
+                "allow_permanent": not has_tirith,
             }
             entry = _ApprovalEntry(approval_data)
             with _lock:
@@ -1328,6 +1329,7 @@ def check_all_command_guards(command: str, env_type: str,
             "pattern_key": primary_key,
             "pattern_keys": all_keys,
             "description": combined_desc,
+            "allow_permanent": not has_tirith,
         })
         return {
             "approved": False,

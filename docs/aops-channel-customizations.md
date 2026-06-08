@@ -168,14 +168,14 @@ AOPS 入站 `attachments` 会由 Bot 侧下载并缓存：
 - 下载失败不会静默丢失，会在用户问题后追加中文系统提示。
 - 静默 SkillHub 命令跳过附件处理，避免无关附件干扰命令执行。
 
-AOPS wire log 会记录附件下载过程：
+统一 AOPS 日志只记录与 Tec01 上游的附件 HTTP 交互：
 
-- `attachment.download.start`
-- `attachment.download.success`
-- `attachment.download.failed`
-- `attachment.download.skipped`
+- `http.attachment.request`
+- `http.attachment.response`
 
-日志目录为 `~/.hermes/logs/aops/`，默认保留 7 天。
+日志写入 `~/.hermes/logs/aops/aops-YYYY-MM-DD.log`，每行包含时间、收发方向、上游事件、`messageType`、关键摘要和 `raw=` 原始 payload。普通 session 状态、busy handler、agent 内部状态和附件本地缓存过程不写入 AOPS 日志。
+
+默认保留 7 天，可通过 `platforms.aops.extra.log_retention_days` 或 `AOPS_LOG_RETENTION_DAYS` 覆盖。清理范围包括新日志和旧版 `aops-wire-*.log`、`aops-messages-*.log`。
 
 ## 缓存和清理
 

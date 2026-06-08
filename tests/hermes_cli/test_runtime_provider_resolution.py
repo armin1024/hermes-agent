@@ -606,6 +606,47 @@ def test_custom_endpoint_uses_config_api_key_over_env(monkeypatch):
     assert resolved["api_key"] == "config-api-key"
 
 
+def test_custom_endpoint_uses_model_api_key_env(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "custom",
+            "base_url": "https://my-api.example.com/v1",
+            "api_key_env": "MODEL_GATEWAY_API_KEY",
+        },
+    )
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "model-gateway-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-should-not-win")
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+
+    resolved = rp.resolve_runtime_provider(requested="custom")
+
+    assert resolved["base_url"] == "https://my-api.example.com/v1"
+    assert resolved["api_key"] == "model-gateway-key"
+
+
+def test_custom_endpoint_ignores_unresolved_api_key_template(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "custom",
+            "base_url": "https://my-api.example.com/v1",
+            "api_key": "{model.api_key}",
+        },
+    )
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "model-gateway-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-should-not-win")
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+
+    resolved = rp.resolve_runtime_provider(requested="custom")
+
+    assert resolved["api_key"] == "model-gateway-key"
+
+
 def test_custom_endpoint_uses_config_api_field_when_no_api_key(monkeypatch):
     """provider: custom with 'api' in config uses it as api_key (#1760)."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")

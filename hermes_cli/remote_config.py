@@ -43,7 +43,8 @@ AOPS_ENV_KEYS = (
     "AOPS_CONNECT_TIMEOUT",
     "HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT",
 )
-MODEL_GATEWAY_ENV_KEYS = ("OPENAI_API_KEY",)
+MODEL_GATEWAY_API_KEY_ENV = "MODEL_GATEWAY_API_KEY"
+MODEL_GATEWAY_ENV_KEYS = (MODEL_GATEWAY_API_KEY_ENV,)
 HINDSIGHT_ENV_KEYS = (
     "HINDSIGHT_API_KEY",
     "HINDSIGHT_API_URL",
@@ -245,6 +246,15 @@ def _save_env_if_allowed(key: str, value: str, *, field: str, options: dict[str,
     changed.append(key)
 
 
+def _model_gateway_api_key(model_gateway: dict[str, Any]) -> str | None:
+    return (
+        _optional_string(model_gateway.get("apiKey"), "config.modelGateway.apiKey")
+        or _optional_string(model_gateway.get("api_key"), "config.modelGateway.api_key")
+        or _optional_string(model_gateway.get(MODEL_GATEWAY_API_KEY_ENV), f"config.modelGateway.{MODEL_GATEWAY_API_KEY_ENV}")
+        or _optional_string(model_gateway.get("OPENAI_API_KEY"), "config.modelGateway.OPENAI_API_KEY")
+    )
+
+
 def _apply_env(config_payload: dict[str, Any], options: dict[str, Any]) -> list[str]:
     changed: list[str] = []
     existing_env = load_env()
@@ -267,14 +277,10 @@ def _apply_env(config_payload: dict[str, Any], options: dict[str, Any]) -> list[
     model_gateway = config_payload.get("modelGateway") or {}
     if model_gateway and not isinstance(model_gateway, dict):
         raise RemoteConfigError("config.modelGateway must be a JSON object")
-    api_key = (
-        _optional_string(model_gateway.get("apiKey"), "config.modelGateway.apiKey")
-        or _optional_string(model_gateway.get("api_key"), "config.modelGateway.api_key")
-        or _optional_string(model_gateway.get("OPENAI_API_KEY"), "config.modelGateway.OPENAI_API_KEY")
-    )
+    api_key = _model_gateway_api_key(model_gateway)
     if api_key is not None:
         _save_env_if_allowed(
-            "OPENAI_API_KEY",
+            MODEL_GATEWAY_API_KEY_ENV,
             api_key,
             field="modelGateway.apiKey",
             options=options,
@@ -283,7 +289,7 @@ def _apply_env(config_payload: dict[str, Any], options: dict[str, Any]) -> list[
         )
 
     for key in MODEL_GATEWAY_ENV_KEYS:
-        if key == "OPENAI_API_KEY":
+        if key == MODEL_GATEWAY_API_KEY_ENV:
             continue
         value = _optional_string(model_gateway.get(key), f"config.modelGateway.{key}")
         if value is not None:
@@ -348,6 +354,7 @@ def _apply_config_yaml(config_payload: dict[str, Any], options: dict[str, Any]) 
     model = _optional_string(model_gateway.get("model"), "config.modelGateway.model")
     provider = _optional_string(model_gateway.get("provider"), "config.modelGateway.provider") or "custom"
     api_mode = _optional_string(model_gateway.get("apiMode"), "config.modelGateway.apiMode")
+    api_key = _model_gateway_api_key(model_gateway)
     if base_url or model or provider or api_mode:
         model_cfg = cfg.get("model")
         if not isinstance(model_cfg, dict):
@@ -362,6 +369,8 @@ def _apply_config_yaml(config_payload: dict[str, Any], options: dict[str, Any]) 
             _deep_set_if_allowed(cfg, "model.provider", provider, field="modelGateway.provider", options=options, changed=changed)
         if api_mode:
             _deep_set_if_allowed(cfg, "model.api_mode", api_mode, field="modelGateway.apiMode", options=options, changed=changed)
+        if api_key:
+            _deep_set_if_allowed(cfg, "model.api_key_env", MODEL_GATEWAY_API_KEY_ENV, field="modelGateway.apiKey", options=options, changed=changed)
 
     approvals = config_payload.get("approvals") or {}
     if approvals and not isinstance(approvals, dict):

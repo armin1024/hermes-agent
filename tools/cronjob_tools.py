@@ -22,11 +22,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     AmbiguousJobReference,
+    audit_cron_jobs,
     create_job,
     get_job,
     list_jobs,
     parse_schedule,
     pause_job,
+    recurring_interval_from_once_duration,
     remove_job,
     resolve_job_ref,
     resume_job,
@@ -208,6 +210,94 @@ def _normalize_deliver_param(value: Any) -> Optional[str]:
     return text or None
 
 
+_CN_EVERY_MINUTE_RE = re.compile(
+    r"(每\s*(?:隔\s*)?(?:1|一)?\s*分钟|每分钟|每\s*min|每\s*minute)",
+    re.IGNORECASE,
+)
+_CN_AFTER_MINUTE_RE = re.compile(r"(?:(?:1|一)\s*分钟后|after\s+1\s*min)", re.IGNORECASE)
+_RECURRING_INTENT_RE = re.compile(
+    r"(每|每隔|周期|循环|定期|every|recurr|interval|hourly|daily|weekly|monthly)",
+    re.IGNORECASE,
+)
+_ONE_SHOT_INTENT_RE = re.compile(
+    r"(分钟后|小时后|天后|只执行一次|仅执行一次|一次性|执行一次就|one[-\s]?shot|only\s+once|just\s+once|after\s+\d+)",
+    re.IGNORECASE,
+)
+_BARE_DURATION_RE = re.compile(
+    r"^\s*(?:once\s+in\s+)?(?P<num>\d+)\s*(?P<unit>m|min|minute|minutes|h|hr|hour|hours|d|day|days)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _original_user_text_from_env() -> str:
+    try:
+        from gateway.session_context import get_session_env
+        return get_session_env("HERMES_SESSION_MESSAGE_TEXT", "") or ""
+    except Exception:
+        return ""
+
+
+def _combined_intent_text(*parts: Optional[Any]) -> str:
+    return "\n".join(str(part or "") for part in parts if str(part or "").strip())
+
+
+def _recurring_minutes_from_intent(value: str) -> Optional[int]:
+    try:
+        from cron.jobs import _recurring_minutes_from_text
+        return _recurring_minutes_from_text(value)
+    except Exception:
+        return None
+
+
+def _looks_like_once_duration(value: str) -> bool:
+    raw = str(value or "").strip()
+    return bool(_BARE_DURATION_RE.match(raw) or raw in {"一分钟", "一 分钟"})
+
+
+def _normalize_create_schedule(
+    schedule: str,
+    prompt: Optional[str],
+    name: Optional[str] = None,
+    intent_text: Optional[str] = None,
+) -> tuple[str, Optional[str]]:
+    """Repair common NL schedule slips before they become one-shot jobs."""
+    raw_schedule = str(schedule or "").strip()
+    combined = _combined_intent_text(raw_schedule, prompt, name, intent_text)
+    if _ONE_SHOT_INTENT_RE.search(combined):
+        return raw_schedule, None
+    minutes = _recurring_minutes_from_intent(combined)
+    if minutes and _looks_like_once_duration(raw_schedule):
+        interval = recurring_interval_from_once_duration(raw_schedule, minutes=minutes)
+        if interval:
+            return interval, f"检测到用户表达的是周期执行，已将一次性 `{raw_schedule}` 修正为周期任务 `{interval}`。"
+    if raw_schedule in {"1m", "1 min", "1 minute", "一分钟", "一 分钟"}:
+        if _CN_EVERY_MINUTE_RE.search(combined) and not _CN_AFTER_MINUTE_RE.search(combined):
+            return "every 1m", "检测到用户表达的是“每分钟执行”，已将一次性 `1m` 修正为周期任务 `every 1m`。"
+    return raw_schedule, None
+
+
+def _normalize_create_repeat(
+    schedule: str,
+    prompt: Optional[str],
+    repeat: Optional[int],
+    *,
+    name: Optional[str] = None,
+    intent_text: Optional[str] = None,
+) -> tuple[Optional[int], Optional[str]]:
+    if repeat != 1:
+        return repeat, None
+    try:
+        parsed = parse_schedule(schedule)
+    except Exception:
+        return repeat, None
+    if parsed.get("kind") not in {"interval", "cron"}:
+        return repeat, None
+    combined = _combined_intent_text(schedule, prompt, name, intent_text)
+    if _RECURRING_INTENT_RE.search(combined) and not _ONE_SHOT_INTENT_RE.search(combined):
+        return None, "检测到周期任务被附带 `repeat=1`，已修正为持续重复执行，避免首次执行后自动删除。"
+    return repeat, None
+
+
 def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     """Validate a cron job script path at the API boundary.
 
@@ -223,6 +313,12 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     from hermes_constants import get_hermes_home
 
     raw = script.strip()
+    if re.search(r"""[\s'"`$;&|<>]""", raw):
+        return (
+            "Script must be a script filename/path under ~/.hermes/scripts, not an inline shell command. "
+            f"Got: {raw!r}. Put commands in ~/.hermes/scripts/<name>.sh and set script='<name>.sh', "
+            "or omit script/no_agent and put the task instruction in prompt."
+        )
 
     # Reject absolute paths and ~ expansion at the API boundary.
     # Only relative paths within ~/.hermes/scripts/ are allowed.
@@ -243,11 +339,18 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
         return (
             f"Script path escapes the scripts directory via traversal: {raw!r}"
         )
+    if (scripts_dir / raw).suffix.lower() not in {".py", ".sh", ".bash"}:
+        return (
+            "Script path must point to a .py, .sh, or .bash file under ~/.hermes/scripts/. "
+            f"Got: {raw!r}."
+        )
 
     return None
 
 
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    from cron.jobs import job_description
+
     prompt = str(job.get("prompt") or "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
     job_id = str(job.get("id") or "unknown")
@@ -255,6 +358,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     result = {
         "job_id": job_id,
         "name": name,
+        "description": job_description(job),
         "skill": skills[0] if skills else None,
         "skills": skills,
         "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
@@ -311,10 +415,24 @@ def cronjob(
 
     try:
         normalized = (action or "").strip().lower()
+        original_user_text = _original_user_text_from_env()
 
         if normalized == "create":
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
+            schedule, schedule_warning = _normalize_create_schedule(
+                schedule,
+                prompt,
+                name=name,
+                intent_text=original_user_text,
+            )
+            repeat, repeat_warning = _normalize_create_repeat(
+                schedule,
+                prompt,
+                repeat,
+                name=name,
+                intent_text=original_user_text,
+            )
             canonical_skills = _canonical_skills(skill, skills)
             _no_agent = bool(no_agent)
             # Job-shape validation differs by mode:
@@ -383,14 +501,20 @@ def cronjob(
                     "deliver": job.get("deliver", "local"),
                     "next_run_at": job["next_run_at"],
                     "job": _format_job(job),
+                    "warning": "\n".join([msg for msg in [schedule_warning, repeat_warning] if msg]) or None,
                     "message": f"Cron job '{job['name']}' created.",
                 },
                 indent=2,
             )
 
         if normalized == "list":
+            audit_cron_jobs(repair=True)
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
+
+        if normalized in {"audit", "doctor", "self_check", "self-check"}:
+            report = audit_cron_jobs(repair=True)
+            return json.dumps({"success": True, **report}, indent=2)
 
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
@@ -453,6 +577,7 @@ def cronjob(
 
         if normalized == "update":
             updates: Dict[str, Any] = {}
+            update_warnings: list[str] = []
             if prompt is not None:
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
@@ -520,20 +645,62 @@ def cronjob(
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
+                effective_schedule = schedule if schedule is not None else job.get("schedule_display") or ""
+                if normalized_repeat == 1:
+                    normalized_repeat, _repeat_warning = _normalize_create_repeat(
+                        effective_schedule,
+                        prompt if prompt is not None else job.get("prompt"),
+                        1,
+                        name=name if name is not None else job.get("name"),
+                        intent_text=original_user_text,
+                    )
+                    if _repeat_warning:
+                        update_warnings.append(_repeat_warning)
+                if normalized_repeat is None and schedule is None:
+                    existing_schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+                    if existing_schedule.get("kind") == "once":
+                        converted_schedule = recurring_interval_from_once_duration(effective_schedule)
+                        if converted_schedule:
+                            updates["schedule"] = converted_schedule
+                            if job.get("state") != "paused":
+                                updates["state"] = "scheduled"
+                                updates["enabled"] = True
+                            update_warnings.append(
+                                f"检测到将一次性 duration 任务设为持续重复，已同步将 schedule 从 `{effective_schedule}` 修正为 `{converted_schedule}`。"
+                            )
+                        else:
+                            return tool_error(
+                                "Cannot set repeat=forever on an absolute one-shot schedule without also providing a recurring schedule. "
+                                "Pass schedule='every <interval>' together with repeat=0.",
+                                success=False,
+                            )
                 repeat_state = dict(job.get("repeat") or {})
                 repeat_state["times"] = normalized_repeat
                 updates["repeat"] = repeat_state
             if schedule is not None:
-                parsed_schedule = parse_schedule(schedule)
-                updates["schedule"] = parsed_schedule
-                updates["schedule_display"] = parsed_schedule.get("display", schedule)
+                normalized_schedule, schedule_warning = _normalize_create_schedule(
+                    schedule,
+                    prompt if prompt is not None else job.get("prompt"),
+                    name=name if name is not None else job.get("name"),
+                    intent_text=original_user_text,
+                )
+                if schedule_warning:
+                    update_warnings.append(schedule_warning)
+                updates["schedule"] = normalized_schedule
                 if job.get("state") != "paused":
                     updates["state"] = "scheduled"
                     updates["enabled"] = True
             if not updates:
                 return tool_error("No updates provided.", success=False)
             updated = update_job(job_id, updates)
-            return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
+            return json.dumps(
+                {
+                    "success": True,
+                    "job": _format_job(updated),
+                    "warning": "\n".join(update_warnings) or None,
+                },
+                indent=2,
+            )
 
         return tool_error(f"Unknown cron action '{action}'", success=False)
 
@@ -547,7 +714,7 @@ CRONJOB_SCHEMA = {
     "description": """Manage scheduled cron jobs with a single compressed tool.
 
 Use action='create' to schedule a new job from a prompt or one or more skills.
-Use action='list' to inspect jobs.
+Use action='list' to inspect jobs. Use action='audit' to self-check and repair bad stored cron records.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
@@ -566,7 +733,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
         "properties": {
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run"
+                "description": "One of: create, list, audit, update, pause, resume, remove, run"
             },
             "job_id": {
                 "type": "string",

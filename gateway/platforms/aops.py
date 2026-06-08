@@ -45,8 +45,8 @@ from hermes_constants import get_default_hermes_root, get_hermes_home
 logger = logging.getLogger(__name__)
 
 _RECONNECT_BACKOFF = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
-_AOPS_WIRE_LOG_RETENTION_DAYS = 7
-_AOPS_WIRE_LOG_LOCK = threading.Lock()
+_AOPS_LOG_RETENTION_DAYS_DEFAULT = 7
+_AOPS_LOG_LOCK = threading.Lock()
 _DONE = object()
 _SEGMENT_BREAK = object()
 _COMMENTARY = object()
@@ -216,6 +216,48 @@ def _aops_message_type(*, metadata: dict[str, Any], inherited_silent: bool | Non
     return "common"
 
 
+def _aops_outbound_extra_fields(metadata: dict[str, Any], *, message_type: str) -> dict[str, Any]:
+    """Return protocol metadata fields safe to expose beside messageType."""
+    outbound: dict[str, Any] = {}
+    source = str(metadata.get("source") or "").strip()
+    if source:
+        outbound["source"] = source
+    bot_reply_extra = metadata.get("botReplyExtra")
+    if isinstance(bot_reply_extra, dict):
+        nested = bot_reply_extra.get("botReplyExtra")
+        if isinstance(nested, dict):
+            bot_reply_extra = nested
+        for key in ("messageType", "id", "name"):
+            value = bot_reply_extra.get(key)
+            if value is not None:
+                outbound[key] = value
+    elif message_type:
+        outbound["messageType"] = message_type
+    return outbound
+
+
+def _aops_normalize_outbound_protocol_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """Flatten legacy AOPS metadata/botReplyExtra shapes at the final send boundary."""
+    normalized = dict(data)
+    message_type = str(normalized.get("messageType") or "").strip().lower() or "common"
+    metadata = normalized.pop("metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    extra = _aops_outbound_extra_fields(metadata, message_type=message_type)
+    for key, value in extra.items():
+        normalized.setdefault(key, value)
+    bot_reply_extra = normalized.pop("botReplyExtra", None)
+    if isinstance(bot_reply_extra, dict):
+        nested = bot_reply_extra.get("botReplyExtra")
+        if isinstance(nested, dict):
+            bot_reply_extra = nested
+        for key in ("messageType", "id", "name"):
+            value = bot_reply_extra.get(key)
+            if value is not None:
+                normalized[key] = value
+    normalized.setdefault("messageType", message_type)
+    return normalized
+
+
 def _normalize_aops_attachment_type(attachment: dict[str, Any]) -> str:
     raw_type = str(attachment.get("fileType") or attachment.get("file_type") or "").strip().lower()
     mime_type = str(attachment.get("mimeType") or attachment.get("mime_type") or "").strip().lower()
@@ -292,6 +334,128 @@ def _extract_aops_text(raw_text: Any) -> tuple[str, bool, str | None]:
     return text, False, None
 
 
+def _metadata_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def _extract_aops_conversation_title(data: dict[str, Any]) -> str:
+    metadata = _metadata_dict(data.get("metadata"))
+    candidates = (
+        data.get("title"),
+        data.get("conversationTitle"),
+        data.get("conversation_title"),
+        data.get("chatTitle"),
+        data.get("channelName"),
+        metadata.get("title"),
+        metadata.get("conversationTitle"),
+        metadata.get("conversation_title"),
+        metadata.get("chatTitle"),
+        metadata.get("channelName"),
+    )
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _iter_aops_content_items(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return []
+        return _iter_aops_content_items(parsed)
+    return []
+
+
+def _extract_aops_approval_action(data: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return (slash-command, approval-id) for AOPS approval button callbacks."""
+    metadata = _metadata_dict(data.get("metadata"))
+    content_candidates = [
+        *_iter_aops_content_items(data.get("content")),
+        *_iter_aops_content_items(metadata.get("content")),
+    ]
+    candidates: list[dict[str, Any]] = [*content_candidates, metadata, data]
+
+    action = ""
+    approval_id = ""
+    approval_kind = ""
+    for item in candidates:
+        raw_action = (
+            item.get("action")
+            or item.get("approvalAction")
+            or item.get("approval_action")
+            or item.get("value")
+        )
+        raw_id = item.get("approvalId") or item.get("approval_id")
+        raw_kind = item.get("approvalKind") or item.get("approval_kind") or item.get("kind")
+        if raw_id is None and item in content_candidates:
+            raw_id = item.get("id")
+        if not action and raw_action is not None:
+            action = str(raw_action).strip().lower().replace("_", "-")
+        if not approval_id and raw_id is not None:
+            approval_id = str(raw_id).strip()
+        if not approval_kind and raw_kind is not None:
+            approval_kind = str(raw_kind).strip().lower().replace("_", "-")
+
+    if approval_kind in {"slash", "slash-confirm", "confirm"}:
+        command_by_action = {
+            "/approve": "/approve",
+            "allow-once": "/approve",
+            "approve-once": "/approve",
+            "once": "/approve",
+            "/always": "/always",
+            "/approve-always": "/always",
+            "/approve always": "/always",
+            "allow-always": "/always",
+            "approve-always": "/always",
+            "always": "/always",
+            "/cancel": "/cancel",
+            "/deny": "/cancel",
+            "deny": "/cancel",
+            "reject": "/cancel",
+            "cancel": "/cancel",
+        }
+        return command_by_action.get(action), approval_id or None
+
+    command_by_action = {
+        "/approve": "/approve",
+        "allow-once": "/approve",
+        "approve-once": "/approve",
+        "once": "/approve",
+        "/approve-session": "/approve session",
+        "/approve session": "/approve session",
+        "allow-session": "/approve session",
+        "approve-session": "/approve session",
+        "session": "/approve session",
+        "/approve-always": "/approve always",
+        "/approve always": "/approve always",
+        "allow-always": "/approve always",
+        "approve-always": "/approve always",
+        "always": "/approve always",
+        "/deny": "/deny",
+        "/cancel": "/deny",
+        "deny": "/deny",
+        "reject": "/deny",
+        "cancel": "/deny",
+    }
+    return command_by_action.get(action), approval_id or None
+
+
 def _extension_for_aops_attachment(filename: str, mime_type: str, file_type: str) -> str:
     ext = Path(filename).suffix
     if ext:
@@ -308,80 +472,319 @@ def _extension_for_aops_attachment(filename: str, mime_type: str, file_type: str
     return ".bin"
 
 
-def _format_utc(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
 def _format_local(dt: datetime) -> str:
-    local_dt = dt.astimezone()
-    tz_label = os.getenv("HERMES_TIMEZONE", "").strip() or local_dt.tzname() or local_dt.strftime("%z")
-    return f"{local_dt.strftime('%Y-%m-%d %H:%M:%S')} {tz_label}".strip()
+    return dt.astimezone().isoformat(timespec="milliseconds")
 
 
-def _extract_aops_wire_fields(payload: Any) -> dict[str, Any]:
+def _compact_log_text(value: Any, *, limit: int = 500) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _aops_log_retention_days(config: PlatformConfig | None = None) -> int:
+    value: Any = None
+    if config is not None:
+        extra = getattr(config, "extra", None)
+        if isinstance(extra, dict):
+            value = extra.get("log_retention_days")
+    if value is None:
+        value = os.getenv("AOPS_LOG_RETENTION_DAYS", "").strip()
+    if value in (None, ""):
+        return _AOPS_LOG_RETENTION_DAYS_DEFAULT
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        logger.debug("Ignoring invalid AOPS log retention days: %r", value)
+        return _AOPS_LOG_RETENTION_DAYS_DEFAULT
+    if parsed < 1:
+        logger.debug("Ignoring invalid AOPS log retention days: %r", value)
+        return _AOPS_LOG_RETENTION_DAYS_DEFAULT
+    return parsed
+
+
+def _aops_local_command_send_timeout() -> float:
+    raw = os.getenv("AOPS_LOCAL_COMMAND_SEND_TIMEOUT", "2").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 2.0
+    return value if value > 0 else 2.0
+
+
+def _aops_local_command_exec_timeout() -> float:
+    raw = os.getenv("AOPS_LOCAL_COMMAND_EXEC_TIMEOUT", "3").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 3.0
+    return value if value > 0 else 3.0
+
+
+def _quote_aops_log_value(value: Any, *, limit: int = 500) -> str:
+    text = _compact_log_text(value, limit=limit)
+    return json.dumps(text or "-", ensure_ascii=False)
+
+
+def _aops_log_raw_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _aops_action_commands(actions: Any) -> list[str]:
+    commands: list[str] = []
+    if isinstance(actions, list):
+        for action in actions:
+            if isinstance(action, dict):
+                command = str(action.get("command") or action.get("value") or "").strip()
+            else:
+                command = str(action or "").strip()
+            if command:
+                commands.append(command)
+    return commands
+
+
+def _aops_log_event(action: str, raw_payload: Any) -> str:
+    if isinstance(raw_payload, dict):
+        event = str(raw_payload.get("event") or raw_payload.get("action") or "").strip()
+        if event:
+            return event
+    return action or "-"
+
+
+def _aops_log_message_type(data: dict[str, Any], *, action: str, filtered: bool = False) -> str:
+    if filtered:
+        return "filtered"
+    phase = str(data.get("phase") or "").strip().lower()
+    kind = str(data.get("kind") or "").strip().lower()
+    if kind == "approval" or phase == "actions":
+        return "approval"
+    if kind == "tool" or phase == "tool":
+        return "tool"
+    message_type = str(data.get("messageType") or "").strip()
+    if message_type:
+        return message_type
+    if data.get("messageId") or data.get("replyToId") or data.get("channelId") or data.get("text"):
+        return "-"
+    if action.startswith("ws.") or action in {"ping", "pong", "auth"}:
+        return "ws"
+    if action.startswith("http."):
+        return "http"
+    if action.startswith("attachment."):
+        return "attachment"
+    return "-"
+
+
+def _aops_log_text(data: dict[str, Any], *, action: str, error: str | None = None, filtered: bool = False) -> str:
+    if filtered:
+        return "filtered reason=internal_thinking tool=_thinking"
+    if error:
+        base = action or "error"
+        return f"{base} error={_compact_log_text(error, limit=200)}"
+    text = data.get("text") or data.get("delta")
+    if text is None and isinstance(data.get("content"), str):
+        text = data.get("content")
+    if text:
+        return _compact_log_text(text)
+    phase = str(data.get("phase") or "").strip().lower()
+    kind = str(data.get("kind") or "").strip().lower()
+    if kind == "approval" or phase == "actions":
+        content = data.get("content")
+        approval = content[0] if isinstance(content, list) and content and isinstance(content[0], dict) else {}
+        commands = _aops_action_commands(approval.get("allowedActions"))
+        return (
+            f"approval kind={approval.get('approvalKind') or '-'} "
+            f"actions={','.join(commands) or '-'} "
+            f"command={_compact_log_text(approval.get('command'), limit=200) or '-'}"
+        )
+    if kind == "tool" or phase == "tool":
+        tool = data.get("tool") if isinstance(data.get("tool"), dict) else data
+        result = tool.get("result") if isinstance(tool.get("result"), dict) else {}
+        tool_text = data.get("text") or tool.get("preview") or result.get("text")
+        tool_name = tool.get("name") or tool.get("tool_name") or "-"
+        if str(tool_name) == "cronjob":
+            cron_bits: list[str] = []
+            args = tool.get("args") if isinstance(tool.get("args"), dict) else data.get("args")
+            if isinstance(args, dict):
+                for key in ("action", "job_id", "schedule", "repeat"):
+                    if args.get(key) is not None:
+                        cron_bits.append(f"{key}={_compact_log_text(args.get(key), limit=80)}")
+            parsed_result = result.get("json") if isinstance(result.get("json"), dict) else None
+            if not parsed_result and isinstance(result.get("text"), str):
+                try:
+                    loaded = json.loads(result["text"])
+                    if isinstance(loaded, dict):
+                        parsed_result = loaded
+                except Exception:
+                    parsed_result = None
+            if parsed_result:
+                job = parsed_result.get("job") if isinstance(parsed_result.get("job"), dict) else {}
+                for key, value in (
+                    ("job_id", parsed_result.get("job_id") or job.get("job_id")),
+                    ("schedule", parsed_result.get("schedule") or job.get("schedule")),
+                    ("repeat", parsed_result.get("repeat") or job.get("repeat")),
+                    ("enabled", job.get("enabled")),
+                    ("state", job.get("state")),
+                ):
+                    if value is not None:
+                        cron_bits.append(f"{key}={_compact_log_text(value, limit=80)}")
+            if cron_bits:
+                tool_text = " ".join(cron_bits)
+        return (
+            f"tool phase={tool.get('phase') or data.get('phase') or '-'} "
+            f"name={tool_name} "
+            f"text={_compact_log_text(tool_text, limit=200) or '-'}"
+        )
+    if action.startswith("attachment."):
+        summary = f"{action}"
+        file_name = data.get("fileName") or data.get("file_name")
+        if file_name:
+            summary += f" file={file_name}"
+        if error:
+            summary += f" error={_compact_log_text(error, limit=200)}"
+        elif data.get("reason"):
+            summary += f" reason={data.get('reason')}"
+        return summary
+    if action.startswith("http."):
+        summary = action
+        status = data.get("status")
+        method = data.get("method")
+        url = data.get("url")
+        if method:
+            summary += f" method={method}"
+        if status is not None:
+            summary += f" status={status}"
+        if url:
+            summary += f" url={url}"
+        if error:
+            summary += f" error={_compact_log_text(error, limit=200)}"
+        return summary
+    if action == "ws.closed":
+        close_code = data.get("closeCode") or data.get("data")
+        reason_hint = f"server_closed_code_{close_code}" if close_code else "-"
+        return f"closeCode={close_code or '-'} reasonHint={reason_hint}"
+    return action or "-"
+
+
+def _aops_log_data_from_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
-    data = payload.get("data")
-    data_record = data if isinstance(data, dict) else {}
-    return {
-        "event": payload.get("event"),
-        "messageId": data_record.get("messageId") or data_record.get("id"),
-        "seq": data_record.get("seq"),
-        "phase": data_record.get("phase"),
-        "kind": data_record.get("kind"),
-        "channelId": data_record.get("channelId") or data_record.get("conversationId"),
-        "replyToId": data_record.get("replyToId"),
-        "runId": data_record.get("runId"),
-        "userId": data_record.get("userId") or data_record.get("ownerUserId"),
-        "agentKey": data_record.get("agentKey") or data_record.get("agentId"),
-    }
+    payload_data = payload.get("data")
+    if isinstance(payload_data, dict):
+        return payload_data
+    return payload
 
 
-def _cleanup_aops_wire_logs(log_dir: Path, *, now: datetime) -> None:
-    cutoff = now.astimezone(timezone.utc).date() - timedelta(days=_AOPS_WIRE_LOG_RETENTION_DAYS - 1)
-    for path in log_dir.glob("aops-wire-*.log"):
-        raw_date = path.stem.removeprefix("aops-wire-")
-        try:
-            log_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
-        except ValueError:
+def _aops_is_internal_thinking_payload(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if not isinstance(item, dict):
             continue
-        if log_date < cutoff:
+        for key in ("tool_name", "name"):
+            if str(item.get(key) or "").strip() == "_thinking":
+                return True
+        tool = item.get("tool")
+        if isinstance(tool, dict):
+            for key in ("tool_name", "name"):
+                if str(tool.get(key) or "").strip() == "_thinking":
+                    return True
+            stack.append(tool)
+        kind = str(item.get("kind") or "").strip().lower()
+        phase = str(item.get("phase") or "").strip().lower()
+        event_type = str(item.get("event_type") or item.get("eventType") or "").strip().lower()
+        if kind == "thinking" or phase == "thinking" or event_type in {"_thinking", "reasoning.available"}:
+            return True
+        metadata = item.get("metadata")
+        if isinstance(metadata, dict):
+            marker = str(metadata.get("type") or metadata.get("kind") or metadata.get("reasoning") or "").strip().lower()
+            if marker in {"thinking", "reasoning", "internal_thinking", "true"}:
+                return True
+            stack.append(metadata)
+        content = item.get("content")
+        if isinstance(content, list):
+            stack.extend(child for child in content if isinstance(child, dict))
+        elif isinstance(content, dict):
+            stack.append(content)
+    return False
+
+
+def _cleanup_aops_logs(log_dir: Path, *, now: datetime, retention_days: int) -> None:
+    cutoff = now.astimezone(timezone.utc).date() - timedelta(days=retention_days - 1)
+    patterns = ("aops-*.log", "aops-wire-*.log", "aops-messages-*.log")
+    for pattern in patterns:
+        paths = list(log_dir.glob(pattern))
+        for path in paths:
+            raw_date = path.stem
+            for prefix in ("aops-wire-", "aops-messages-", "aops-"):
+                raw_date = raw_date.removeprefix(prefix)
             try:
-                path.unlink()
-            except OSError:
-                pass
+                log_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if log_date < cutoff:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
 
 
-def _write_aops_wire_log(
+def _write_aops_log_line(
     *,
-    level: str,
     direction: str,
     action: str,
     payload: Any = None,
+    data: dict[str, Any] | None = None,
+    raw: Any = None,
     error: str | None = None,
+    session_key: str | None = None,
+    session_id: str | None = None,
+    status: str | None = None,
+    elapsed_ms: int | None = None,
+    send_elapsed_ms: int | None = None,
+    filtered: bool = False,
+    config: PlatformConfig | None = None,
 ) -> None:
     now = datetime.now(timezone.utc)
     log_dir = get_hermes_home() / "logs" / "aops"
-    record = {
-        "ts": _format_utc(now),
-        "localTime": _format_local(now),
-        "level": level,
-        "direction": direction,
-        "action": action,
-        **_extract_aops_wire_fields(payload),
-        "payload": payload,
-    }
-    if error:
-        record["error"] = error
+    record_data = data if isinstance(data, dict) else {}
+    raw_payload = raw if raw is not None else payload
+    if not record_data:
+        record_data = _aops_log_data_from_payload(raw_payload)
+    metadata = record_data.get("metadata") if isinstance(record_data.get("metadata"), dict) else {}
+    io = "recv" if direction in {"in", "recv"} else "send"
+    event = _aops_log_event(action, raw_payload)
+    message_type = _aops_log_message_type(record_data, action=action, filtered=filtered)
+    silent = bool(record_data.get("silent") is True or str(record_data.get("messageType") or "").strip().lower() == "silent")
+    text = _aops_log_text(record_data, action=action, error=error, filtered=filtered)
+    status_value = status or ("failed" if error else ("skipped" if filtered else "ok"))
+    line_parts = [
+        _format_local(now),
+        f"io={io}",
+        f"event={event or '-'}",
+        f"messageType={message_type or '-'}",
+        f"silent={'true' if silent else 'false'}",
+        f"channel={record_data.get('channelId') or record_data.get('conversationId') or '-'}",
+        f"msg={record_data.get('messageId') or record_data.get('id') or '-'}",
+        f"replyTo={record_data.get('replyToId') or '-'}",
+        f"title={_quote_aops_log_value(record_data.get('title') or record_data.get('conversationTitle') or metadata.get('title') or metadata.get('conversationTitle'))}",
+        f"text={_quote_aops_log_value(text)}",
+        f"status={status_value}",
+        f"elapsedMs={elapsed_ms if elapsed_ms is not None else '-'}",
+        f"sendElapsedMs={send_elapsed_ms if send_elapsed_ms is not None else '-'}",
+        f"raw={_aops_log_raw_json(raw_payload if raw_payload is not None else record_data)}",
+    ]
     try:
-        with _AOPS_WIRE_LOG_LOCK:
+        with _AOPS_LOG_LOCK:
             log_dir.mkdir(parents=True, exist_ok=True)
-            _cleanup_aops_wire_logs(log_dir, now=now)
-            log_path = log_dir / f"aops-wire-{now.date().isoformat()}.log"
+            _cleanup_aops_logs(log_dir, now=now, retention_days=_aops_log_retention_days(config))
+            log_path = log_dir / f"aops-{now.date().isoformat()}.log"
             with log_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                handle.write(" ".join(line_parts) + "\n")
     except Exception as exc:
-        logger.debug("AOPS wire log write failed: %s", exc)
+        logger.debug("AOPS log write failed: %s", exc)
 
 
 @dataclass
@@ -389,14 +792,23 @@ class _ReplyContext:
     channel_id: str
     reply_to_id: Optional[str]
     run_id: Optional[str]
+    title: Optional[str] = None
 
 
 class AopsLiveReplyBridge:
     """Thread-safe bridge for AOPS native streaming replies."""
 
-    def __init__(self, adapter: "AopsAdapter", *, chat_id: str, reply_to_id: Optional[str], run_id: Optional[str] = None):
+    def __init__(
+        self,
+        adapter: "AopsAdapter",
+        *,
+        chat_id: str,
+        reply_to_id: Optional[str],
+        run_id: Optional[str] = None,
+        title: Optional[str] = None,
+    ):
         self.adapter = adapter
-        self.context = _ReplyContext(channel_id=str(chat_id), reply_to_id=reply_to_id, run_id=run_id)
+        self.context = _ReplyContext(channel_id=str(chat_id), reply_to_id=reply_to_id, run_id=run_id, title=title)
         self._queue: queue.Queue = queue.Queue()
         self._message_id: Optional[str] = None
         self._seq = 0
@@ -416,6 +828,11 @@ class AopsLiveReplyBridge:
 
     def bind_run_id(self, run_id: str | None) -> None:
         self.context.run_id = run_id
+
+    def update_title(self, title: str | None) -> None:
+        normalized = str(title or "").strip()
+        if normalized:
+            self.context.title = normalized
 
     def _reset_segment(self) -> None:
         self._message_id = None
@@ -495,6 +912,8 @@ class AopsLiveReplyBridge:
             data["replyToId"] = self.context.reply_to_id
         if self.context.run_id:
             data["runId"] = self.context.run_id
+        if self.context.title:
+            data["title"] = self.context.title
         if delta is not None:
             data["delta"] = delta
         if text is not None:
@@ -539,11 +958,15 @@ class AopsLiveReplyBridge:
     async def _emit_tool(self, payload: dict[str, Any]) -> None:
         event_type = str(payload.get("event_type") or "").strip()
         if event_type in ("reasoning.available", "_thinking"):
-            self.adapter._log_wire(
-                "info",
-                direction="drop",
-                action="tool_progress.dropped",
-                payload=payload,
+            raw = {"event": "message_reply", "data": payload}
+            _write_aops_log_line(
+                direction="out",
+                action="message_reply",
+                data=payload,
+                raw=raw,
+                filtered=True,
+                status="skipped",
+                config=self.adapter.config,
             )
             return
         tool_name = str(payload.get("tool_name") or "").strip() or None
@@ -664,12 +1087,15 @@ class AopsAdapter(BasePlatformAdapter):
         self._session: Optional["aiohttp.ClientSession"] = None
         self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
         self._listen_task: Optional[asyncio.Task] = None
+        self._dispatch_tasks: set[asyncio.Task] = set()
         self._connected_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._channel_send_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._chat_cache: dict[str, dict[str, Any]] = {}
         self._seen_message_ids: set[str] = set()
         self._reply_flags_by_message_id: dict[str, dict[str, Any]] = {}
+        self._conversation_titles: dict[str, str] = {}
+        self._title_resolver = None
         self._bot_id: Optional[str] = None
         self._bot_name: Optional[str] = None
 
@@ -680,6 +1106,27 @@ class AopsAdapter(BasePlatformAdapter):
     @property
     def dm_policy(self) -> str:
         return self._dm_policy
+
+    def set_title_resolver(self, resolver) -> None:
+        self._title_resolver = resolver
+
+    def _resolve_outbound_title(self, data: dict[str, Any]) -> str:
+        title = str(data.get("title") or "").strip()
+        if title:
+            return title
+        channel_id = str(data.get("channelId") or "").strip()
+        cached_title = self._conversation_titles.get(channel_id, "")
+        if cached_title:
+            return cached_title
+        resolver = self._title_resolver
+        if callable(resolver):
+            try:
+                resolved = resolver(data)
+                if resolved:
+                    return str(resolved).strip()
+            except Exception as exc:
+                logger.debug("[%s] AOPS title resolver failed: %s", self.name, exc)
+        return ""
 
     @property
     def allow_from(self) -> list[str]:
@@ -715,12 +1162,12 @@ class AopsAdapter(BasePlatformAdapter):
         payload: Any = None,
         error: str | None = None,
     ) -> None:
-        _write_aops_wire_log(
-            level=level,
+        _write_aops_log_line(
             direction=direction,
             action=action,
             payload=payload,
             error=error,
+            config=self.config,
         )
 
     async def connect(self) -> bool:
@@ -755,8 +1202,19 @@ class AopsAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._listen_task = None
+        await self._cancel_dispatch_tasks()
         await self._cleanup()
         self._mark_disconnected()
+
+    async def _cancel_dispatch_tasks(self) -> None:
+        tasks = [task for task in self._dispatch_tasks if not task.done()]
+        if not tasks:
+            self._dispatch_tasks.clear()
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._dispatch_tasks.difference_update(tasks)
 
     async def _cleanup(self) -> None:
         if self._ws and not self._ws.closed:
@@ -807,11 +1265,21 @@ class AopsAdapter(BasePlatformAdapter):
         if not self._session:
             raise RuntimeError("AOPS session not initialized")
         url = urljoin(f"{self._base_url}/", "api/v1/bot/me")
+        self._log_wire("info", direction="out", action="http.bot_me.request", payload={"method": "GET", "url": url})
         async with self._session.get(url, headers=self._headers(), **request_kwargs) as resp:
             if resp.status >= 400:
                 body = await resp.text()
+                self._log_wire(
+                    "warning",
+                    direction="in",
+                    action="http.bot_me.response",
+                    payload={"method": "GET", "url": url, "status": resp.status, "body": body[:500]},
+                    error=f"status={resp.status}",
+                )
                 raise RuntimeError(f"/bot/me failed ({resp.status}): {body[:200]}")
-            return await resp.json()
+            payload = await resp.json()
+            self._log_wire("info", direction="in", action="http.bot_me.response", payload={"method": "GET", "url": url, "status": resp.status, "body": payload})
+            return payload
 
     def _build_agent_report_payload(self) -> dict[str, Any]:
         agents = []
@@ -853,11 +1321,27 @@ class AopsAdapter(BasePlatformAdapter):
         url = urljoin(f"{self._base_url}/", "api/v1/bot/agents/report")
         payload = self._build_agent_report_payload()
         try:
+            self._log_wire("info", direction="out", action="http.agent_report.request", payload={"method": "POST", "url": url, "body": payload})
             async with self._session.post(url, headers={**self._headers(), "Content-Type": "application/json"}, json=payload, **request_kwargs) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
+                    self._log_wire(
+                        "warning",
+                        direction="in",
+                        action="http.agent_report.response",
+                        payload={"method": "POST", "url": url, "status": resp.status, "body": body[:500]},
+                        error=f"status={resp.status}",
+                    )
                     logger.warning("[%s] agent report failed (%s): %s", self.name, resp.status, body[:200])
+                    return
+                body = None
+                try:
+                    body = await resp.text()
+                except Exception:
+                    body = ""
+                self._log_wire("info", direction="in", action="http.agent_report.response", payload={"method": "POST", "url": url, "status": resp.status, "body": body[:500]})
         except Exception as exc:
+            self._log_wire("warning", direction="in", action="http.agent_report.response", payload={"method": "POST", "url": url}, error=str(exc))
             logger.warning("[%s] agent report failed: %s", self.name, exc)
 
     async def _listen_loop(self) -> None:
@@ -873,12 +1357,6 @@ class AopsAdapter(BasePlatformAdapter):
                     return
                 self._connected_event.clear()
                 logger.warning("[%s] AOPS socket error: %s", self.name, exc)
-                self._log_wire(
-                    "warning",
-                    direction="state",
-                    action="ws.socket_error",
-                    error=str(exc),
-                )
                 delay = _RECONNECT_BACKOFF[min(attempt, len(_RECONNECT_BACKOFF) - 1)]
                 attempt += 1
                 await asyncio.sleep(delay)
@@ -887,12 +1365,6 @@ class AopsAdapter(BasePlatformAdapter):
                     attempt = 0
                 except Exception as reconnect_exc:
                     logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)
-                    self._log_wire(
-                        "warning",
-                        direction="state",
-                        action="ws.reconnect_failed",
-                        error=str(reconnect_exc),
-                    )
 
     async def _read_events(self) -> None:
         if not self._ws:
@@ -902,30 +1374,61 @@ class AopsAdapter(BasePlatformAdapter):
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
                 if payload:
-                    self._log_wire("info", direction="in", action="ws.receive", payload=payload)
+                    if payload.get("event") != "message_posted":
+                        self._log_wire("info", direction="in", action="ws.receive", payload=payload)
                     if await self._handle_ws_control_event(payload):
                         continue
-                    await self._dispatch_payload(payload)
+                    if payload.get("event") == "message_posted":
+                        self._schedule_dispatch_payload(payload)
+                    else:
+                        await self._dispatch_payload(payload)
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                close_code = getattr(self._ws, "close_code", None)
+                close_error = None
+                try:
+                    close_error = self._ws.exception() if self._ws else None
+                except Exception:
+                    close_error = None
                 self._log_wire(
                     "warning",
                     direction="in",
                     action="ws.closed",
                     payload={
-                        "event": "closed",
+                        "event": "ws.closed",
                         "type": str(msg.type),
                         "data": getattr(msg, "data", None),
+                        "extra": getattr(msg, "extra", None),
+                        "closeCode": close_code or getattr(msg, "data", None),
+                        "closeError": str(close_error or ""),
                     },
                 )
                 raise RuntimeError("AOPS websocket closed")
 
+    def _schedule_dispatch_payload(self, payload: dict[str, Any]) -> None:
+        task = asyncio.create_task(self._dispatch_payload(payload))
+        self._dispatch_tasks.add(task)
+
+        def _done(done_task: asyncio.Task) -> None:
+            self._dispatch_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning("[%s] AOPS message dispatch failed: %s", self.name, exc, exc_info=True)
+
+        task.add_done_callback(_done)
+
     async def _handle_ws_control_event(self, payload: dict[str, Any]) -> bool:
         event = str(payload.get("event") or "").strip().lower()
-        if event != "ping":
+        action = str(payload.get("action") or "").strip().lower()
+        if event != "ping" and action != "ping":
             return False
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         pong = {
-            "event": "pong",
+            "action" if action == "ping" and event != "ping" else "event": "pong",
             "data": {
+                **data,
                 "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             },
         }
@@ -933,7 +1436,7 @@ class AopsAdapter(BasePlatformAdapter):
             if not self._ws or self._ws.closed:
                 raise RuntimeError("AOPS websocket not connected")
             await self._ws.send_json(pong)
-        self._log_wire("info", direction="out", action="ws.send", payload=pong)
+        self._log_wire("info", direction="out", action="pong", payload=pong)
         return True
 
     def _parse_json(self, raw: str) -> Optional[dict[str, Any]]:
@@ -953,8 +1456,115 @@ class AopsAdapter(BasePlatformAdapter):
         event = self._build_message_event(data)
         if event is None:
             return
+        log_data = dict(data)
+        log_data["text"] = event.text
+        _write_aops_log_line(
+            direction="in",
+            action="in.command" if str(event.text or "").strip().startswith("/") else "in.message",
+            data=log_data,
+            raw=payload,
+            session_key=self._session_key_for_event(event),
+            config=self.config,
+        )
+        if data.get("silent") is True or str(data.get("messageType") or "").strip().lower() == "silent":
+            await self._dispatch_silent_event(event)
+            return
         await self._attach_inbound_attachments(event)
         await self.handle_message(event)
+
+    async def _dispatch_silent_event(self, event: MessageEvent) -> None:
+        started = time.monotonic()
+        response: Any = None
+        try:
+            from gateway import aops_commands as _aops_commands
+
+            command = (event.get_command() or "").strip().lower().replace("_", "-")
+            if command == "help":
+                response = _aops_commands.help_tree_response(self.config, event.text.strip() or "/help")
+            elif command == "commands":
+                lines = ["🧰 **AOPS Local Commands**", *_aops_commands.aops_text_command_lines(), ""]
+                skill_entries = _aops_commands.aops_skill_command_lines(self.config)
+                if skill_entries:
+                    lines.extend(["⚡ **Skill Commands**:", *skill_entries, ""])
+                response = "\n".join(lines).strip()
+            else:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(_aops_commands.maybe_local_command, event),
+                    timeout=_aops_local_command_exec_timeout(),
+                )
+
+        except asyncio.TimeoutError:
+            response = json.dumps(
+                {
+                    "schemaVersion": "local-command-list.v1",
+                    "type": "silent.error",
+                    "ok": False,
+                    "command": event.text,
+                    "error": {"code": "SILENT_COMMAND_TIMEOUT", "message": "Silent local command timed out."},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        except Exception as exc:
+            response = json.dumps(
+                {
+                    "schemaVersion": "local-command-list.v1",
+                    "type": "silent.error",
+                    "ok": False,
+                    "command": event.text,
+                    "error": {"code": "SILENT_COMMAND_FAILED", "message": str(exc)},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        if response is None:
+            response = json.dumps(
+                {
+                    "schemaVersion": "local-command-list.v1",
+                    "type": "silent.error",
+                    "ok": False,
+                    "command": event.text,
+                    "error": {"code": "SILENT_COMMAND_UNSUPPORTED", "message": "Unsupported silent command."},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        content = None
+        metadata = None
+        if hasattr(response, "text") and hasattr(response, "content"):
+            content = getattr(response, "content", None)
+            metadata = getattr(response, "metadata", None)
+            response = getattr(response, "text", "") or ""
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        message_id = self.create_message_id()
+        data = {
+            "messageId": message_id,
+            "seq": 1,
+            "phase": "end",
+            "kind": "final",
+            "channelId": event.source.chat_id if event.source else "",
+            "replyToId": event.message_id,
+            "text": str(response or ""),
+            "conversationEnded": True,
+            "ts": _now_ms(),
+            "messageType": "silent",
+            "silent": True,
+            "title": str(raw.get("title") or raw.get("conversationTitle") or ""),
+            "botReplyExtra": {"messageType": "silent"},
+        }
+        if isinstance(metadata, dict):
+            data["contentMetadata"] = metadata
+        if content:
+            data["content"] = content
+        await self.send_reply_event(data, send_timeout=_aops_local_command_send_timeout(), elapsed_ms=int((time.monotonic() - started) * 1000))
+
+    def _session_key_for_event(self, event: MessageEvent) -> str | None:
+        try:
+            from gateway.session import build_session_key
+
+            return build_session_key(event.source) if event.source else None
+        except Exception:
+            return None
 
     def _normalize_inbound_message(self, payload: dict[str, Any]) -> Optional[dict[str, Any]]:
         if payload.get("event") == "message_posted":
@@ -1035,6 +1645,7 @@ class AopsAdapter(BasePlatformAdapter):
             "metadata": metadata,
             "attachments": message_data.get("attachments"),
             "messageType": message_data.get("messageType") or metadata.get("messageType"),
+            "title": message_data.get("title") or message_data.get("conversationTitle") or metadata.get("title") or metadata.get("conversationTitle"),
             "silent": (
                 bool(metadata["silent"])
                 if isinstance(metadata.get("silent"), bool)
@@ -1081,9 +1692,27 @@ class AopsAdapter(BasePlatformAdapter):
             "name": chat_name or channel_id,
             "type": chat_type,
         }
+        conversation_title = _extract_aops_conversation_title(data)
+        if conversation_title:
+            self._conversation_titles[channel_id] = conversation_title
+            metadata = data.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = _metadata_dict(metadata)
+            data = {**data, "metadata": {**metadata, "conversationTitle": conversation_title}}
         if isinstance(data.get("silent"), bool):
             self._reply_flags_by_message_id[message_id] = {"silent": bool(data["silent"])}
+        approval_command, approval_id = _extract_aops_approval_action(data)
         text, text_was_messages, system_prompt = _extract_aops_text(data.get("text"))
+        if approval_command:
+            text = approval_command
+            metadata = data.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = _metadata_dict(metadata)
+            metadata = {**metadata, "aopsApprovalAction": True}
+            if approval_id:
+                metadata["aopsApprovalId"] = approval_id
+            data = {**data, "metadata": metadata}
+            text_was_messages = False
         if text_was_messages:
             metadata = data.get("metadata")
             if not isinstance(metadata, dict):
@@ -1111,12 +1740,6 @@ class AopsAdapter(BasePlatformAdapter):
     async def _attach_inbound_attachments(self, event: MessageEvent) -> None:
         raw = event.raw_message if isinstance(event.raw_message, dict) else {}
         if raw.get("silent") is True or str(raw.get("messageType") or "").strip().lower() == "silent":
-            self._log_wire(
-                "info",
-                direction="drop",
-                action="attachment.download.skipped",
-                payload={"messageId": getattr(event, "message_id", None), "reason": "silent"},
-            )
             return
         attachments = raw.get("attachments")
         if not isinstance(attachments, list) or not attachments:
@@ -1127,50 +1750,20 @@ class AopsAdapter(BasePlatformAdapter):
         failures: list[str] = []
         for attachment in attachments:
             if not isinstance(attachment, dict):
-                self._log_wire(
-                    "warning",
-                    direction="drop",
-                    action="attachment.download.skipped",
-                    payload={"messageId": getattr(event, "message_id", None), "reason": "invalid_attachment"},
-                )
                 continue
             file_id = str(attachment.get("fileId") or attachment.get("file_id") or "").strip()
             if not file_id:
-                self._log_wire(
-                    "warning",
-                    direction="drop",
-                    action="attachment.download.skipped",
-                    payload={
-                        "messageId": getattr(event, "message_id", None),
-                        "reason": "missing_file_id",
-                        "fileName": attachment.get("fileName") or attachment.get("file_name"),
-                    },
-                )
                 continue
             attachment_log = self._attachment_log_payload(event, attachment)
-            self._log_wire("info", direction="in", action="attachment.download.start", payload=attachment_log)
             try:
                 cached_path, media_type = await self._download_and_cache_attachment(attachment)
             except Exception as exc:
                 logger.warning("[%s] Failed to download AOPS attachment %s: %s", self.name, file_id, exc)
                 failures.append(str(attachment.get("fileName") or attachment.get("file_name") or file_id))
-                self._log_wire(
-                    "warning",
-                    direction="in",
-                    action="attachment.download.failed",
-                    payload=attachment_log,
-                    error=str(exc),
-                )
                 continue
             if cached_path:
                 media_paths.append(cached_path)
                 media_types.append(media_type)
-                self._log_wire(
-                    "info",
-                    direction="in",
-                    action="attachment.download.success",
-                    payload={**attachment_log, "mimeType": media_type, "cachedPath": cached_path},
-                )
 
         if media_paths:
             event.media_urls.extend(media_paths)
@@ -1205,9 +1798,17 @@ class AopsAdapter(BasePlatformAdapter):
         session_kwargs, request_kwargs = self._request_kwargs()
         del session_kwargs
         url = self._attachment_download_url(attachment)
+        self._log_wire("info", direction="out", action="http.attachment.request", payload={"method": "GET", "url": url, "fileId": attachment.get("fileId") or attachment.get("file_id")})
         async with self._session.get(url, headers=self._headers(), **request_kwargs) as resp:
             if resp.status >= 400:
                 body = await resp.text()
+                self._log_wire(
+                    "warning",
+                    direction="in",
+                    action="http.attachment.response",
+                    payload={"method": "GET", "url": url, "status": resp.status, "body": body[:500]},
+                    error=f"status={resp.status}",
+                )
                 raise RuntimeError(f"attachment download failed ({resp.status}): {body[:200]}")
             raw_size = resp.headers.get("Content-Length") if hasattr(resp, "headers") else None
             try:
@@ -1219,6 +1820,12 @@ class AopsAdapter(BasePlatformAdapter):
             if len(data) > _AOPS_MAX_ATTACHMENT_BYTES:
                 raise RuntimeError(f"attachment too large: {len(data)} bytes")
             content_type = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip() if hasattr(resp, "headers") else ""
+            self._log_wire(
+                "info",
+                direction="in",
+                action="http.attachment.response",
+                payload={"method": "GET", "url": url, "status": resp.status, "contentType": content_type, "bytes": len(data)},
+            )
             return data, content_type
 
     async def _download_and_cache_attachment(self, attachment: dict[str, Any]) -> tuple[str, str]:
@@ -1237,9 +1844,9 @@ class AopsAdapter(BasePlatformAdapter):
             return cache_video_from_bytes(data, ext), media_type
         return cache_document_from_bytes(data, file_name), media_type
 
-    async def _send_payload(self, payload: dict[str, Any], *, channel_id: str) -> SendResult:
+    async def _send_payload(self, payload: dict[str, Any], *, channel_id: str, timeout: float = 15.0) -> SendResult:
         try:
-            await asyncio.wait_for(self._connected_event.wait(), timeout=15.0)
+            await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             return SendResult(success=False, error="AOPS websocket is not connected", retryable=True)
         lock = self._channel_send_locks[str(channel_id)]
@@ -1250,12 +1857,21 @@ class AopsAdapter(BasePlatformAdapter):
                 await self._ws.send_json(payload)
         return SendResult(success=True, message_id=((payload.get("data") or {}).get("messageId")))
 
-    async def send_reply_event(self, data: dict[str, Any]) -> SendResult:
+    async def send_reply_event(
+        self,
+        data: dict[str, Any],
+        *,
+        send_timeout: float = 15.0,
+        elapsed_ms: int | None = None,
+    ) -> SendResult:
+        send_started = time.monotonic()
         reply_to_id = str(data.get("replyToId") or "").strip()
         if "silent" not in data and reply_to_id:
             reply_flags = self._reply_flags_by_message_id.get(reply_to_id) or {}
             if isinstance(reply_flags.get("silent"), bool):
                 data = {**data, "silent": reply_flags["silent"]}
+        title = self._resolve_outbound_title(data)
+        data = {**data, "title": title}
         if "messageType" not in data:
             data = {
                 **data,
@@ -1265,9 +1881,38 @@ class AopsAdapter(BasePlatformAdapter):
                     else ("silent" if data.get("silent") is True else "common")
                 ),
             }
+        data = _aops_normalize_outbound_protocol_fields(data)
         payload = {"event": "message_reply", "data": data}
-        self._log_wire("info", direction="out", action="ws.send", payload=payload)
-        return await self._send_payload(payload, channel_id=str(data.get("channelId") or ""))
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        if _aops_is_internal_thinking_payload(data):
+            _write_aops_log_line(
+                direction="out",
+                action="message_reply",
+                data=data,
+                raw=payload,
+                session_key=metadata.get("sessionKey"),
+                session_id=data.get("runId") or metadata.get("sessionId"),
+                filtered=True,
+                status="skipped",
+                config=self.config,
+            )
+            return SendResult(success=True, message_id=str(data.get("messageId") or ""))
+        result = await self._send_payload(payload, channel_id=str(data.get("channelId") or ""), timeout=send_timeout)
+        send_elapsed_ms = int((time.monotonic() - send_started) * 1000)
+        _write_aops_log_line(
+            direction="out",
+            action="message_reply",
+            data=data,
+            raw=payload,
+            session_key=metadata.get("sessionKey"),
+            session_id=data.get("runId") or metadata.get("sessionId"),
+            status="ok" if result.success else "failed",
+            error=None if result.success else result.error,
+            elapsed_ms=elapsed_ms,
+            send_elapsed_ms=send_elapsed_ms,
+            config=self.config,
+        )
+        return result
 
     async def send(
         self,
@@ -1286,6 +1931,17 @@ class AopsAdapter(BasePlatformAdapter):
         message_id = str(metadata.get("message_id") or self.create_message_id())
         run_id = metadata.get("run_id")
         kind = str(metadata.get("kind") or "final")
+        message_type = _aops_message_type(metadata=metadata, inherited_silent=inherited_silent)
+        outbound_extra = _aops_outbound_extra_fields(metadata, message_type=message_type)
+        title = self._resolve_outbound_title(
+            {
+                "title": metadata.get("title"),
+                "channelId": chat_id,
+                "runId": run_id,
+                "sessionId": metadata.get("sessionId"),
+                "sessionKey": metadata.get("sessionKey"),
+            }
+        )
         start_payload = {
             "messageId": message_id,
             "seq": 1,
@@ -1294,8 +1950,11 @@ class AopsAdapter(BasePlatformAdapter):
             "channelId": chat_id,
             "conversationEnded": False,
             "ts": _now_ms(),
-            "messageType": _aops_message_type(metadata=metadata, inherited_silent=inherited_silent),
+            "messageType": message_type,
+            "title": title,
         }
+        if outbound_extra:
+            start_payload.update(outbound_extra)
         if reply_to:
             start_payload["replyToId"] = reply_to
         if run_id:
@@ -1314,8 +1973,11 @@ class AopsAdapter(BasePlatformAdapter):
             "text": content,
             "conversationEnded": bool(metadata.get("conversation_ended", True)),
             "ts": _now_ms(),
-            "messageType": _aops_message_type(metadata=metadata, inherited_silent=inherited_silent),
+            "messageType": message_type,
+            "title": title,
         }
+        if outbound_extra:
+            end_payload.update(outbound_extra)
         if reply_to:
             end_payload["replyToId"] = reply_to
         if run_id:
@@ -1341,25 +2003,123 @@ class AopsAdapter(BasePlatformAdapter):
         metadata = metadata or {}
         approval_id = f"exec-approval-{uuid.uuid4().hex[:12]}"
         expires_at_ms = _now_ms() + self._approval_timeout_ms()
-        text = f"Dangerous command requires approval: {description or command}"
-        return await self.send(
-            chat_id=chat_id,
-            content=text,
-            reply_to=metadata.get("reply_to"),
-            metadata={
-                **metadata,
-                "content": [{
-                    "type": "approval",
-                    "id": approval_id,
-                    "approvalKind": "exec",
-                    "allowedActions": ["allow-once", "allow-always", "deny"],
-                    "expiresAtMs": expires_at_ms,
-                    "sessionKey": session_key,
-                    "command": command,
-                    "description": description,
-                }],
-            },
+        message_id = str(metadata.get("message_id") or self.create_message_id())
+        allow_permanent = bool(metadata.get("allow_permanent", True))
+        allowed_actions = (
+            [
+                {"command": "/approve", "display": "仅本次允许"},
+                {"command": "/approve always", "display": "始终允许"},
+                {"command": "/deny", "display": "拒绝"},
+            ]
+            if allow_permanent
+            else [
+                {"command": "/approve", "display": "仅本次允许"},
+                {"command": "/approve session", "display": "本会话允许"},
+                {"command": "/deny", "display": "拒绝"},
+            ]
         )
+        inherited_silent = None
+        reply_to = metadata.get("reply_to")
+        if reply_to:
+            reply_flags = self._reply_flags_by_message_id.get(str(reply_to)) or {}
+            if isinstance(reply_flags.get("silent"), bool):
+                inherited_silent = reply_flags["silent"]
+        command_preview = command[:500] + "..." if len(command) > 500 else command
+        action_hint = "仅本次允许、始终允许同类操作，或拒绝执行" if allow_permanent else "仅本次允许、本会话允许，或拒绝执行"
+        message = (
+            "检测到需要审批的高风险操作。\n\n"
+            f"风险说明：{description or '危险命令'}\n\n"
+            f"待执行命令：\n```sh\n{command_preview}\n```\n\n"
+            f"请选择：{action_hint}。"
+        )
+        payload = {
+            "messageId": message_id,
+            "seq": 1,
+            "phase": "actions",
+            "kind": "approval",
+            "channelId": chat_id,
+            "text": "",
+            "conversationEnded": True,
+            "ts": _now_ms(),
+            "messageType": _aops_message_type(metadata=metadata, inherited_silent=inherited_silent),
+            "content": [{
+                "type": "approval",
+                "id": approval_id,
+                "approvalKind": "exec",
+                "allowedActions": allowed_actions,
+                "expiresAtMs": expires_at_ms,
+                "message": message,
+                "replyContent": message,
+                "sessionKey": session_key,
+                "command": command,
+                "description": description,
+                "allowPermanent": allow_permanent,
+            }],
+        }
+        if reply_to:
+            payload["replyToId"] = reply_to
+        if metadata.get("run_id"):
+            payload["runId"] = metadata["run_id"]
+        if inherited_silent is not None:
+            payload["silent"] = inherited_silent
+        result = await self.send_reply_event(payload)
+        if result.success:
+            result.message_id = message_id
+        return result
+
+    async def send_slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        session_key: str,
+        confirm_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        metadata = metadata or {}
+        message_id = str(metadata.get("message_id") or self.create_message_id())
+        inherited_silent = None
+        reply_to = metadata.get("reply_to")
+        if reply_to:
+            reply_flags = self._reply_flags_by_message_id.get(str(reply_to)) or {}
+            if isinstance(reply_flags.get("silent"), bool):
+                inherited_silent = reply_flags["silent"]
+        payload = {
+            "messageId": message_id,
+            "seq": 1,
+            "phase": "actions",
+            "kind": "approval",
+            "channelId": chat_id,
+            "text": "",
+            "conversationEnded": True,
+            "ts": _now_ms(),
+            "messageType": _aops_message_type(metadata=metadata, inherited_silent=inherited_silent),
+            "content": [{
+                "type": "approval",
+                "id": confirm_id,
+                "approvalKind": "slash",
+                "allowedActions": [
+                    {"command": "/approve", "display": "执行本次"},
+                    {"command": "/always", "display": "始终执行"},
+                    {"command": "/cancel", "display": "取消"},
+                ],
+                "message": message,
+                "replyContent": message,
+                "sessionKey": session_key,
+                "command": title,
+                "description": "slash command confirmation",
+            }],
+        }
+        if reply_to:
+            payload["replyToId"] = reply_to
+        if metadata.get("run_id"):
+            payload["runId"] = metadata["run_id"]
+        if inherited_silent is not None:
+            payload["silent"] = inherited_silent
+        result = await self.send_reply_event(payload)
+        if result.success:
+            result.message_id = message_id
+        return result
 
     def _approval_timeout_ms(self) -> int:
         try:

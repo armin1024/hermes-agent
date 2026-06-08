@@ -184,6 +184,8 @@ cp "$SCRIPT_DIR/install_aops_offline.sh" "$BUNDLE_DIR/install.sh"
 chmod +x "$BUNDLE_DIR/install.sh"
 cp "$SCRIPT_DIR/tec01_oneclick_install.sh" "$BUNDLE_DIR/tec01_oneclick_install.sh"
 chmod +x "$BUNDLE_DIR/tec01_oneclick_install.sh"
+mkdir -p "$BUNDLE_DIR/docs"
+cp "$REPO_ROOT/docs/aops-tec01-command-protocol.md" "$BUNDLE_DIR/docs/aops-tec01-command-protocol.md"
 
 CONTENT_SHA="$(
   cd "$BUNDLE_DIR"

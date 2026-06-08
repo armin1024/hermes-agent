@@ -484,6 +484,12 @@ class TestDeliverResultWrapping:
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
         assert send_mock.call_args.kwargs["metadata"]["message_type"] == "cron"
+        assert send_mock.call_args.kwargs["metadata"]["source"] == "claw"
+        assert send_mock.call_args.kwargs["metadata"]["botReplyExtra"] == {
+            "messageType": "cron",
+            "id": "test-job",
+            "name": "daily-report",
+        }
 
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
@@ -1222,6 +1228,48 @@ class TestRunJobSessionPersistence:
         assert call_args[0][0] == "empty-job"
         assert call_args[0][1] is False  # success should be False
         assert "empty" in call_args[0][2].lower()  # error should mention empty
+
+    def test_tick_appends_structured_history_with_next_run_and_duration(self):
+        from cron.scheduler import tick
+
+        job = {
+            "id": "history-job",
+            "name": "history-test",
+            "prompt": "daily report",
+            "schedule_display": "every 60m",
+            "deliver": "local",
+            "model": "aops-model",
+            "provider": "custom",
+        }
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "报告已生成", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch(
+                 "cron.scheduler.get_job",
+                 return_value={
+                     "next_run_at": "2026-05-08T10:00:00+00:00",
+                     "last_run_at": "2026-05-08T09:00:00+00:00",
+                 },
+             ), \
+             patch("cron.scheduler.append_cron_history") as history_mock:
+            assert tick(verbose=False) == 1
+
+        history_mock.assert_called_once()
+        entry = history_mock.call_args.args[0]
+        assert entry["job_id"] == "history-job"
+        assert entry["job_description"] == "daily report"
+        assert entry["status"] == "ok"
+        assert entry["response_preview"] == "报告已生成"
+        assert entry["duration_ms"] >= 0
+        assert entry["next_run_at"] == "2026-05-08T10:00:00+00:00"
+        assert entry["last_run_at"] == "2026-05-08T09:00:00+00:00"
+        assert entry["model"] == "aops-model"
+        assert entry["provider"] == "custom"
+        assert entry["output_path"] == "/tmp/out.md"
 
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {

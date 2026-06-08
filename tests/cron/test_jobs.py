@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cron.jobs import (
+    audit_cron_jobs,
     parse_duration,
     parse_schedule,
     compute_next_run,
@@ -194,12 +195,20 @@ class TestJobCRUD:
         job = create_job(prompt="Check server status", schedule="30m")
         assert job["id"]
         assert job["prompt"] == "Check server status"
+        assert job["description"] == "Check server status"
         assert job["enabled"] is True
         assert job["schedule"]["kind"] == "once"
 
         fetched = get_job(job["id"])
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
+        assert fetched["description"] == "Check server status"
+
+    def test_create_no_agent_script_job_has_description(self, tmp_cron_dir):
+        job = create_job(prompt="", schedule="every 1h", name="CPU watchdog", script="cpu_watch.sh", no_agent=True)
+
+        assert job["description"] == "CPU watchdog"
+        assert get_job(job["id"])["description"] == "CPU watchdog"
 
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")
@@ -242,6 +251,27 @@ class TestJobCRUD:
     def test_interval_no_auto_repeat(self, tmp_cron_dir):
         job = create_job(prompt="Recurring", schedule="every 1h")
         assert job["repeat"]["times"] is None
+
+    def test_create_repairs_recurring_minute_prompt_from_bare_duration(self, tmp_cron_dir):
+        job = create_job(prompt="每5分钟提醒我检查一次", schedule="5m", repeat=1)
+
+        assert job["schedule"]["kind"] == "interval"
+        assert job["schedule"]["minutes"] == 5
+        assert job["schedule_display"] == "every 5m"
+        assert job["repeat"]["times"] is None
+
+    def test_create_repairs_chinese_recurring_minute_prompt_from_bare_duration(self, tmp_cron_dir):
+        job = create_job(prompt="每隔五分钟提醒我检查一次", schedule="5m")
+
+        assert job["schedule"]["kind"] == "interval"
+        assert job["schedule"]["minutes"] == 5
+        assert job["repeat"]["times"] is None
+
+    def test_create_keeps_after_minutes_prompt_as_one_shot(self, tmp_cron_dir):
+        job = create_job(prompt="5分钟后提醒我检查一次", schedule="5m")
+
+        assert job["schedule"]["kind"] == "once"
+        assert job["repeat"]["times"] == 1
 
     def test_default_delivery_origin(self, tmp_cron_dir):
         job = create_job(
@@ -293,8 +323,10 @@ class TestUpdateJob:
         assert job["enabled"] is True
         updated = update_job(job["id"], {"enabled": False})
         assert updated["enabled"] is False
+        assert updated["next_run_at"] is None
         fetched = get_job(job["id"])
         assert fetched["enabled"] is False
+        assert fetched["next_run_at"] is None
 
     def test_update_nonexistent_returns_none(self, tmp_cron_dir):
         result = update_job("nonexistent_id", {"name": "X"})
@@ -309,6 +341,7 @@ class TestPauseResumeJob:
         assert paused["enabled"] is False
         assert paused["state"] == "paused"
         assert paused["paused_reason"] == "user paused"
+        assert paused["next_run_at"] is None
 
     def test_resume_reenables_job(self, tmp_cron_dir):
         job = create_job(prompt="Resume me", schedule="every 1h")
@@ -439,6 +472,158 @@ class TestMarkJobRun:
         assert job["repeat"]["times"] is None
         mark_job_run(job["id"], success=True)
         assert get_job(job["id"]) is not None
+
+    def test_recurring_repeat_one_is_not_deleted_after_first_run(self, tmp_cron_dir):
+        """Regression: periodic jobs accidentally persisted with repeat=1 must
+        not disappear after their first tick.
+        """
+        job = create_job(prompt="每分钟提醒我站起来", schedule="every 1m", repeat=1)
+        assert job["schedule"]["kind"] == "interval"
+        assert job["repeat"]["times"] == 1
+
+        mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["schedule"]["kind"] == "interval"
+        assert updated["repeat"]["times"] is None
+        assert updated["repeat"]["completed"] == 1
+        assert updated["state"] == "scheduled"
+
+    def test_bare_duration_recurring_intent_survives_first_run(self, tmp_cron_dir):
+        job = create_job(prompt="每3分钟提醒我检查一次", schedule="3m", repeat=1)
+
+        mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["schedule"]["kind"] == "interval"
+        assert updated["repeat"]["times"] is None
+        assert updated["next_run_at"] is not None
+
+    def test_audit_repairs_legacy_once_record_with_recurring_intent(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 6, 3, 10, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        existing_next_run = (now + timedelta(minutes=1)).isoformat()
+        save_jobs([
+            {
+                "id": "legacy-once",
+                "name": "每5分钟提醒我",
+                "prompt": "每5分钟提醒我检查任务状态",
+                "schedule": {"kind": "once", "run_at": (now + timedelta(minutes=5)).isoformat(), "display": "once in 5m"},
+                "schedule_display": "once in 5m",
+                "repeat": {"times": 1, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "next_run_at": existing_next_run,
+                "created_at": now.isoformat(),
+            }
+        ])
+
+        report = audit_cron_jobs(repair=True)
+        repaired = get_job("legacy-once")
+
+        assert report["issues_count"] == 1
+        assert report["issues"][0]["changes"] == ["schedule_once_to_recurring"]
+        assert repaired["schedule"]["kind"] == "interval"
+        assert repaired["schedule"]["minutes"] == 5
+        assert repaired["schedule_display"] == "every 5m"
+        assert repaired["repeat"]["times"] is None
+        assert repaired["next_run_at"] == existing_next_run
+
+    def test_audit_repairs_recurring_repeat_one_before_first_run(self, tmp_cron_dir):
+        save_jobs([
+            {
+                "id": "repeat-one",
+                "name": "Every minute",
+                "prompt": "每分钟提醒我检查任务状态",
+                "schedule": {"kind": "interval", "minutes": 1, "display": "every 1m"},
+                "schedule_display": "every 1m",
+                "repeat": {"times": 1, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+            }
+        ])
+
+        report = audit_cron_jobs(repair=True)
+        repaired = get_job("repeat-one")
+
+        assert report["issues_count"] == 1
+        assert report["issues"][0]["changes"] == ["recurring_repeat_one_to_forever"]
+        assert repaired["schedule"]["kind"] == "interval"
+        assert repaired["repeat"]["times"] is None
+
+    def test_audit_clears_disabled_next_run(self, tmp_cron_dir):
+        save_jobs([
+            {
+                "id": "paused-with-next-run",
+                "name": "Paused",
+                "prompt": "提醒我站起来",
+                "schedule": {"kind": "interval", "minutes": 1, "display": "every 1m"},
+                "schedule_display": "every 1m",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": False,
+                "state": "paused",
+                "next_run_at": "2026-06-05T10:00:00+00:00",
+            }
+        ])
+
+        report = audit_cron_jobs(repair=True)
+        repaired = get_job("paused-with-next-run")
+
+        assert report["issues_count"] == 1
+        assert "disabled_next_run_cleared" in report["issues"][0]["changes"]
+        assert repaired["next_run_at"] is None
+
+    def test_audit_clears_inline_script_and_returns_job_to_agent_mode(self, tmp_cron_dir):
+        save_jobs([
+            {
+                "id": "bad-script",
+                "name": "Bad inline script",
+                "prompt": "汇报 echo 输出",
+                "schedule": {"kind": "interval", "minutes": 1, "display": "every 1m"},
+                "schedule_display": "every 1m",
+                "repeat": {"times": None, "completed": 0},
+                "script": 'echo "hello"',
+                "no_agent": True,
+                "enabled": True,
+                "state": "scheduled",
+            }
+        ])
+
+        report = audit_cron_jobs(repair=True)
+        repaired = get_job("bad-script")
+
+        assert report["issues_count"] == 1
+        assert "bad_script_cleared_no_agent_disabled" in report["issues"][0]["changes"]
+        assert repaired["script"] is None
+        assert repaired["no_agent"] is False
+        assert repaired["enabled"] is True
+
+    def test_audit_disables_inline_script_no_agent_job_without_prompt(self, tmp_cron_dir):
+        save_jobs([
+            {
+                "id": "bad-script-no-prompt",
+                "name": "Bad inline script only",
+                "prompt": "",
+                "schedule": {"kind": "interval", "minutes": 1, "display": "every 1m"},
+                "schedule_display": "every 1m",
+                "repeat": {"times": None, "completed": 0},
+                "script": 'echo "hello"',
+                "no_agent": True,
+                "enabled": True,
+                "state": "scheduled",
+            }
+        ])
+
+        report = audit_cron_jobs(repair=True)
+        repaired = get_job("bad-script-no-prompt")
+
+        assert report["issues_count"] == 1
+        assert "bad_script_disabled_no_agent_job" in report["issues"][0]["changes"]
+        assert repaired["script"] is None
+        assert repaired["enabled"] is False
+        assert repaired["state"] == "error"
 
     def test_error_status(self, tmp_cron_dir):
         job = create_job(prompt="Fail", schedule="every 1h")

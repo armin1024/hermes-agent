@@ -168,6 +168,137 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_repairs_every_minute_from_bare_1m_schedule(self):
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="每分钟提醒我站起来",
+                schedule="1m",
+                repeat=1,
+                name="Stand up",
+            )
+        )
+
+        assert created["success"] is True
+        assert created["schedule"] == "every 1m"
+        assert created["repeat"] == "forever"
+        assert "周期任务" in created["warning"]
+        assert "repeat=1" in created["warning"]
+        stored = get_job(created["job_id"])
+        assert stored["schedule"]["kind"] == "interval"
+        assert stored["repeat"]["times"] is None
+
+    def test_create_repairs_recurring_intent_from_original_user_text(self):
+        from cron.jobs import get_job
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        tokens = set_session_vars(
+            platform="aops",
+            chat_id="conv-1",
+            message_text="帮我创建一个定时任务，一分钟执行一次，提醒我站立",
+        )
+        try:
+            created = json.loads(
+                cronjob(
+                    action="create",
+                    prompt="提醒用户站起来活动一下，避免久坐。",
+                    schedule="1m",
+                    name="站立提醒",
+                )
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert created["success"] is True
+        assert created["schedule"] == "every 1m"
+        assert created["repeat"] == "forever"
+        assert "周期任务" in created["warning"]
+        stored = get_job(created["job_id"])
+        assert stored["schedule"]["kind"] == "interval"
+        assert stored["repeat"]["times"] is None
+
+    def test_create_repairs_every_five_minutes_from_bare_5m_schedule(self):
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="每5分钟提醒我检查任务状态",
+                schedule="5m",
+                repeat=1,
+                name="Task check",
+            )
+        )
+
+        assert created["success"] is True
+        assert created["schedule"] == "every 5m"
+        assert created["repeat"] == "forever"
+        stored = get_job(created["job_id"])
+        assert stored["schedule"]["kind"] == "interval"
+        assert stored["schedule"]["minutes"] == 5
+        assert stored["repeat"]["times"] is None
+
+    def test_create_keeps_after_one_minute_as_one_shot(self):
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="1分钟后提醒我站起来",
+                schedule="1m",
+                name="Stand up once",
+            )
+        )
+
+        assert created["success"] is True
+        assert created["schedule"] == "once in 1m"
+        assert created["repeat"] == "once"
+        assert created["warning"] is None
+        stored = get_job(created["job_id"])
+        assert stored["schedule"]["kind"] == "once"
+        assert stored["repeat"]["times"] == 1
+
+    def test_update_repeat_forever_converts_once_duration_schedule(self):
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="提醒用户站起来活动一下，避免久坐。",
+                schedule="1m",
+                name="站立提醒",
+            )
+        )
+        job_id = created["job_id"]
+
+        updated = json.loads(cronjob(action="update", job_id=job_id, repeat=0))
+
+        assert updated["success"] is True
+        assert updated["job"]["schedule"] == "every 1m"
+        assert updated["job"]["repeat"] == "forever"
+        assert "schedule" in updated["warning"]
+        stored = get_job(job_id)
+        assert stored["schedule"]["kind"] == "interval"
+        assert stored["schedule"]["minutes"] == 1
+        assert stored["repeat"]["times"] is None
+
+    def test_update_repeat_forever_rejects_absolute_once_schedule(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="提醒用户站起来",
+                schedule="2026-06-05T10:00:00+00:00",
+                name="站立提醒",
+            )
+        )
+
+        updated = json.loads(cronjob(action="update", job_id=created["job_id"], repeat=0))
+
+        assert updated["success"] is False
+        assert "Cannot set repeat=forever" in updated["error"]
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 
@@ -187,8 +318,36 @@ class TestUnifiedCronjobTool:
 
         assert listing["success"] is True
         assert listing["jobs"][0]["name"] == "abc123deadbe"
+        assert listing["jobs"][0]["description"] == "abc123deadbe"
         assert listing["jobs"][0]["prompt_preview"] == ""
         assert listing["jobs"][0]["schedule"] == "every 60m"
+
+    def test_audit_action_repairs_legacy_once_and_reports_changes(self):
+        from datetime import datetime, timedelta, timezone
+        from cron.jobs import get_job, save_jobs
+
+        now = datetime(2026, 6, 3, 10, 0, 0, tzinfo=timezone.utc)
+        save_jobs([
+            {
+                "id": "legacy-once",
+                "name": "每5分钟提醒我",
+                "prompt": "每5分钟提醒我检查状态",
+                "schedule": {"kind": "once", "run_at": (now + timedelta(minutes=5)).isoformat(), "display": "once in 5m"},
+                "schedule_display": "once in 5m",
+                "repeat": {"times": 1, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+            }
+        ])
+
+        result = json.loads(cronjob(action="audit"))
+        repaired = get_job("legacy-once")
+
+        assert result["success"] is True
+        assert result["issues_count"] == 1
+        assert result["repaired"] is True
+        assert repaired["schedule"]["kind"] == "interval"
+        assert repaired["repeat"]["times"] is None
 
     def test_pause_and_resume(self):
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
@@ -356,3 +515,16 @@ class TestUnifiedCronjobTool:
         assert updated["success"] is True
         stored = get_job(created["job_id"])
         assert stored["deliver"] == "telegram"
+
+    def test_create_rejects_inline_script_command(self):
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="Monitor things",
+                schedule="every 1h",
+                script='echo "hello"',
+            )
+        )
+
+        assert result["success"] is False
+        assert "inline shell command" in result["error"]

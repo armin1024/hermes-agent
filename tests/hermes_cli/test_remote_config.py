@@ -66,7 +66,8 @@ def test_remote_config_applies_allowed_fields(tmp_path, monkeypatch):
     assert env["AOPS_API_KEY"] == "api-key-1"
     assert env["AOPS_CONNECT_TIMEOUT"] == "90"
     assert env["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] == "90"
-    assert env["OPENAI_API_KEY"] == "model-key-1"
+    assert env["MODEL_GATEWAY_API_KEY"] == "model-key-1"
+    assert "OPENAI_API_KEY" not in env
     assert env["HINDSIGHT_API_KEY"] == "hindsight-key-1"
     assert env["HINDSIGHT_API_URL"] == "http://hindsight.example"
 
@@ -74,6 +75,7 @@ def test_remote_config_applies_allowed_fields(tmp_path, monkeypatch):
     assert cfg["model"]["provider"] == "custom"
     assert cfg["model"]["base_url"] == "http://llm.example/v1"
     assert cfg["model"]["default"] == "qwen3-32b"
+    assert cfg["model"]["api_key_env"] == "MODEL_GATEWAY_API_KEY"
     assert cfg["approvals"]["mode"] == "off"
     assert cfg["display"]["busy_input_mode"] == "queue"
     assert cfg["memory"]["provider"] == "hindsight"
@@ -142,15 +144,48 @@ def test_remote_config_preserves_existing_values_by_default(tmp_path, monkeypatc
     env = load_env()
     assert env["AOPS_BOT_URL"] == "http://old-aops"
     assert env["OPENAI_API_KEY"] == "old-key"
+    assert env["MODEL_GATEWAY_API_KEY"] == "new-key"
     cfg = load_config()
     assert cfg["model"]["base_url"] == "http://old-llm/v1"
     assert cfg["model"]["default"] == "old-model"
+    assert cfg["model"]["api_key_env"] == "MODEL_GATEWAY_API_KEY"
     assert cfg["approvals"]["mode"] == "smart"
     assert (tmp_path / "memories" / "USER.md").read_text(encoding="utf-8") == "existing user prompt\n"
     assert json.loads((tmp_path / "hindsight" / "config.json").read_text(encoding="utf-8"))["api_url"] == "http://old-hindsight"
-    assert result["envChanged"] == []
+    assert result["envChanged"] == ["MODEL_GATEWAY_API_KEY"]
     assert result["userInstructions"] is None
     assert result["hindsight"] is None
+
+
+def test_remote_config_preserves_existing_model_gateway_key_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text(
+        "OPENAI_API_KEY=openai-key\nMODEL_GATEWAY_API_KEY=old-model-gateway-key\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "options": {"upgrade": True},
+        "config": {
+            "modelGateway": {
+                "baseUrl": "http://llm.example/v1",
+                "model": "qwen3-32b",
+                "apiKey": "new-model-gateway-key",
+            },
+        },
+    }
+    path = tmp_path / "task.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    from hermes_cli.remote_config import apply_payload
+    from hermes_cli.config import load_config, load_env
+
+    result = apply_payload(str(path), skip_skills=True)
+
+    env = load_env()
+    assert env["OPENAI_API_KEY"] == "openai-key"
+    assert env["MODEL_GATEWAY_API_KEY"] == "old-model-gateway-key"
+    assert load_config()["model"]["api_key_env"] == "MODEL_GATEWAY_API_KEY"
+    assert "MODEL_GATEWAY_API_KEY" not in result["envChanged"]
 
 
 def test_remote_config_overwrites_existing_values_when_requested(tmp_path, monkeypatch):

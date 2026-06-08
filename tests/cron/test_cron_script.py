@@ -69,6 +69,12 @@ class TestJobScriptField:
         job = create_job(prompt="Hello", schedule="every 1h", script="  ")
         assert job.get("script") is None
 
+    def test_create_job_rejects_inline_script_command(self, cron_env):
+        from cron.jobs import create_job
+
+        with pytest.raises(ValueError, match="inline shell command"):
+            create_job(prompt="Hello", schedule="every 1h", script='echo "hello"')
+
     def test_update_job_add_script(self, cron_env):
         from cron.jobs import create_job, update_job
 
@@ -86,6 +92,13 @@ class TestJobScriptField:
 
         updated = update_job(job["id"], {"script": None})
         assert updated.get("script") is None
+
+    def test_update_job_rejects_inline_script_command(self, cron_env):
+        from cron.jobs import create_job, update_job
+
+        job = create_job(prompt="Hello", schedule="every 1h")
+        with pytest.raises(ValueError, match="inline shell command"):
+            update_job(job["id"], {"script": 'echo "hello"'})
 
 
 class TestRunJobScript:
@@ -449,6 +462,19 @@ class TestCronjobToolScriptValidation:
         ))
         assert result["success"] is True
         assert result["job"]["script"] == "monitor.py"
+
+    def test_create_with_inline_script_command_rejected(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+            script='echo "hello"',
+        ))
+        assert result["success"] is False
+        assert "inline shell command" in result["error"]
 
     def test_update_with_absolute_script_rejected(self, cron_env, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
