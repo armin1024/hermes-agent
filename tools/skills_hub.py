@@ -3196,7 +3196,7 @@ def parallel_search_sources(
 
     for src in sources:
         sid = src.source_id()
-        if source_filter != "all" and sid != source_filter and sid != "official":
+        if source_filter != "all" and sid != source_filter:
             continue
         # Skip external API sources when the index covers them
         if _index_available and sid in _api_source_ids:

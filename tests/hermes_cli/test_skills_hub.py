@@ -264,6 +264,44 @@ def test_handle_skills_slash_search_accepts_chatconsole_without_status_errors():
         handle_skills_slash("/skills search kubernetes", console=ChatConsole())
 
 
+def test_handle_skills_slash_search_defaults_to_clawhub_and_preserves_empty_query():
+    calls = []
+
+    def _fake_search(query, sources, source_filter="all", limit=10):
+        calls.append((query, source_filter, limit))
+        return []
+
+    with patch("tools.skills_hub.unified_search", side_effect=_fake_search), \
+         patch("tools.skills_hub.create_source_router", return_value={}), \
+         patch("tools.skills_hub.GitHubAuth"):
+        handle_skills_slash('/skills search ""', console=ChatConsole())
+
+    assert calls == [("", "clawhub", 10)]
+
+
+def test_do_install_short_name_defaults_to_clawhub(monkeypatch, hub_env):
+    import tools.skills_hub as hub
+    import hermes_cli.skills_hub as cli_hub
+
+    calls = []
+
+    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
+    fake_source = type("Source", (), {"source_id": lambda self: "clawhub"})()
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [fake_source])
+
+    def _fake_resolve(name, sources, console, source="all"):
+        calls.append((name, source))
+        return ""
+
+    monkeypatch.setattr(cli_hub, "_resolve_short_name", _fake_resolve)
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    cli_hub.do_install("comment-context", console=console, skip_confirm=True)
+
+    assert calls == [("comment-context", "clawhub")]
+
+
 def test_do_install_scans_with_resolved_identifier(monkeypatch, tmp_path, hub_env):
     import tools.skills_guard as guard
     import tools.skills_hub as hub

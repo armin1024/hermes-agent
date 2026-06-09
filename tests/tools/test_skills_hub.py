@@ -1333,6 +1333,22 @@ class TestUnifiedSearchDedup:
         assert len(results) == 1
         assert results[0].name == "s1"
 
+    def test_source_filter_does_not_include_official(self):
+        official = SkillMeta(name="official-skill", description="d",
+                             source="official", identifier="official/x",
+                             trust_level="builtin")
+        clawhub = SkillMeta(name="clawhub-skill", description="d",
+                            source="clawhub", identifier="clawhub/y",
+                            trust_level="community")
+        src_official = self._make_source("official", [official])
+        src_clawhub = self._make_source("clawhub", [clawhub])
+        results = unified_search(
+            "query",
+            [src_official, src_clawhub],
+            source_filter="clawhub",
+        )
+        assert [r.source for r in results] == ["clawhub"]
+
     def test_limit_respected(self):
         skills = [
             SkillMeta(name=f"s{i}", description="d", source="a",

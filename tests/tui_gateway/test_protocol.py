@@ -560,7 +560,7 @@ def test_skills_manage_search_uses_tools_hub_sources(server):
     }
     auth.assert_called_once_with()
     router.assert_called_once_with("auth")
-    search.assert_called_once_with("showroom", ["source"], source_filter="all", limit=20)
+    search.assert_called_once_with("showroom", ["source"], source_filter="clawhub", limit=20)
 
 
 def test_command_dispatch_steer_fallback_sends_message(server):

@@ -10842,7 +10842,7 @@ Examples:
     skills_search.add_argument("query", help="Search query")
     skills_search.add_argument(
         "--source",
-        default="all",
+        default="clawhub",
         choices=[
             "all",
             "official",
@@ -10870,7 +10870,7 @@ Examples:
     )
     skills_install.add_argument(
         "--source",
-        default="all",
+        default="clawhub",
         help="Resolve short skill names against a specific source, e.g. clawhub",
     )
     skills_install.add_argument(

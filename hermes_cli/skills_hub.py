@@ -12,6 +12,7 @@ handler are thin wrappers that parse args and delegate.
 
 import json
 import re
+import shlex
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -25,6 +26,8 @@ from rich.table import Table
 from hermes_constants import display_hermes_home
 
 _console = Console()
+
+DEFAULT_SKILLS_SOURCE = "clawhub"
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +77,8 @@ def _resolve_short_name(name: str, sources, console: Console, source: str = "all
         c.print()
         return ""
 
-    c.print(f"[bold red]Error:[/] No skill named '{name}' found in any source.\n")
+    source_label = "any source" if source == "all" else source
+    c.print(f"[bold red]Error:[/] No skill named '{name}' found in {source_label}.\n")
     return ""
 
 
@@ -239,7 +243,7 @@ def _prompt_for_category(c: Console, existing: List[str]) -> str:
     return answer
 
 
-def do_search(query: str, source: str = "all", limit: int = 10,
+def do_search(query: str, source: str = DEFAULT_SKILLS_SOURCE, limit: int = 10,
               console: Optional[Console] = None) -> None:
     """Search registries and display results as a Rich table."""
     from tools.skills_hub import GitHubAuth, create_source_router, unified_search
@@ -282,8 +286,6 @@ def do_search(query: str, source: str = "all", limit: int = 10,
 def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
               console: Optional[Console] = None) -> None:
     """Browse all available skills across registries, paginated.
-
-    Official skills are always shown first, regardless of source filter.
     """
     from tools.skills_hub import (
         GitHubAuth, create_source_router, parallel_search_sources,
@@ -409,7 +411,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True,
                name_override: str = "",
-               source: str = "all") -> None:
+               source: str = DEFAULT_SKILLS_SOURCE) -> None:
     """Fetch, quarantine, scan, confirm, and install a skill.
 
     ``name_override`` lets non-interactive callers (slash commands, gateway,
@@ -428,10 +430,13 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     c = console or _console
     ensure_hub_dirs()
 
-    # Resolve which source adapter handles this identifier
+    # Source filters only apply to short-name resolution. Full identifiers
+    # such as official/foo/bar, github/owner/repo/path, or direct URLs already
+    # carry enough routing information for the source adapters.
     auth = GitHubAuth()
     sources = create_source_router(auth)
-    if source and source != "all":
+    is_short_name = "/" not in identifier
+    if is_short_name and source and source != "all":
         filtered_sources = [src for src in sources if src.source_id() == source]
         if not filtered_sources:
             c.print(f"[bold red]Error:[/] Unknown skill source '{source}'.\n")
@@ -439,7 +444,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         sources = filtered_sources
 
     # If identifier looks like a short name (no slashes), resolve it via search
-    if "/" not in identifier:
+    if is_short_name:
         identifier = _resolve_short_name(identifier, sources, c, source=source)
         if not identifier:
             return
@@ -697,7 +702,7 @@ def browse_skills(page: int = 1, page_size: int = 20, source: str = "all") -> di
     all_results: list = []
     for src in sources:
         sid = src.source_id()
-        if source != "all" and sid != source and sid != "official":
+        if source != "all" and sid != source:
             continue
         try:
             limit = _PER_SOURCE_LIMIT.get(sid, 50)
@@ -1403,7 +1408,10 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         /skills tap remove owner/repo
     """
     c = console or _console
-    parts = cmd.strip().split()
+    try:
+        parts = shlex.split(cmd.strip())
+    except ValueError:
+        parts = cmd.strip().split()
 
     # Strip the leading "/skills" if present
     if parts and parts[0].lower() == "/skills":
@@ -1443,9 +1451,9 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
 
     elif action == "search":
         if not args:
-            c.print("[bold red]Usage:[/] /skills search <query> [--source skills-sh|well-known|github|official] [--limit N]\n")
+            c.print("[bold red]Usage:[/] /skills search <query> [--source clawhub|all|skills-sh|well-known|github|official] [--limit N]\n")
             return
-        source = "all"
+        source = DEFAULT_SKILLS_SOURCE
         limit = 10
         query_parts = []
         i = 0
@@ -1466,12 +1474,12 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
 
     elif action == "install":
         if not args:
-            c.print("[bold red]Usage:[/] /skills install <identifier-or-url> [--name <name>] [--category <cat>] [--force] [--now]\n")
+            c.print("[bold red]Usage:[/] /skills install <identifier-or-url> [--source clawhub|all|skills-sh|well-known|github|official] [--name <name>] [--category <cat>] [--force] [--now]\n")
             return
         identifier = args[0]
         category = ""
         name_override = ""
-        source = "all"
+        source = DEFAULT_SKILLS_SOURCE
         # Slash commands run inside prompt_toolkit where input() hangs.
         # Always skip confirmation — the user typing the command is implicit consent.
         skip_confirm = True
