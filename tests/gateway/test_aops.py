@@ -2601,11 +2601,11 @@ async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_aops_toolsets_list_returns_profile_config_json(monkeypatch, tmp_path):
+async def test_aops_toolsets_list_returns_dashboard_config_json(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import hermes_cli.config as hermes_config
 
-    hermes_config.save_config({"platform_toolsets": {"aops": ["web", "terminal"]}})
+    hermes_config.save_config({"platform_toolsets": {"cli": ["web", "terminal"]}})
     runner = _make_runner(extra={"dm_policy": "open"})
 
     result = await runner._handle_message(_make_silent_aops_event("/toolsets list"))
@@ -2629,7 +2629,24 @@ async def test_aops_toolsets_list_returns_profile_config_json(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_aops_toolsets_set_updates_aops_platform_config(monkeypatch, tmp_path):
+async def test_aops_toolsets_list_falls_back_to_legacy_aops_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_cli.config as hermes_config
+
+    hermes_config.save_config({"platform_toolsets": {"aops": ["web", "terminal"]}})
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/toolsets list"))
+
+    payload = json.loads(result)
+    assert payload["ok"] is True
+    items_by_name = {item["name"]: item for item in payload["items"]}
+    assert items_by_name["web"]["enabled"] is True
+    assert items_by_name["terminal"]["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_aops_toolsets_set_updates_dashboard_and_legacy_platform_config(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import hermes_cli.config as hermes_config
 
@@ -2646,8 +2663,49 @@ async def test_aops_toolsets_set_updates_aops_platform_config(monkeypatch, tmp_p
     assert payload["items"][0]["name"] == "web"
     assert payload["items"][0]["enabled"] is True
     cfg = hermes_config.load_config()
+    assert "web" in cfg["platform_toolsets"]["cli"]
+    assert "terminal" in cfg["platform_toolsets"]["cli"]
     assert "web" in cfg["platform_toolsets"]["aops"]
     assert "terminal" in cfg["platform_toolsets"]["aops"]
+
+
+@pytest.mark.asyncio
+async def test_aops_run_agent_uses_dashboard_toolset_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"provider": "openai", "api_key": "key", "base_url": "https://example.com", "api_mode": "responses"},
+    )
+    import hermes_cli.config as hermes_config
+
+    hermes_config.save_config({"platform_toolsets": {"cli": ["terminal"], "aops": ["web", "terminal"]}})
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    _CapturingAgent.last_init = None
+    runner = _make_runner(platform=Platform.AOPS, extra={})
+    runner.config = GatewayConfig(platforms={})
+    source = SessionSource(platform=Platform.AOPS, chat_id="chat", chat_name="AOPS", chat_type="dm", user_id="user-1")
+
+    result = await runner._run_agent(
+        message="ping",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="session-1",
+        session_key="agent:main:aops:dm",
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init is not None
+    enabled_toolsets = set(_CapturingAgent.last_init["enabled_toolsets"])
+    assert "terminal" in enabled_toolsets
+    assert "web" not in enabled_toolsets
 
 
 @pytest.mark.asyncio

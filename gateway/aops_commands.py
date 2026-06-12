@@ -1119,17 +1119,17 @@ def _toolset_list_data() -> tuple[list[dict[str, Any]], dict[str, Any], set[str]
     from hermes_cli.config import load_config
     from hermes_cli.tools_config import (
         _get_effective_configurable_toolsets,
-        _get_platform_tools,
+        _get_aops_dashboard_toolsets,
         _toolset_allowed_for_platform,
         _toolset_has_keys,
     )
 
     cfg = load_config()
-    enabled = _get_platform_tools(cfg, "aops", include_default_mcp_servers=False)
+    enabled = _get_aops_dashboard_toolsets(cfg, include_default_mcp_servers=False)
     definitions = {
         name: (label, description)
         for name, label, description in _get_effective_configurable_toolsets()
-        if _toolset_allowed_for_platform(name, "aops")
+        if _toolset_allowed_for_platform(name, "cli")
     }
     items: list[dict[str, Any]] = []
     for name in sorted(definitions):
@@ -1154,7 +1154,7 @@ def _toolset_list_data() -> tuple[list[dict[str, Any]], dict[str, Any], set[str]
 
 def _toolsets_command(command_text: str, event: MessageEvent, args: list[str]) -> str:
     from hermes_cli.config import load_config
-    from hermes_cli.tools_config import _save_platform_tools
+    from hermes_cli.tools_config import _save_aops_dashboard_toolsets
 
     action = str(args[0] if args else "list").strip().lower().replace("_", "-")
     if action in {"", "list"}:
@@ -1225,7 +1225,7 @@ def _toolsets_command(command_text: str, event: MessageEvent, args: list[str]) -
         updated_enabled.add(target)
     else:
         updated_enabled.discard(target)
-    _save_platform_tools(cfg, "aops", updated_enabled)
+    _save_aops_dashboard_toolsets(cfg, updated_enabled)
 
     items, summary, _enabled_after, _definitions_after = _toolset_list_data()
     updated_item = [item for item in items if item.get("name") == target]

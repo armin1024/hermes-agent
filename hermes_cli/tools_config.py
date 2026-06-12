@@ -1292,6 +1292,36 @@ def _get_platform_tools(
     return enabled_toolsets
 
 
+def _has_platform_toolset_config(config: dict, platform: str) -> bool:
+    platform_toolsets = config.get("platform_toolsets") or {}
+    return isinstance(platform_toolsets, dict) and isinstance(platform_toolsets.get(platform), list)
+
+
+def _get_aops_dashboard_toolsets(
+    config: dict,
+    *,
+    include_default_mcp_servers: bool = True,
+) -> Set[str]:
+    """Resolve AOPS toolsets from the dashboard-compatible CLI state.
+
+    AOPS used to store its switches under ``platform_toolsets.aops``.  The
+    dashboard uses ``platform_toolsets.cli`` by default, so new AOPS reads use
+    CLI when present and only fall back to the legacy AOPS key.
+    """
+    platform = "cli" if _has_platform_toolset_config(config, "cli") else "aops"
+    return _get_platform_tools(
+        config,
+        platform,
+        include_default_mcp_servers=include_default_mcp_servers,
+    )
+
+
+def _save_aops_dashboard_toolsets(config: dict, enabled_toolset_keys: Set[str]):
+    """Save AOPS switches to the dashboard source and mirror legacy AOPS."""
+    _save_platform_tools(config, "cli", enabled_toolset_keys)
+    _save_platform_tools(config, "aops", enabled_toolset_keys)
+
+
 def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[str]):
     """Save the selected toolset keys for a platform to config.
 

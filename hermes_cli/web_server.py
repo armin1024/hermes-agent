@@ -2683,12 +2683,46 @@ def _resolve_profile_dir(name: str) -> Path:
     """Validate ``name`` and resolve to its directory or raise an HTTPException."""
     from hermes_cli import profiles as profiles_mod
     try:
+        name = profiles_mod.normalize_profile_name(name)
         profiles_mod.validate_profile_name(name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not profiles_mod.profile_exists(name):
         raise HTTPException(status_code=404, detail=f"Profile '{name}' does not exist.")
     return profiles_mod.get_profile_dir(name)
+
+
+def _load_toolsets_config_for_profile(profile: str) -> dict:
+    """Load config for a dashboard profile selector.
+
+    A profile-specific dashboard already runs with HERMES_HOME pointed at that
+    profile, so the safest default is always the current process config.  The
+    explicit profile query parameter remains useful for cross-profile
+    inspection from a default dashboard.
+    """
+    profile_key = str(profile or "current").strip()
+    if not profile_key or profile_key in {"current", "active"}:
+        return load_config()
+
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        requested = profiles_mod.normalize_profile_name(profile_key)
+        current = profiles_mod.get_active_profile_name()
+    except Exception:
+        requested = profile_key
+        current = "current"
+
+    if requested == current:
+        return load_config()
+
+    profile_dir = _resolve_profile_dir(requested)
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        return {}
+    with config_path.open("r", encoding="utf-8") as f:
+        loaded = yaml.safe_load(f) or {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def _profile_setup_command(name: str) -> str:
@@ -2888,7 +2922,7 @@ async def toggle_skill(body: SkillToggle):
 
 
 @app.get("/api/tools/toolsets")
-async def get_toolsets():
+async def get_toolsets(platform: str = "cli", profile: str = "current"):
     from hermes_cli.tools_config import (
         _get_effective_configurable_toolsets,
         _get_platform_tools,
@@ -2896,10 +2930,11 @@ async def get_toolsets():
     )
     from toolsets import resolve_toolset
 
-    config = load_config()
+    platform_key = str(platform or "cli").strip().lower() or "cli"
+    config = _load_toolsets_config_for_profile(profile)
     enabled_toolsets = _get_platform_tools(
         config,
-        "cli",
+        platform_key,
         include_default_mcp_servers=False,
     )
     result = []

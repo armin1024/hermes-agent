@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useState, useMemo } from "react";
+import { useCallback, useEffect, useLayoutEffect, useState, useMemo } from "react";
 import {
   Package,
   Search,
@@ -94,6 +94,13 @@ function toolsetIcon(
 /* ------------------------------------------------------------------ */
 
 export default function SkillsPage() {
+  const { toolsetPlatform, toolsetProfile } = useMemo(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    return {
+      toolsetPlatform: urlParams.get("platform") || undefined,
+      toolsetProfile: urlParams.get("profile") || undefined,
+    };
+  }, []);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [toolsets, setToolsets] = useState<ToolsetInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -105,15 +112,45 @@ export default function SkillsPage() {
   const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
 
+  const loadToolsets = useCallback(async () => {
+    const tsets = await api.getToolsets({
+      platform: toolsetPlatform,
+      profile: toolsetProfile,
+    });
+    setToolsets(tsets);
+  }, [toolsetPlatform, toolsetProfile]);
+
   useEffect(() => {
-    Promise.all([api.getSkills(), api.getToolsets()])
-      .then(([s, tsets]) => {
-        setSkills(s);
-        setToolsets(tsets);
+    let cancelled = false;
+    setLoading(true);
+    api.getSkills()
+      .then((s) => {
+        if (!cancelled) setSkills(s);
       })
       .catch(() => showToast(t.common.loading, "error"))
-      .finally(() => setLoading(false));
-  }, []);
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    loadToolsets().catch(() => showToast(t.common.loading, "error"));
+    return () => {
+      cancelled = true;
+    };
+  }, [loadToolsets, showToast, t.common.loading]);
+
+  useEffect(() => {
+    if (view !== "toolsets") return;
+    void loadToolsets().catch(() => showToast(t.common.loading, "error"));
+  }, [loadToolsets, showToast, t.common.loading, view]);
+
+  useEffect(() => {
+    const onFocus = () => {
+      if (view === "toolsets") {
+        void loadToolsets().catch(() => showToast(t.common.loading, "error"));
+      }
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [loadToolsets, showToast, t.common.loading, view]);
 
   /* ---- Toggle skill ---- */
   const handleToggleSkill = async (skill: SkillInfo) => {

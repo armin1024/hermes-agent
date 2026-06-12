@@ -203,7 +203,13 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, enabled }),
     }),
-  getToolsets: () => fetchJSON<ToolsetInfo[]>("/api/tools/toolsets"),
+  getToolsets: (params?: { platform?: string; profile?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.platform) qs.set("platform", params.platform);
+    if (params?.profile) qs.set("profile", params.profile);
+    const query = qs.toString();
+    return fetchJSON<ToolsetInfo[]>(`/api/tools/toolsets${query ? `?${query}` : ""}`);
+  },
 
   // Session search (FTS5)
   searchSessions: (q: string) =>

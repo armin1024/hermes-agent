@@ -931,6 +931,105 @@ class TestNewEndpoints:
             },
         ]
 
+    def test_toolsets_list_accepts_aops_platform_and_default_profile(self, monkeypatch, tmp_path):
+        import hermes_cli.tools_config as tools_config
+        import hermes_cli.web_server as web_server
+
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir(parents=True)
+        (default_home / "config.yaml").write_text(
+            "platform_toolsets:\n  aops:\n    - web\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(
+            web_server,
+            "load_config",
+            lambda: {"platform_toolsets": {"aops": ["web"]}},
+        )
+        monkeypatch.setattr(web_server, "_resolve_profile_dir", lambda name: default_home)
+        monkeypatch.setattr(
+            tools_config,
+            "_get_effective_configurable_toolsets",
+            lambda: [
+                ("web", "Web", "web_search"),
+                ("terminal", "Terminal", "terminal"),
+            ],
+        )
+
+        resp = self.client.get("/api/tools/toolsets?platform=aops&profile=default")
+
+        assert resp.status_code == 200
+        by_name = {item["name"]: item for item in resp.json()}
+        assert by_name["web"]["enabled"] is True
+        assert by_name["terminal"]["enabled"] is False
+
+    def test_toolsets_list_accepts_aops_platform_and_named_profile(self, monkeypatch, tmp_path):
+        import hermes_cli.tools_config as tools_config
+        import hermes_cli.web_server as web_server
+
+        default_home = tmp_path / ".hermes"
+        profile_home = default_home / "profiles" / "ops-1"
+        default_home.mkdir(parents=True)
+        profile_home.mkdir(parents=True)
+        (default_home / "config.yaml").write_text(
+            "platform_toolsets:\n  aops:\n    - web\n",
+            encoding="utf-8",
+        )
+        (profile_home / "config.yaml").write_text(
+            "platform_toolsets:\n  aops:\n    - terminal\n",
+            encoding="utf-8",
+        )
+
+        def fake_resolve_profile_dir(name):
+            return default_home if name == "default" else profile_home
+
+        monkeypatch.setattr(web_server, "_resolve_profile_dir", fake_resolve_profile_dir)
+        monkeypatch.setattr(
+            tools_config,
+            "_get_effective_configurable_toolsets",
+            lambda: [
+                ("web", "Web", "web_search"),
+                ("terminal", "Terminal", "terminal"),
+            ],
+        )
+
+        resp = self.client.get("/api/tools/toolsets?platform=aops&profile=ops-1")
+
+        assert resp.status_code == 200
+        by_name = {item["name"]: item for item in resp.json()}
+        assert by_name["web"]["enabled"] is False
+        assert by_name["terminal"]["enabled"] is True
+
+    def test_toolsets_list_uses_current_profile_when_query_matches_active_profile(self, monkeypatch, tmp_path):
+        import hermes_cli.profiles as profiles_mod
+        import hermes_cli.tools_config as tools_config
+        import hermes_cli.web_server as web_server
+
+        current_config = {"platform_toolsets": {"cli": ["web"]}}
+        monkeypatch.setattr(web_server, "load_config", lambda: current_config)
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "ops-1")
+        monkeypatch.setattr(
+            tools_config,
+            "_get_effective_configurable_toolsets",
+            lambda: [
+                ("web", "Web", "web_search"),
+                ("terminal", "Terminal", "terminal"),
+            ],
+        )
+
+        def should_not_resolve(_name):
+            raise AssertionError("matching active profile should use current HERMES_HOME")
+
+        monkeypatch.setattr(web_server, "_resolve_profile_dir", should_not_resolve)
+
+        resp = self.client.get("/api/tools/toolsets?profile=ops-1")
+
+        assert resp.status_code == 200
+        by_name = {item["name"]: item for item in resp.json()}
+        assert by_name["web"]["enabled"] is True
+        assert by_name["terminal"]["enabled"] is False
+
     def test_config_raw_get(self):
         resp = self.client.get("/api/config/raw")
         assert resp.status_code == 200

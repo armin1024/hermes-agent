@@ -161,8 +161,8 @@ AOPS 上游统一通过 `send_message` 静默消息调用本地命令：
 - `/model list`：从当前模型网关 `/models` 读取可用模型。
 - `/model status`、`/model current`：返回当前生效模型，不请求模型网关。
 - `/model use <provider> <model>`：切换当前 AOPS channel + agent 的模型偏好，并同步更新当前 profile 的 `config.yaml`。
-- `/toolsets list`：返回当前 profile 的 AOPS 工具集开关状态。
-- `/toolsets enable <name>`、`/toolsets disable <name>`、`/toolsets set <name> <true|false>`：修改当前 profile 的 `config.yaml platform_toolsets.aops`，立即影响后续任务。
+- `/toolsets list`：返回当前 profile 的工具集开关状态，与 dashboard 默认 Toolsets 页面使用同一状态源。
+- `/toolsets enable <name>`、`/toolsets disable <name>`、`/toolsets set <name> <true|false>`：修改当前 profile 的 `config.yaml platform_toolsets.cli`，并同步镜像到历史兼容键 `platform_toolsets.aops`，立即影响后续新任务。
 - `/skills`、`/skills list`：返回已安装技能和命令缓存。
 - `/cron`、`/cron list`：返回计划任务。
 - `/cron remove <id|name>`：按任务 ID 或唯一任务名删除计划任务。
@@ -236,14 +236,24 @@ AOPS 上游统一通过 `send_message` 静默消息调用本地命令：
 
 ## Toolsets 接口
 
-工具集配置按 Hermes profile 独立生效，写入当前 profile 的 `config.yaml`：
+工具集配置按 Hermes profile 独立生效，AOPS 与 dashboard 默认 Toolsets 页面共享当前 profile 的 `config.yaml platform_toolsets.cli`：
 
 ```yaml
 platform_toolsets:
+  cli:
+    - web
+    - terminal
+  # 兼容旧 AOPS 读取逻辑；/toolsets set 会同步镜像该键。
   aops:
-    web: true
-    terminal: false
+    - web
+    - terminal
 ```
+
+兼容规则：
+
+- 读取时优先使用 `platform_toolsets.cli`。
+- 如果历史配置只有 `platform_toolsets.aops`，`/toolsets list` 和 AOPS 新任务会 fallback 读取该旧键。
+- 写入时同时更新 `platform_toolsets.cli` 和 `platform_toolsets.aops`。
 
 `/toolsets list` 返回示例：
 
@@ -284,7 +294,20 @@ platform_toolsets:
 }
 ```
 
-`configured=false` 表示工具集缺少 API key 或运行依赖，前端应展示“需要配置”，但不阻止开关操作。开关修改立即写配置，后续新任务生效；已在运行中的 agent turn 不强制中断。
+`configured=false` 表示工具集缺少 API key 或运行依赖，前端应展示“需要配置”，但不阻止开关操作。开关修改立即写配置，AOPS gateway 每个新用户 query/new turn 都会重新读取 `config.yaml`，因此下一条用户消息立即生效；已在运行中的 agent turn 不强制中断或热替换。
+
+Hermes dashboard 的普通 Toolsets 页面默认读取同一份 `platform_toolsets.cli` 状态，因此 AOPS `/toolsets set web false` 后，刷新或重新进入 dashboard Toolsets 页面即可看到 `web.enabled=false`。
+
+Dashboard API 仍支持显式读取指定 platform/profile，主要用于诊断或 profile 显式查看：
+
+```http
+GET /api/tools/toolsets?platform=aops&profile=<profile>
+```
+
+- `profile=default` 读取 `~/.hermes/config.yaml`。
+- `profile=<name>` 读取 `~/.hermes/profiles/<name>/config.yaml`。
+- 不传参数时 dashboard 保持原有行为，读取当前 dashboard profile 的 `platform_toolsets.cli`。
+- AOPS `/toolsets` 与普通 dashboard 一致性不依赖 `platform=aops` 查询参数；它们共享 `platform_toolsets.cli`。
 
 ## 审批接口
 

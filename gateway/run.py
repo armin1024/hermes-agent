@@ -940,6 +940,14 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _enabled_toolsets_for_platform(user_config: dict, platform: "Platform") -> list[str]:
+    from hermes_cli.tools_config import _get_aops_dashboard_toolsets, _get_platform_tools
+
+    if platform == Platform.AOPS:
+        return sorted(_get_aops_dashboard_toolsets(user_config))
+    return sorted(_get_platform_tools(user_config, _platform_config_key(platform)))
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -10964,10 +10972,7 @@ class GatewayRunner:
                 )
                 return
 
-            platform_key = _platform_config_key(source.platform)
-
-            from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = _enabled_toolsets_for_platform(user_config, source.platform)
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -14924,9 +14929,7 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
-
-        from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = _enabled_toolsets_for_platform(user_config, source.platform)
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
