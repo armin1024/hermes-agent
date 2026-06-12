@@ -1,5 +1,7 @@
 # AOPS Tec01 命令与审批对接说明
 
+> 当前 AOPS channel 的完整接口文档以 `docs/aops-channel-interface.md` 为准。本文保留为 Tec01 命令与审批专题说明；后续功能更新必须同步更新主接口文档。
+
 本文说明 Tec01 前后端通过 AOPS channel 对接 Hermes 后端时，模型切换、安全策略切换和审批卡片的协议约定。
 
 ## 1. 审批消息

@@ -2788,8 +2788,10 @@ class BasePlatformAdapter(ABC):
             response = await self._message_handler(event)
 
             _response_content = None
+            _response_metadata = None
             if hasattr(response, "text") and hasattr(response, "content"):
                 _response_content = getattr(response, "content", None)
+                _response_metadata = getattr(response, "metadata", None)
                 response = getattr(response, "text", "") or ""
             _text, _eph_ttl = self._unwrap_ephemeral(response)
             # Send the response BEFORE cancelling the old task so the send
@@ -2805,11 +2807,18 @@ class BasePlatformAdapter(ABC):
                     len(_text),
                     event.source.chat_id,
                 )
+                _send_meta = thread_meta
+                if _response_content or isinstance(_response_metadata, dict):
+                    _send_meta = dict(_send_meta or {})
+                    if _response_content:
+                        _send_meta["content"] = _response_content
+                    if isinstance(_response_metadata, dict):
+                        _send_meta.update(_response_metadata)
                 _r = await self._send_with_retry(
                     chat_id=event.source.chat_id,
                     content=_text,
                     reply_to=_reply_anchor_for_event(event),
-                    metadata=thread_meta,
+                    metadata=_send_meta,
                 )
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
@@ -2903,13 +2912,26 @@ class BasePlatformAdapter(ABC):
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
+                    _response_content = None
+                    _response_metadata = None
+                    if hasattr(response, "text") and hasattr(response, "content"):
+                        _response_content = getattr(response, "content", None)
+                        _response_metadata = getattr(response, "metadata", None)
+                        response = getattr(response, "text", "") or ""
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     if _text:
+                        _send_meta = _thread_meta
+                        if _response_content or isinstance(_response_metadata, dict):
+                            _send_meta = dict(_send_meta or {})
+                            if _response_content:
+                                _send_meta["content"] = _response_content
+                            if isinstance(_response_metadata, dict):
+                                _send_meta.update(_response_metadata)
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
-                            metadata=_thread_meta,
+                            metadata=_send_meta,
                         )
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
@@ -2952,13 +2974,26 @@ class BasePlatformAdapter(ABC):
                             event.source, _reply_anchor_for_event(event)
                         )
                         response = await self._message_handler(event)
+                        _response_content = None
+                        _response_metadata = None
+                        if hasattr(response, "text") and hasattr(response, "content"):
+                            _response_content = getattr(response, "content", None)
+                            _response_metadata = getattr(response, "metadata", None)
+                            response = getattr(response, "text", "") or ""
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
                         if _text:
+                            _send_meta = _thread_meta
+                            if _response_content or isinstance(_response_metadata, dict):
+                                _send_meta = dict(_send_meta or {})
+                                if _response_content:
+                                    _send_meta["content"] = _response_content
+                                if isinstance(_response_metadata, dict):
+                                    _send_meta.update(_response_metadata)
                             _r = await self._send_with_retry(
                                 chat_id=event.source.chat_id,
                                 content=_text,
                                 reply_to=_reply_anchor_for_event(event),
-                                metadata=_thread_meta,
+                                metadata=_send_meta,
                             )
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(

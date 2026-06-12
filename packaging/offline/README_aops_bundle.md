@@ -2,6 +2,8 @@
 
 这个离线包以官方 `offline bundle` 为底包，额外叠加了当前仓库里的 AOPS channel 改动，适合 Linux x86_64 内网环境。
 
+> AOPS channel 的完整接口文档见 `docs/aops-channel-interface.md`。后续 AOPS channel、Tec01 一键安装、profile、多 agent、静默命令、模型/工具集配置或 runtime 上报发生变化时，必须同步更新该文档。
+
 ## 版本信息
 
 - Hermes 版本：`__VERSION__`
@@ -19,6 +21,15 @@
 
 ## 本次升级点
 
+- 自动会话标题生成已固定为简体中文
+  - 无论首轮对话原文是什么语言，自动生成的 session title 都会要求使用简体中文
+  - 手动 `/title` 设置的标题不受影响
+- AOPS 返回的 `title` 字段已对齐当前 session title
+  - `/title` 设置或查看到的标题会同步用于 AOPS channel 推送 payload 的 `data.title`
+  - 会话忙碌时发送 `/title` 也会保留这份 title metadata
+- AOPS 本地 `/cron remove <id|name>` 已支持删除定时任务
+  - 支持按任务 ID 或唯一任务名称删除
+  - 支持静默消息触发，返回结构化 `cron.removed` 结果
 - `tec-client-ip` 上报逻辑已调整为“每个系统用户首次生成一次随机 UUID，之后持久复用”
   - 持久文件保存在当前 Hermes root 下的 `aops/client-id-v2-<user-hash>`
   - 同一个系统用户切换 AOPS 地址、bot token、home channel 或 profile 时继续使用同一个值

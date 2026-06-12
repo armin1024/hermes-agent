@@ -24,6 +24,24 @@ class TestGenerateTitle:
             title = generate_title("help me fix this import", "Sure, let me check...")
             assert title == "Debugging Python Import Errors"
 
+    def test_prompt_requires_simplified_chinese_title(self):
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "调试导入错误"
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title("help me fix this import", "Sure, let me check...")
+
+        assert title == "调试导入错误"
+        system_prompt = captured_kwargs["messages"][0]["content"]
+        assert "Simplified Chinese" in system_prompt
+        assert "regardless of the language" in system_prompt
+
     def test_strips_quotes(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]

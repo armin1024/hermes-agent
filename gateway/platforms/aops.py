@@ -5,15 +5,17 @@ from __future__ import annotations
 import asyncio
 import getpass
 import hashlib
+import ipaddress
 import json
 import logging
 import mimetypes
 import os
 import queue
+import socket
+import subprocess
 import threading
 import time
 import uuid
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -96,6 +98,209 @@ def _current_system_user() -> str:
         return str(os.getuid())
     except Exception:
         return "unknown-user"
+
+
+def _is_reportable_ipv4(value: Any) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(value or "").strip())
+    except ValueError:
+        return False
+    return ip.version == 4 and not ip.is_loopback
+
+
+def _dedupe_sorted_ipv4(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen or not _is_reportable_ipv4(text):
+            continue
+        seen.add(text)
+        out.append(text)
+    return sorted(out, key=lambda item: tuple(int(part) for part in item.split(".")))
+
+
+def _collect_ipv4_from_ip_addr() -> list[str]:
+    try:
+        proc = subprocess.run(
+            ["ip", "-j", "-4", "addr"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.0,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    try:
+        payload = json.loads(proc.stdout)
+    except Exception:
+        return []
+    addresses: list[str] = []
+    if isinstance(payload, list):
+        for link in payload:
+            if not isinstance(link, dict):
+                continue
+            if str(link.get("ifname") or "").strip().lower() == "lo":
+                continue
+            for addr in link.get("addr_info") or []:
+                if not isinstance(addr, dict):
+                    continue
+                if str(addr.get("family") or "").lower() != "inet":
+                    continue
+                addresses.append(str(addr.get("local") or ""))
+    return _dedupe_sorted_ipv4(addresses)
+
+
+def _collect_ipv4_from_socket() -> list[str]:
+    names = {socket.gethostname(), socket.getfqdn()}
+    addresses: list[str] = []
+    for name in names:
+        if not name:
+            continue
+        try:
+            infos = socket.getaddrinfo(name, None, socket.AF_INET)
+        except Exception:
+            continue
+        for info in infos:
+            sockaddr = info[4] if len(info) > 4 else None
+            if isinstance(sockaddr, tuple) and sockaddr:
+                addresses.append(str(sockaddr[0]))
+    return _dedupe_sorted_ipv4(addresses)
+
+
+def _collect_host_ipv4s() -> list[str]:
+    return _collect_ipv4_from_ip_addr() or _collect_ipv4_from_socket()
+
+
+def _resolve_aops_profile_name() -> str:
+    raw_profile = os.getenv("HERMES_PROFILE", "").strip()
+    if raw_profile:
+        return raw_profile
+    home = get_hermes_home()
+    try:
+        if home.parent.name == "profiles":
+            return home.name or "default"
+    except Exception:
+        pass
+    return "default"
+
+
+def _runtime_secret_from_model_config(model_cfg: dict[str, Any]) -> tuple[str, str]:
+    api_key = str(model_cfg.get("api_key") or "").strip()
+    if api_key:
+        return api_key, "config.model.api_key"
+    api_key_env = str(model_cfg.get("api_key_env") or "").strip()
+    if api_key_env:
+        try:
+            from hermes_cli.config import get_env_value
+
+            env_value = (get_env_value(api_key_env) or os.getenv(api_key_env, "")).strip()
+        except Exception:
+            env_value = os.getenv(api_key_env, "").strip()
+        if env_value:
+            return env_value, f"env:{api_key_env}"
+    return "", ""
+
+
+def _runtime_secret_from_provider(provider: str, model_name: str, base_url: str) -> tuple[str, str, str]:
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested=provider or None,
+            explicit_base_url=base_url or None,
+            target_model=model_name or None,
+        )
+    except Exception:
+        return "", "", ""
+    api_key = str(runtime.get("api_key") or "").strip()
+    source = str(runtime.get("source") or "").strip()
+    resolved_base_url = str(runtime.get("base_url") or "").strip()
+    return api_key, source, resolved_base_url
+
+
+def _build_aops_model_runtime_report() -> dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    raw_model = cfg.get("model") if isinstance(cfg, dict) else {}
+    model_cfg = raw_model if isinstance(raw_model, dict) else {}
+    if isinstance(raw_model, str):
+        model_cfg = {"default": raw_model}
+
+    provider = str(model_cfg.get("provider") or "").strip()
+    model = str(model_cfg.get("model") or model_cfg.get("default") or model_cfg.get("name") or "").strip()
+    default_model = str(model_cfg.get("default") or "").strip()
+    base_url = str(model_cfg.get("base_url") or "").strip()
+    api_mode = str(model_cfg.get("api_mode") or "").strip()
+    api_key_env = str(model_cfg.get("api_key_env") or "").strip()
+
+    api_key, _source = _runtime_secret_from_model_config(model_cfg)
+    if not api_key:
+        api_key, _source, resolved_base_url = _runtime_secret_from_provider(provider, model, base_url)
+        if resolved_base_url and not base_url:
+            base_url = resolved_base_url
+
+    report: dict[str, Any] = {}
+    if provider:
+        report["provider"] = provider
+    if model:
+        report["model"] = model
+    if default_model:
+        report["default"] = default_model
+    if base_url:
+        report["baseUrl"] = base_url
+    if api_mode:
+        report["apiMode"] = api_mode
+    if api_key_env:
+        report["apiKeyEnv"] = api_key_env
+    if api_key:
+        report["apiKey"] = api_key
+    return report
+
+
+def _build_aops_runtime_report() -> dict[str, Any]:
+    try:
+        hostname = socket.gethostname().strip()
+    except Exception:
+        hostname = ""
+    hermes_home = get_hermes_home()
+    runtime: dict[str, Any] = {
+        "schema": "aops-runtime-report.v1",
+        "host": {
+            "ips": _collect_host_ipv4s(),
+        },
+        "user": {
+            "systemUser": _current_system_user(),
+        },
+        "hermes": {
+            "home": str(hermes_home),
+            "profile": _resolve_aops_profile_name(),
+        },
+        "model": _build_aops_model_runtime_report(),
+    }
+    if hostname:
+        runtime["host"]["hostname"] = hostname
+    return runtime
+
+
+def _redact_aops_agent_report_for_log(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    redacted = json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    try:
+        model = redacted["body"]["runtime"]["model"]
+        if isinstance(model, dict) and model.get("apiKey"):
+            model["apiKey"] = "[REDACTED]"
+    except Exception:
+        pass
+    return redacted
 
 
 def _aops_client_user_key() -> str:
@@ -1088,9 +1293,13 @@ class AopsAdapter(BasePlatformAdapter):
         self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
         self._listen_task: Optional[asyncio.Task] = None
         self._dispatch_tasks: set[asyncio.Task] = set()
-        self._connected_event = asyncio.Event()
-        self._send_lock = asyncio.Lock()
-        self._channel_send_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._dispatch_queue: asyncio.Queue[dict[str, Any] | None] | None = None
+        self._dispatch_worker_task: asyncio.Task | None = None
+        self._connected = False
+        self._asyncio_loop: asyncio.AbstractEventLoop | None = None
+        self._connected_event: asyncio.Event | None = None
+        self._send_lock: asyncio.Lock | None = None
+        self._channel_send_locks: dict[str, asyncio.Lock] = {}
         self._chat_cache: dict[str, dict[str, Any]] = {}
         self._seen_message_ids: set[str] = set()
         self._reply_flags_by_message_id: dict[str, dict[str, Any]] = {}
@@ -1098,6 +1307,59 @@ class AopsAdapter(BasePlatformAdapter):
         self._title_resolver = None
         self._bot_id: Optional[str] = None
         self._bot_name: Optional[str] = None
+        try:
+            self._ensure_loop_primitives()
+        except RuntimeError:
+            pass
+
+    def _ensure_loop_primitives(self) -> None:
+        """Keep asyncio primitives bound to the currently running loop.
+
+        AOPS adapters can outlive a single event loop in tests and in some
+        supervisor/reconnect paths. asyncio locks/events remember the loop
+        once they have waiters; reusing them from another loop can crash ping
+        pong or silent replies with "bound to a different event loop".
+        """
+        loop = asyncio.get_running_loop()
+        if self._asyncio_loop is loop and self._connected_event is not None and self._send_lock is not None:
+            return
+        was_connected = self._connected
+        self._asyncio_loop = loop
+        self._connected_event = asyncio.Event()
+        if was_connected:
+            self._connected_event.set()
+        self._send_lock = asyncio.Lock()
+        self._channel_send_locks = {}
+
+    def _connected_signal(self) -> asyncio.Event:
+        self._ensure_loop_primitives()
+        assert self._connected_event is not None
+        return self._connected_event
+
+    def _send_guard(self) -> asyncio.Lock:
+        self._ensure_loop_primitives()
+        assert self._send_lock is not None
+        return self._send_lock
+
+    def _channel_send_guard(self, channel_id: str) -> asyncio.Lock:
+        self._ensure_loop_primitives()
+        key = str(channel_id)
+        lock = self._channel_send_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._channel_send_locks[key] = lock
+        return lock
+
+    def _set_connected_signal(self, connected: bool) -> None:
+        self._connected = connected
+        try:
+            event = self._connected_signal()
+        except RuntimeError:
+            return
+        if connected:
+            event.set()
+        else:
+            event.clear()
 
     @property
     def push_tool_calls(self) -> bool:
@@ -1194,7 +1456,7 @@ class AopsAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._running = False
-        self._connected_event.clear()
+        self._set_connected_signal(False)
         if self._listen_task:
             self._listen_task.cancel()
             try:
@@ -1203,6 +1465,7 @@ class AopsAdapter(BasePlatformAdapter):
                 pass
             self._listen_task = None
         await self._cancel_dispatch_tasks()
+        await self._stop_dispatch_worker()
         await self._cleanup()
         self._mark_disconnected()
 
@@ -1251,7 +1514,7 @@ class AopsAdapter(BasePlatformAdapter):
             action="ws.auth_sent",
             payload={"event": "auth", "authSent": True},
         )
-        self._connected_event.set()
+        self._set_connected_signal(True)
         await self._report_agents(request_kwargs=request_kwargs)
         logger.info("[%s] Connected to %s as %s", self.name, self._base_url, self._bot_id or "unknown")
         self._log_wire(
@@ -1313,6 +1576,7 @@ class AopsAdapter(BasePlatformAdapter):
             "source": "hermes",
             "agents": agents,
             "defaultAgentId": default_agent_id,
+            "runtime": _build_aops_runtime_report(),
         }
 
     async def _report_agents(self, *, request_kwargs: dict[str, Any]) -> None:
@@ -1321,7 +1585,8 @@ class AopsAdapter(BasePlatformAdapter):
         url = urljoin(f"{self._base_url}/", "api/v1/bot/agents/report")
         payload = self._build_agent_report_payload()
         try:
-            self._log_wire("info", direction="out", action="http.agent_report.request", payload={"method": "POST", "url": url, "body": payload})
+            log_payload = _redact_aops_agent_report_for_log({"method": "POST", "url": url, "body": payload})
+            self._log_wire("info", direction="out", action="http.agent_report.request", payload=log_payload)
             async with self._session.post(url, headers={**self._headers(), "Content-Type": "application/json"}, json=payload, **request_kwargs) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
@@ -1355,7 +1620,7 @@ class AopsAdapter(BasePlatformAdapter):
             except Exception as exc:
                 if not self._running:
                     return
-                self._connected_event.clear()
+                self._set_connected_signal(False)
                 logger.warning("[%s] AOPS socket error: %s", self.name, exc)
                 delay = _RECONNECT_BACKOFF[min(attempt, len(_RECONNECT_BACKOFF) - 1)]
                 attempt += 1
@@ -1369,6 +1634,7 @@ class AopsAdapter(BasePlatformAdapter):
     async def _read_events(self) -> None:
         if not self._ws:
             raise RuntimeError("AOPS websocket not connected")
+        self._ensure_dispatch_worker()
         while self._running and self._ws and not self._ws.closed:
             msg = await self._ws.receive()
             if msg.type == aiohttp.WSMsgType.TEXT:
@@ -1405,19 +1671,74 @@ class AopsAdapter(BasePlatformAdapter):
                 raise RuntimeError("AOPS websocket closed")
 
     def _schedule_dispatch_payload(self, payload: dict[str, Any]) -> None:
-        task = asyncio.create_task(self._dispatch_payload(payload))
-        self._dispatch_tasks.add(task)
+        self._ensure_dispatch_worker()
+        assert self._dispatch_queue is not None
+        self._dispatch_queue.put_nowait(payload)
+
+    def _ensure_dispatch_worker(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._dispatch_worker_task and not self._dispatch_worker_task.done():
+            try:
+                if self._dispatch_worker_task.get_loop() is loop:
+                    return
+            except Exception:
+                pass
+            self._dispatch_worker_task.cancel()
+            self._dispatch_tasks.discard(self._dispatch_worker_task)
+            self._dispatch_worker_task = None
+            self._dispatch_queue = None
+        if self._dispatch_worker_task and not self._dispatch_worker_task.done():
+            return
+        self._dispatch_queue = asyncio.Queue()
+        self._dispatch_worker_task = asyncio.create_task(self._dispatch_worker())
+        self._dispatch_tasks.add(self._dispatch_worker_task)
 
         def _done(done_task: asyncio.Task) -> None:
             self._dispatch_tasks.discard(done_task)
+            if self._dispatch_worker_task is done_task:
+                self._dispatch_worker_task = None
             try:
                 done_task.result()
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
-                logger.warning("[%s] AOPS message dispatch failed: %s", self.name, exc, exc_info=True)
+                logger.warning("[%s] AOPS message dispatch worker failed: %s", self.name, exc, exc_info=True)
 
-        task.add_done_callback(_done)
+        self._dispatch_worker_task.add_done_callback(_done)
+
+    async def _dispatch_worker(self) -> None:
+        assert self._dispatch_queue is not None
+        while True:
+            payload = await self._dispatch_queue.get()
+            if payload is None:
+                self._dispatch_queue.task_done()
+                return
+            try:
+                await self._dispatch_payload(payload)
+            except asyncio.CancelledError:
+                self._dispatch_queue.task_done()
+                raise
+            except Exception as exc:
+                logger.warning("[%s] AOPS message dispatch failed: %s", self.name, exc, exc_info=True)
+            finally:
+                if payload is not None:
+                    self._dispatch_queue.task_done()
+
+    async def _stop_dispatch_worker(self) -> None:
+        task = self._dispatch_worker_task
+        queue = self._dispatch_queue
+        if not task:
+            return
+        if queue is not None:
+            queue.put_nowait(None)
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        finally:
+            self._dispatch_worker_task = None
+            self._dispatch_queue = None
 
     async def _handle_ws_control_event(self, payload: dict[str, Any]) -> bool:
         event = str(payload.get("event") or "").strip().lower()
@@ -1432,7 +1753,7 @@ class AopsAdapter(BasePlatformAdapter):
                 "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             },
         }
-        async with self._send_lock:
+        async with self._send_guard():
             if not self._ws or self._ws.closed:
                 raise RuntimeError("AOPS websocket not connected")
             await self._ws.send_json(pong)
@@ -1466,7 +1787,7 @@ class AopsAdapter(BasePlatformAdapter):
             session_key=self._session_key_for_event(event),
             config=self.config,
         )
-        if data.get("silent") is True or str(data.get("messageType") or "").strip().lower() == "silent":
+        if self._inbound_is_silent(data):
             await self._dispatch_silent_event(event)
             return
         await self._attach_inbound_attachments(event)
@@ -1566,10 +1887,40 @@ class AopsAdapter(BasePlatformAdapter):
         except Exception:
             return None
 
+    @staticmethod
+    def _metadata_from_message(data: dict[str, Any]) -> dict[str, Any]:
+        metadata = data.get("metadata")
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        return metadata if isinstance(metadata, dict) else {}
+
+    @classmethod
+    def _normalize_wire_message_data(cls, data: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(data)
+        metadata = cls._metadata_from_message(normalized)
+        if metadata is not data.get("metadata"):
+            normalized["metadata"] = metadata
+        message_type = normalized.get("messageType") or metadata.get("messageType")
+        if message_type is not None:
+            normalized["messageType"] = message_type
+        if isinstance(metadata.get("silent"), bool):
+            normalized["silent"] = bool(metadata["silent"])
+        elif isinstance(normalized.get("silent"), bool):
+            normalized["silent"] = bool(normalized["silent"])
+        return normalized
+
+    @classmethod
+    def _inbound_is_silent(cls, data: dict[str, Any]) -> bool:
+        normalized = cls._normalize_wire_message_data(data)
+        return normalized.get("silent") is True or str(normalized.get("messageType") or "").strip().lower() == "silent"
+
     def _normalize_inbound_message(self, payload: dict[str, Any]) -> Optional[dict[str, Any]]:
         if payload.get("event") == "message_posted":
             data = payload.get("data")
-            return data if isinstance(data, dict) else None
+            return self._normalize_wire_message_data(data) if isinstance(data, dict) else None
 
         envelope_type = str(payload.get("type") or "").strip().lower()
         envelope_event = str(payload.get("event") or "").strip().lower()
@@ -1739,7 +2090,7 @@ class AopsAdapter(BasePlatformAdapter):
 
     async def _attach_inbound_attachments(self, event: MessageEvent) -> None:
         raw = event.raw_message if isinstance(event.raw_message, dict) else {}
-        if raw.get("silent") is True or str(raw.get("messageType") or "").strip().lower() == "silent":
+        if self._inbound_is_silent(raw):
             return
         attachments = raw.get("attachments")
         if not isinstance(attachments, list) or not attachments:
@@ -1846,12 +2197,11 @@ class AopsAdapter(BasePlatformAdapter):
 
     async def _send_payload(self, payload: dict[str, Any], *, channel_id: str, timeout: float = 15.0) -> SendResult:
         try:
-            await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
+            await asyncio.wait_for(self._connected_signal().wait(), timeout=timeout)
         except asyncio.TimeoutError:
             return SendResult(success=False, error="AOPS websocket is not connected", retryable=True)
-        lock = self._channel_send_locks[str(channel_id)]
-        async with lock:
-            async with self._send_lock:
+        async with self._channel_send_guard(str(channel_id)):
+            async with self._send_guard():
                 if not self._ws or self._ws.closed:
                     return SendResult(success=False, error="AOPS websocket is not connected", retryable=True)
                 await self._ws.send_json(payload)

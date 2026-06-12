@@ -1945,6 +1945,25 @@ class GatewayRunner:
             data["sessionId"] = str(session_id)
         return data
 
+    def _aops_local_command_result_with_session_title(self, event: MessageEvent, local_reply):
+        if not hasattr(local_reply, "metadata"):
+            return local_reply
+        try:
+            from gateway import aops_commands as _aops_commands
+        except Exception:
+            return local_reply
+        existing_meta = getattr(local_reply, "metadata", None)
+        title_meta = self._aops_session_title_metadata_for_event(event)
+        base_meta = existing_meta if isinstance(existing_meta, dict) else {}
+        merged_meta = {**title_meta, **base_meta}
+        if not str(base_meta.get("title") or "").strip() and title_meta.get("title"):
+            merged_meta["title"] = title_meta["title"]
+        return _aops_commands.LocalCommandResult(
+            text=getattr(local_reply, "text", "") or "",
+            content=getattr(local_reply, "content", None),
+            metadata=merged_meta,
+        )
+
     def _aops_session_title_for_id(self, session_id: str | None) -> str:
         if not session_id or not self._session_db:
             return ""
@@ -6704,18 +6723,7 @@ class GatewayRunner:
                                 )
                     except Exception as exc:
                         logger.debug("AOPS model local command preference sync skipped: %s", exc)
-                if hasattr(local_reply, "metadata"):
-                    existing_meta = getattr(local_reply, "metadata", None)
-                    title_meta = self._aops_session_title_metadata_for_event(event)
-                    base_meta = existing_meta if isinstance(existing_meta, dict) else {}
-                    merged_meta = {**title_meta, **base_meta}
-                    if not str(base_meta.get("title") or "").strip() and title_meta.get("title"):
-                        merged_meta["title"] = title_meta["title"]
-                    local_reply = _aops_commands.LocalCommandResult(
-                        text=getattr(local_reply, "text", "") or "",
-                        content=getattr(local_reply, "content", None),
-                        metadata=merged_meta,
-                    )
+                local_reply = self._aops_local_command_result_with_session_title(event, local_reply)
                 return local_reply
 
             if not _aops_commands.is_supported_command(command, raw_command_args, canonical):
@@ -6935,7 +6943,14 @@ class GatewayRunner:
             return await self._handle_debug_command(event)
 
         if canonical == "title":
-            return await self._handle_title_command(event)
+            response = await self._handle_title_command(event)
+            if source.platform == Platform.AOPS:
+                from gateway import aops_commands as _aops_commands
+                response = self._aops_local_command_result_with_session_title(
+                    event,
+                    _aops_commands.LocalCommandResult(text=response, metadata={}),
+                )
+            return response
 
         if canonical == "resume":
             return await self._handle_resume_command(event)

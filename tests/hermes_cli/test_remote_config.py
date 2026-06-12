@@ -85,7 +85,7 @@ def test_remote_config_applies_allowed_fields(tmp_path, monkeypatch):
     hindsight_cfg = json.loads((tmp_path / "hindsight" / "config.json").read_text(encoding="utf-8"))
     assert hindsight_cfg["mode"] == "local_external"
     assert hindsight_cfg["api_url"] == "http://hindsight.example"
-    assert hindsight_cfg["apiKey"] == "hindsight-key-1"
+    assert hindsight_cfg["api_key"] == "hindsight-key-1"
     assert hindsight_cfg["bank_id_template"] == "users-{user}"
     assert hindsight_cfg["timeout"] == 120
 
@@ -214,6 +214,72 @@ def test_remote_config_overwrites_existing_values_when_requested(tmp_path, monke
     assert load_config()["approvals"]["mode"] == "off"
     assert (tmp_path / "memories" / "USER.md").read_text(encoding="utf-8") == "new prompt\n"
     assert result["overwriteExistingConfig"] is True
+
+
+def test_remote_config_applies_env_configyaml_soul_and_user_memory(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    payload = {
+        "profile": {"name": "hermes-1", "noBundledSkills": True},
+        "config": {
+            "env": {
+                "AOPS_BOT_TOKEN": "tok",
+                "MODEL_GATEWAY_API_KEY": "model-key",
+                "CUSTOM_FLAG": "enabled",
+            },
+            "configYaml": {
+                "model": {
+                    "provider": "custom",
+                    "model": "qwen3-32b",
+                    "base_url": "http://llm/v1",
+                    "api_key_env": "MODEL_GATEWAY_API_KEY",
+                },
+                "display": {"busy_input_mode": "queue"},
+                "checkpoints": {"enabled": True},
+            },
+            "userMemory": "# User\n\nPrefer Chinese.",
+            "soul": "# Soul\n\nFocused AOPS agent.",
+            "hindsight": {
+                "mode": "local_external",
+                "api_url": "http://hindsight",
+                "api_key": "hk",
+            },
+        },
+    }
+    path = tmp_path / "payload.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    from hermes_cli.remote_config import _activate_profile_for_payload, apply_payload
+    from hermes_cli.config import load_config, load_env, get_hermes_home
+
+    assert _activate_profile_for_payload(payload, None) == "hermes-1"
+    result = apply_payload(str(path), skip_skills=True)
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "hermes-1"
+    assert get_hermes_home() == profile_home
+    assert result["envChanged"] == ["AOPS_BOT_TOKEN", "MODEL_GATEWAY_API_KEY", "CUSTOM_FLAG", "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL"]
+    env = load_env()
+    assert env["CUSTOM_FLAG"] == "enabled"
+    cfg = load_config()
+    assert cfg["model"]["model"] == "qwen3-32b"
+    assert cfg["model"]["base_url"] == "http://llm/v1"
+    assert cfg["checkpoints"]["enabled"] is True
+    assert (profile_home / "memories" / "USER.md").read_text(encoding="utf-8") == "# User\n\nPrefer Chinese.\n"
+    assert (profile_home / "SOUL.md").read_text(encoding="utf-8") == "# Soul\n\nFocused AOPS agent.\n"
+    hindsight = json.loads((profile_home / "hindsight" / "config.json").read_text(encoding="utf-8"))
+    assert hindsight["bank_id_template"] == "users-{user}"
+    assert hindsight["api_key"] == "hk"
+
+
+def test_remote_config_rejects_invalid_custom_env_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "payload.json"
+    path.write_text(json.dumps({"config": {"env": {"BAD-NAME": "x"}}}), encoding="utf-8")
+
+    from hermes_cli.remote_config import RemoteConfigError, apply_payload
+
+    with pytest.raises(RemoteConfigError, match="invalid env var name"):
+        apply_payload(str(path), skip_skills=True)
 
 
 def test_remote_config_schema_exposes_official_values():

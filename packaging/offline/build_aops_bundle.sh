@@ -184,7 +184,12 @@ cp "$SCRIPT_DIR/install_aops_offline.sh" "$BUNDLE_DIR/install.sh"
 chmod +x "$BUNDLE_DIR/install.sh"
 cp "$SCRIPT_DIR/tec01_oneclick_install.sh" "$BUNDLE_DIR/tec01_oneclick_install.sh"
 chmod +x "$BUNDLE_DIR/tec01_oneclick_install.sh"
+if [[ -d "$SCRIPT_DIR/templates" ]]; then
+  mkdir -p "$BUNDLE_DIR/templates"
+  cp "$SCRIPT_DIR/templates"/* "$BUNDLE_DIR/templates/"
+fi
 mkdir -p "$BUNDLE_DIR/docs"
+cp "$REPO_ROOT/docs/aops-channel-interface.md" "$BUNDLE_DIR/docs/aops-channel-interface.md"
 cp "$REPO_ROOT/docs/aops-tec01-command-protocol.md" "$BUNDLE_DIR/docs/aops-tec01-command-protocol.md"
 
 CONTENT_SHA="$(

@@ -11,6 +11,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -85,6 +86,7 @@ HINDSIGHT_ALLOWED_KEYS = (
     "retainAssistantPrefix",
     "retain_assistant_prefix",
 )
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class RemoteConfigError(RuntimeError):
@@ -239,11 +241,15 @@ def _optional_env_string(value: Any, field: str) -> str | None:
 
 
 def _save_env_if_allowed(key: str, value: str, *, field: str, options: dict[str, Any], existing_env: dict[str, str], changed: list[str]) -> None:
+    if not _ENV_VAR_NAME_RE.fullmatch(key):
+        raise RemoteConfigError(f"config.env contains invalid env var name: {key}")
     if existing_env.get(key) and not _should_overwrite(field, options):
         return
     save_env_value(key, value)
     os.environ[key] = value
-    changed.append(key)
+    existing_env[key] = value
+    if key not in changed:
+        changed.append(key)
 
 
 def _model_gateway_api_key(model_gateway: dict[str, Any]) -> str | None:
@@ -258,6 +264,23 @@ def _model_gateway_api_key(model_gateway: dict[str, Any]) -> str | None:
 def _apply_env(config_payload: dict[str, Any], options: dict[str, Any]) -> list[str]:
     changed: list[str] = []
     existing_env = load_env()
+
+    raw_env = config_payload.get("env") or {}
+    if raw_env and not isinstance(raw_env, dict):
+        raise RemoteConfigError("config.env must be a JSON object")
+    for key, raw_value in raw_env.items():
+        if raw_value is None:
+            continue
+        value = _optional_env_string(raw_value, f"config.env.{key}")
+        if value is not None:
+            _save_env_if_allowed(
+                str(key),
+                value,
+                field=f"env.{key}",
+                options=options,
+                existing_env=existing_env,
+                changed=changed,
+            )
 
     aops = config_payload.get("aops") or {}
     if aops and not isinstance(aops, dict):
@@ -339,13 +362,56 @@ def _deep_set_if_allowed(cfg: dict[str, Any], dotted_key: str, value: Any, *, fi
     if existing not in (None, "") and not _should_overwrite(field, options):
         return
     _deep_set(cfg, dotted_key, value)
-    changed.append(dotted_key)
+    if dotted_key not in changed:
+        changed.append(dotted_key)
+
+
+def _deep_merge_config_yaml(
+    cfg: dict[str, Any],
+    incoming: dict[str, Any],
+    *,
+    options: dict[str, Any],
+    changed: list[str],
+    path: tuple[str, ...] = (),
+) -> None:
+    for raw_key, value in incoming.items():
+        key = str(raw_key)
+        actual_path = (*path, key)
+        dotted_key = ".".join(actual_path)
+        field = f"configYaml.{dotted_key}"
+        existing = _deep_get(cfg, dotted_key)
+        if isinstance(value, dict):
+            if existing not in (None, "") and not isinstance(existing, dict) and not _should_overwrite(field, options):
+                continue
+            if not isinstance(existing, dict):
+                _deep_set(cfg, dotted_key, {})
+                if dotted_key not in changed:
+                    changed.append(dotted_key)
+            _deep_merge_config_yaml(
+                cfg,
+                value,
+                options=options,
+                changed=changed,
+                path=actual_path,
+            )
+            continue
+        if existing not in (None, "") and not _should_overwrite(field, options):
+            continue
+        _deep_set(cfg, dotted_key, value)
+        if dotted_key not in changed:
+            changed.append(dotted_key)
 
 
 def _apply_config_yaml(config_payload: dict[str, Any], options: dict[str, Any]) -> list[str]:
     cfg = load_config()
     original = copy.deepcopy(cfg)
     changed: list[str] = []
+
+    config_yaml = config_payload.get("configYaml") or config_payload.get("config_yaml") or {}
+    if config_yaml and not isinstance(config_yaml, dict):
+        raise RemoteConfigError("config.configYaml must be a JSON object")
+    if config_yaml:
+        _deep_merge_config_yaml(cfg, config_yaml, options=options, changed=changed)
 
     model_gateway = config_payload.get("modelGateway") or {}
     if model_gateway and not isinstance(model_gateway, dict):
@@ -414,7 +480,11 @@ def _apply_config_yaml(config_payload: dict[str, Any], options: dict[str, Any]) 
 
 
 def _build_user_instructions(config_payload: dict[str, Any]) -> str | None:
-    user_instructions = config_payload.get("userInstructions")
+    user_instructions = config_payload.get("userMemory")
+    if user_instructions is None:
+        user_instructions = config_payload.get("user_memory")
+    if user_instructions is None:
+        user_instructions = config_payload.get("userInstructions")
     if user_instructions is None:
         user_instructions = config_payload.get("userMd")
     if user_instructions is None:
@@ -473,12 +543,36 @@ def _apply_user_instructions(config_payload: dict[str, Any], options: dict[str, 
     content = _build_user_instructions(config_payload)
     if content is None:
         return None
+    field = "userMemory" if (
+        "userMemory" in config_payload or "user_memory" in config_payload
+    ) else "userInstructions"
     path = get_hermes_home() / "memories" / "USER.md"
-    if _is_upgrade_mode(options) and path.exists() and path.read_text(encoding="utf-8").strip() and not _should_overwrite("userInstructions", options):
+    if _is_upgrade_mode(options) and path.exists() and path.read_text(encoding="utf-8").strip() and not (
+        _should_overwrite(field, options) or _should_overwrite("userInstructions", options)
+    ):
         return None
     path.parent.mkdir(parents=True, exist_ok=True)
     backup = _backup_file(path)
     path.write_text(content, encoding="utf-8")
+    return {"path": str(path), "backup": backup}
+
+
+def _apply_soul(config_payload: dict[str, Any], options: dict[str, Any]) -> dict[str, Any] | None:
+    soul = config_payload.get("soul")
+    if soul is None:
+        soul = config_payload.get("SOUL.md")
+    if soul is None:
+        return None
+    if not isinstance(soul, str):
+        raise RemoteConfigError("config.soul must be a string")
+    content = soul.strip()
+    if not content:
+        return None
+    path = get_hermes_home() / "SOUL.md"
+    if _is_upgrade_mode(options) and path.exists() and path.read_text(encoding="utf-8").strip() and not _should_overwrite("soul", options):
+        return None
+    backup = _backup_file(path)
+    path.write_text(content + "\n", encoding="utf-8")
     return {"path": str(path), "backup": backup}
 
 
@@ -510,9 +604,9 @@ def _build_hindsight_config(config_payload: dict[str, Any]) -> dict[str, Any] | 
     }
 
     string_fields = {
-        "apiKey": ("apiKey", "api_key", "HINDSIGHT_API_KEY"),
+        "api_key": ("apiKey", "api_key", "HINDSIGHT_API_KEY"),
         "api_url": ("apiUrl", "api_url", "HINDSIGHT_API_URL"),
-        "llmApiKey": ("llmApiKey", "llm_api_key", "HINDSIGHT_LLM_API_KEY"),
+        "llm_api_key": ("llmApiKey", "llm_api_key", "HINDSIGHT_LLM_API_KEY"),
         "llm_base_url": ("llmBaseUrl", "llm_base_url"),
         "llm_model": ("llmModel", "llm_model"),
         "budget": ("budget", "recallBudget", "recall_budget"),
@@ -613,6 +707,15 @@ def _install_skills(config_payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 def schema() -> dict[str, Any]:
     return {
+        "env": {
+            "type": "object",
+            "description": "Write arbitrary valid environment variables to .env.",
+            "required": ["AOPS_BOT_TOKEN"],
+        },
+        "configYaml": {
+            "type": "object",
+            "description": "Deep-merge arbitrary Hermes config.yaml values.",
+        },
         "approvals.mode": {
             "type": "enum",
             "values": list(APPROVAL_MODE_VALUES),
@@ -624,6 +727,14 @@ def schema() -> dict[str, Any]:
         "userInstructions": {
             "type": "string|object",
             "description": "Write formatted Markdown to ~/.hermes/memories/USER.md.",
+        },
+        "userMemory": {
+            "type": "string",
+            "description": "Write Markdown to ~/.hermes/memories/USER.md.",
+        },
+        "soul": {
+            "type": "string",
+            "description": "Write Markdown to ~/.hermes/SOUL.md.",
         },
         "hindsight": {
             "type": "object",
@@ -651,12 +762,14 @@ def apply_payload(path: str, *, skip_skills: bool = False) -> dict[str, Any]:
     env_backup = _backup_file(env_path)
     config_backup = _backup_file(config_path)
     user_instructions_result: dict[str, Any] | None = None
+    soul_result: dict[str, Any] | None = None
     hindsight_result: dict[str, Any] | None = None
 
     try:
         env_changed = _apply_env(config_payload, options)
         config_changed = _apply_config_yaml(config_payload, options)
         user_instructions_result = _apply_user_instructions(config_payload, options)
+        soul_result = _apply_soul(config_payload, options)
         hindsight_result = _apply_hindsight_config(config_payload, options)
         skill_results = [] if skip_skills else _install_skills(config_payload)
     except Exception:
@@ -664,6 +777,8 @@ def apply_payload(path: str, *, skip_skills: bool = False) -> dict[str, Any]:
         _restore_file(config_path, config_backup)
         if user_instructions_result:
             _rollback_file(Path(user_instructions_result["path"]), user_instructions_result.get("backup"))
+        if soul_result:
+            _rollback_file(Path(soul_result["path"]), soul_result.get("backup"))
         if hindsight_result:
             _rollback_file(Path(hindsight_result["path"]), hindsight_result.get("backup"))
         raise
@@ -675,6 +790,7 @@ def apply_payload(path: str, *, skip_skills: bool = False) -> dict[str, Any]:
         "configChanged": config_changed,
         "skills": skill_results,
         "userInstructions": user_instructions_result,
+        "soul": soul_result,
         "hindsight": hindsight_result,
         "overwriteExistingConfig": _overwrite_all(options),
         "overwriteFields": sorted(_overwrite_fields(options)),
@@ -689,11 +805,56 @@ def apply_payload(path: str, *, skip_skills: bool = False) -> dict[str, Any]:
     }
 
 
+def _activate_profile_for_payload(payload: dict[str, Any], profile_name: str | None) -> str | None:
+    profile = profile_name or ""
+    if not profile:
+        raw_profile = payload.get("profile") or {}
+        if isinstance(raw_profile, dict):
+            profile = str(raw_profile.get("name") or "").strip()
+    if not profile:
+        return None
+
+    from hermes_cli.profiles import (
+        create_profile,
+        get_profile_dir,
+        normalize_profile_name,
+        profile_exists,
+        set_active_profile,
+    )
+
+    canon = normalize_profile_name(profile)
+    profile_cfg = payload.get("profile") or {}
+    profile_cfg = profile_cfg if isinstance(profile_cfg, dict) else {}
+
+    if canon != "default" and not profile_exists(canon):
+        create_profile(
+            canon,
+            clone_from=profile_cfg.get("cloneFrom") or profile_cfg.get("clone_from"),
+            clone_config=bool(profile_cfg.get("clone")),
+            clone_all=bool(profile_cfg.get("cloneAll") or profile_cfg.get("clone_all")),
+            no_alias=True,
+            no_skills=bool(profile_cfg.get("noBundledSkills", profile_cfg.get("no_bundled_skills", True))),
+        )
+
+    profile_dir = get_profile_dir(canon)
+    os.environ["HERMES_HOME"] = str(profile_dir)
+    try:
+        from hermes_cli import config as config_mod
+        config_mod._LOAD_CONFIG_CACHE.clear()
+        config_mod._RAW_CONFIG_CACHE.clear()
+    except Exception:
+        pass
+    if bool(profile_cfg.get("setActive") or profile_cfg.get("set_active")):
+        set_active_profile(canon)
+    return canon
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Apply tec01 remote install configuration")
     sub = parser.add_subparsers(dest="command", required=True)
     apply_p = sub.add_parser("apply", help="Apply a tec01 task payload")
     apply_p.add_argument("--payload", required=True)
+    apply_p.add_argument("--profile", help="Apply payload to a Hermes profile")
     apply_p.add_argument("--skip-skills", action="store_true")
     sub.add_parser("schema", help="Print supported remote config schema")
     args = parser.parse_args(argv)
@@ -702,7 +863,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "schema":
             print(json.dumps(schema(), ensure_ascii=False, indent=2))
             return 0
+        payload = _read_payload(args.payload)
+        profile = _activate_profile_for_payload(payload, args.profile)
         result = apply_payload(args.payload, skip_skills=args.skip_skills)
+        if profile:
+            result["profile"] = profile
+            result["paths"]["hermesHome"] = str(get_hermes_home())
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:

@@ -1,5 +1,7 @@
 # AOPS Channel Customizations
 
+> 当前 AOPS channel 的完整接口文档以 `docs/aops-channel-interface.md` 为准。本文保留为历史定制说明；后续功能更新必须同步更新主接口文档。
+
 本文档记录当前定制分支中的 AOPS channel 行为，方便后续内网部署、升级和排障。
 
 ## 功能总览

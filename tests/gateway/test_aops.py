@@ -18,6 +18,7 @@ from agent.prompt_builder import PLATFORM_HINTS
 from gateway.config import GatewayConfig, Platform, PlatformConfig, _apply_env_overrides
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms.aops import AopsAdapter, AopsLiveReplyBridge, SendResult
+import gateway.platforms.aops as aops_mod
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from tools.send_message_tool import (
@@ -275,7 +276,15 @@ def _aops_log_raw(line: str):
 
 
 async def _drain_aops_dispatch_tasks(adapter: AopsAdapter):
-    tasks = list(getattr(adapter, "_dispatch_tasks", set()))
+    queue = getattr(adapter, "_dispatch_queue", None)
+    if queue is not None:
+        await asyncio.wait_for(queue.join(), timeout=2.0)
+    task = getattr(adapter, "_dispatch_worker_task", None)
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        adapter._dispatch_worker_task = None
+    tasks = [task for task in getattr(adapter, "_dispatch_tasks", set()) if not task.done()]
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -743,6 +752,64 @@ async def test_aops_outbound_title_resolves_from_channel_session(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_aops_title_command_result_metadata_uses_set_session_title(tmp_path):
+    from gateway.aops_commands import LocalCommandResult
+    from gateway.session import SessionStore
+    from hermes_state import SessionDB
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=runner.config)
+    runner._session_db = SessionDB(db_path=tmp_path / "state.db")
+
+    result = await runner._handle_message(_make_aops_event_for_channel("/title 我的标题", channel_id="conv-title"))
+
+    assert isinstance(result, LocalCommandResult)
+    assert result.metadata["title"] == "我的标题"
+    assert result.metadata["sessionId"]
+
+
+@pytest.mark.asyncio
+async def test_aops_title_command_result_metadata_uses_current_session_title(tmp_path):
+    from gateway.aops_commands import LocalCommandResult
+    from gateway.session import SessionStore
+    from hermes_state import SessionDB
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=runner.config)
+    runner._session_db = SessionDB(db_path=tmp_path / "state.db")
+    source = SessionSource(platform=Platform.AOPS, chat_id="conv-title", chat_type="dm")
+    entry = runner.session_store.get_or_create_session(source)
+    runner._session_db.create_session(entry.session_id, source="aops")
+    runner._session_db.set_session_title(entry.session_id, "已有中文标题")
+
+    result = await runner._handle_message(_make_aops_event_for_channel("/title", channel_id="conv-title"))
+
+    assert isinstance(result, LocalCommandResult)
+    assert result.metadata["title"] == "已有中文标题"
+    assert "已有中文标题" in result.text
+
+
+@pytest.mark.asyncio
+async def test_aops_send_uses_title_command_metadata_in_payload(tmp_path):
+    from gateway.session import SessionStore
+    from hermes_state import SessionDB
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=runner.config)
+    runner._session_db = SessionDB(db_path=tmp_path / "state.db")
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+
+    result = await runner._handle_message(_make_aops_event_for_channel("/title 我的标题", channel_id="conv-title"))
+    await adapter.send("conv-title", result.text, metadata=result.metadata)
+
+    start = adapter.send_reply_event.await_args_list[0].args[0]
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert start["title"] == "我的标题"
+    assert end["title"] == "我的标题"
+
+
+@pytest.mark.asyncio
 async def test_aops_send_reply_event_flattens_nested_cron_bot_reply_extra():
     adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
     adapter._connected_event.set()
@@ -1156,6 +1223,50 @@ async def test_aops_read_events_replies_to_server_ping(monkeypatch, tmp_path):
     assert lines[1].startswith(datetime.now().astimezone().strftime("%Y-%m-%dT"))
 
 
+def test_aops_send_primitives_recover_across_event_loops():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    fake_ws = _FakeWebSocket()
+    adapter._ws = fake_ws
+    adapter._connected = True
+
+    async def bind_old_loop_lock():
+        lock = adapter._send_guard()
+        await lock.acquire()
+        waiter = asyncio.create_task(lock.acquire())
+        await asyncio.sleep(0)
+        assert getattr(lock, "_loop", None) is asyncio.get_running_loop()
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+        lock.release()
+        return lock
+
+    old_loop = asyncio.new_event_loop()
+    try:
+        old_lock = old_loop.run_until_complete(bind_old_loop_lock())
+    finally:
+        old_loop.close()
+
+    async def send_on_new_loop():
+        pong_handled = await adapter._handle_ws_control_event({"event": "ping", "data": {"timeoutMs": 30000}})
+        reply = await adapter._send_payload(
+            {"event": "message_reply", "data": {"messageId": "reply-1"}},
+            channel_id="main",
+        )
+        return pong_handled, reply, adapter._send_lock
+
+    new_loop = asyncio.new_event_loop()
+    try:
+        pong_handled, reply, new_lock = new_loop.run_until_complete(send_on_new_loop())
+    finally:
+        new_loop.close()
+
+    assert pong_handled is True
+    assert reply.success is True
+    assert new_lock is not old_lock
+    assert fake_ws.sent[0]["event"] == "pong"
+    assert fake_ws.sent[1]["event"] == "message_reply"
+
+
 @pytest.mark.asyncio
 async def test_aops_read_events_dispatches_message_posted_after_ping_support(monkeypatch, tmp_path):
     fake_aiohttp = types.SimpleNamespace(
@@ -1361,6 +1472,115 @@ model:
     lines = _read_aops_log_lines(tmp_path)
     assert any(" io=recv " in line and "event=message_posted" in line and "silent=true" in line for line in lines)
     assert any(" io=send " in line and "event=message_reply" in line and "messageType=silent" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_aops_common_message_with_metadata_silent_uses_silent_channel(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: qwen-coder
+  base_url: http://model-gateway.internal/v1
+""",
+        encoding="utf-8",
+    )
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._connected_event.set()
+    adapter._ws = _FakeWebSocket()
+    adapter.handle_message = AsyncMock()
+    payload = {
+        "event": "message_posted",
+        "data": {
+            "id": "common-silent-1",
+            "userId": "user-001",
+            "userName": "AOPS User",
+            "text": "/model status",
+            "channelId": "conv-001",
+            "channelType": "direct",
+            "messageType": "common",
+            "metadata": {"silent": True, "id": "silent-correlation-1"},
+        },
+    }
+
+    await adapter._dispatch_payload(payload)
+
+    adapter.handle_message.assert_not_awaited()
+    sent = [item["data"] for item in adapter._ws.sent if item.get("event") == "message_reply"]
+    assert len(sent) == 1
+    assert sent[0]["messageType"] == "silent"
+    assert sent[0]["silent"] is True
+    assert sent[0]["replyToId"] == "common-silent-1"
+    assert json.loads(sent[0]["text"])["type"] == "model.status"
+
+
+@pytest.mark.asyncio
+async def test_aops_common_silent_messages_are_dispatched_in_receive_order(monkeypatch, tmp_path):
+    fake_aiohttp = types.SimpleNamespace(
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    fake_ws = _FakeWebSocket()
+    fake_ws.messages = [
+        SimpleNamespace(
+            type="TEXT",
+            data=json.dumps({
+                "event": "message_posted",
+                "data": {
+                    "id": "common-silent-help",
+                    "userId": "user-001",
+                    "userName": "AOPS User",
+                    "text": "/help",
+                    "channelId": "conv-001",
+                    "channelType": "direct",
+                    "messageType": "common",
+                    "metadata": {"silent": True},
+                },
+            }),
+        ),
+        SimpleNamespace(
+            type="TEXT",
+            data=json.dumps({
+                "event": "message_posted",
+                "data": {
+                    "id": "common-silent-model",
+                    "userId": "user-001",
+                    "userName": "AOPS User",
+                    "text": "/model status",
+                    "channelId": "conv-001",
+                    "channelType": "direct",
+                    "messageType": "common",
+                    "metadata": {"silent": True},
+                },
+            }),
+        ),
+    ]
+    receive_count = 0
+
+    def on_receive():
+        nonlocal receive_count
+        receive_count += 1
+        if receive_count >= 2:
+            adapter._running = False
+
+    fake_ws.on_receive = on_receive
+    adapter._connected_event.set()
+    adapter._ws = fake_ws
+    adapter._running = True
+    adapter.handle_message = AsyncMock()
+
+    await adapter._read_events()
+    await _drain_aops_dispatch_tasks(adapter)
+
+    adapter.handle_message.assert_not_awaited()
+    replies = [item["data"] for item in fake_ws.sent if item.get("event") == "message_reply"]
+    assert [reply["replyToId"] for reply in replies] == ["common-silent-help", "common-silent-model"]
+    assert all(reply["messageType"] == "silent" for reply in replies)
+    assert json.loads(replies[0]["text"])["type"] == "command.tree"
+    assert json.loads(replies[1]["text"])["type"] == "model.status"
 
 
 @pytest.mark.asyncio
@@ -2105,7 +2325,18 @@ def test_aops_approval_action_metadata_maps_to_deny_command():
     assert event.raw_message["metadata"]["aopsApprovalId"] == "approval-2"
 
 
-def test_agent_report_payload_uses_agent_routes():
+def test_agent_report_payload_uses_agent_routes(monkeypatch):
+    monkeypatch.setattr(
+        aops_mod,
+        "_build_aops_runtime_report",
+        lambda: {
+            "schema": "aops-runtime-report.v1",
+            "host": {"ips": ["10.0.0.8"]},
+            "user": {"systemUser": "hermes"},
+            "hermes": {"home": "/home/hermes/.hermes", "profile": "default"},
+            "model": {},
+        },
+    )
     adapter = AopsAdapter(
         PlatformConfig(
             enabled=True,
@@ -2127,6 +2358,145 @@ def test_agent_report_payload_uses_agent_routes():
         {"id": "main", "enabled": True, "default": True, "workspace": "~/.hermes"},
         {"id": "devops", "enabled": True, "default": False, "workspace": "~/.hermes/devops"},
     ]
+    assert payload["runtime"]["schema"] == "aops-runtime-report.v1"
+    assert payload["runtime"]["host"]["ips"] == ["10.0.0.8"]
+
+
+def test_aops_host_ipv4_report_uses_ip_addr_and_filters_loopback(monkeypatch):
+    payload = [
+        {
+            "ifname": "lo",
+            "addr_info": [{"family": "inet", "local": "127.0.0.1"}],
+        },
+        {
+            "ifname": "eth0",
+            "addr_info": [
+                {"family": "inet", "local": "192.168.10.23"},
+                {"family": "inet6", "local": "fe80::1"},
+            ],
+        },
+        {
+            "ifname": "eth1",
+            "addr_info": [
+                {"family": "inet", "local": "10.10.0.18"},
+                {"family": "inet", "local": "192.168.10.23"},
+            ],
+        },
+    ]
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload))
+
+    monkeypatch.setattr(aops_mod.subprocess, "run", fake_run)
+
+    assert aops_mod._collect_host_ipv4s() == ["10.10.0.18", "192.168.10.23"]
+
+
+def test_aops_host_ipv4_report_falls_back_to_socket(monkeypatch):
+    monkeypatch.setattr(aops_mod.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError()))
+    monkeypatch.setattr(aops_mod.socket, "gethostname", lambda: "vm-aops-01")
+    monkeypatch.setattr(aops_mod.socket, "getfqdn", lambda: "vm-aops-01.example.internal")
+
+    def fake_getaddrinfo(name, *_args, **_kwargs):
+        if name == "vm-aops-01":
+            return [(None, None, None, None, ("127.0.0.1", 0)), (None, None, None, None, ("172.16.0.9", 0))]
+        return [(None, None, None, None, ("10.0.0.5", 0))]
+
+    monkeypatch.setattr(aops_mod.socket, "getaddrinfo", fake_getaddrinfo)
+
+    assert aops_mod._collect_host_ipv4s() == ["10.0.0.5", "172.16.0.9"]
+
+
+def test_aops_runtime_model_report_reads_config_api_key(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "provider": "custom",
+                "model": "qwen3-32b",
+                "default": "qwen3-32b",
+                "base_url": "http://llm-gateway.internal/v1",
+                "api_mode": "openai",
+                "api_key_env": "LLM_GATEWAY_TOKEN",
+                "api_key": "sk-config",
+            }
+        },
+    )
+
+    report = aops_mod._build_aops_model_runtime_report()
+
+    assert report == {
+        "provider": "custom",
+        "model": "qwen3-32b",
+        "default": "qwen3-32b",
+        "baseUrl": "http://llm-gateway.internal/v1",
+        "apiMode": "openai",
+        "apiKeyEnv": "LLM_GATEWAY_TOKEN",
+        "apiKey": "sk-config",
+    }
+
+
+def test_aops_runtime_model_report_reads_config_api_key_env(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "provider": "custom",
+                "model": "qwen3-32b",
+                "base_url": "http://llm-gateway.internal/v1",
+                "api_key_env": "LLM_GATEWAY_TOKEN",
+            }
+        },
+    )
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: "sk-env" if key == "LLM_GATEWAY_TOKEN" else "")
+
+    report = aops_mod._build_aops_model_runtime_report()
+
+    assert report["apiKeyEnv"] == "LLM_GATEWAY_TOKEN"
+    assert report["apiKey"] == "sk-env"
+
+
+def test_aops_runtime_model_report_falls_back_to_provider_credentials(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"provider": "openrouter", "default": "openai/gpt-4.1"}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-provider",
+            "source": "OPENROUTER_API_KEY",
+        },
+    )
+
+    report = aops_mod._build_aops_model_runtime_report()
+
+    assert report["provider"] == "openrouter"
+    assert report["model"] == "openai/gpt-4.1"
+    assert report["baseUrl"] == "https://openrouter.ai/api/v1"
+    assert report["apiKey"] == "sk-provider"
+
+
+def test_aops_agent_report_log_redacts_model_api_key():
+    payload = {
+        "method": "POST",
+        "url": "https://aops.example.com/api/v1/bot/agents/report",
+        "body": {
+            "runtime": {
+                "model": {
+                    "apiKey": "sk-secret",
+                    "apiKeyEnv": "LLM_GATEWAY_TOKEN",
+                }
+            }
+        },
+    }
+
+    redacted = aops_mod._redact_aops_agent_report_for_log(payload)
+
+    assert redacted["body"]["runtime"]["model"]["apiKey"] == "[REDACTED]"
+    assert payload["body"]["runtime"]["model"]["apiKey"] == "sk-secret"
 
 
 def test_aops_dm_policy_auth_open_allowlist_pairing_disabled(monkeypatch):
@@ -2228,6 +2598,89 @@ async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path
     items_by_id = {item["id"]: item for item in payload["items"]}
     assert items_by_id["ops/restart-service"]["command"] == "/restart-service"
     assert items_by_id["ops/draft-notes"]["command"] == "/draft-notes"
+
+
+@pytest.mark.asyncio
+async def test_aops_toolsets_list_returns_profile_config_json(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_cli.config as hermes_config
+
+    hermes_config.save_config({"platform_toolsets": {"aops": ["web", "terminal"]}})
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/toolsets list"))
+
+    payload = json.loads(result)
+    assert payload["schemaVersion"] == "local-command-list.v1"
+    assert payload["type"] == "toolsets.list"
+    assert payload["ok"] is True
+    assert payload["itemType"] == "toolset"
+    assert payload["context"]["platform"] == "aops"
+    assert payload["context"]["agentId"] == "main"
+    assert payload["context"]["profileName"] == "default"
+    assert payload["context"]["configPath"] == str(tmp_path / "config.yaml")
+    items_by_name = {item["name"]: item for item in payload["items"]}
+    assert items_by_name["web"]["label"] == "Web Search & Scraping"
+    assert items_by_name["web"]["enabled"] is True
+    assert set(items_by_name["web"]["tools"]) == {"web_search", "web_extract"}
+    assert items_by_name["terminal"]["enabled"] is True
+    assert items_by_name["file"]["enabled"] is False
+    assert payload["summary"]["enabled"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_aops_toolsets_set_updates_aops_platform_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_cli.config as hermes_config
+
+    hermes_config.save_config({"platform_toolsets": {"aops": ["terminal"]}})
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/toolsets set web true"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "toolsets.updated"
+    assert payload["ok"] is True
+    assert payload["total"] == 1
+    assert payload["updated"] == {"name": "web", "enabled": True}
+    assert payload["items"][0]["name"] == "web"
+    assert payload["items"][0]["enabled"] is True
+    cfg = hermes_config.load_config()
+    assert "web" in cfg["platform_toolsets"]["aops"]
+    assert "terminal" in cfg["platform_toolsets"]["aops"]
+
+
+@pytest.mark.asyncio
+async def test_aops_toolsets_unknown_name_returns_structured_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/toolsets enable unknown"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "toolsets.updated"
+    assert payload["ok"] is False
+    assert payload["items"] == []
+    assert payload["error"] == {
+        "code": "TOOLSET_NOT_FOUND",
+        "message": "Toolset `unknown` not found.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_aops_toolsets_context_uses_profile_and_metadata_agent_id(monkeypatch, tmp_path):
+    profile_home = tmp_path / ".hermes" / "profiles" / "ops-2"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(
+        _make_silent_aops_event("/toolsets list", metadata={"agentId": "ops-2"})
+    )
+
+    payload = json.loads(result)
+    assert payload["context"]["agentId"] == "ops-2"
+    assert payload["context"]["profileName"] == "ops-2"
+    assert payload["context"]["profileHome"] == str(profile_home)
 
 
 @pytest.mark.asyncio
@@ -2646,6 +3099,114 @@ async def test_aops_cron_history_works_while_agent_running(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_aops_cron_remove_deletes_job(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Daily report", schedule="every 1h", name="Daily report")
+    output_dir = Path(cron_jobs.OUTPUT_DIR) / job["id"]
+    output_dir.mkdir(parents=True)
+    (output_dir / "old.md").write_text("old output", encoding="utf-8")
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event(f"/cron remove {job['id']}"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "cron.removed"
+    assert payload["ok"] is True
+    assert payload["removed"] is True
+    assert payload["task"]["id"] == job["id"]
+    assert payload["context"]["jobId"] == job["id"]
+    assert cron_jobs.get_job(job["id"]) is None
+    assert not output_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_remove_accepts_silent_message(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Daily report", schedule="every 1h", name="Daily report")
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event(f"/cron remove {job['id']}"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "cron.removed"
+    assert payload["ok"] is True
+    assert cron_jobs.get_job(job["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_remove_returns_structured_usage_error(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/cron remove"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "cron.removed"
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "CRON_REMOVE_MISSING_REF"
+    assert payload["context"]["jobRef"] is None
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_remove_returns_not_found(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/cron remove missing-job"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "cron.removed"
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "CRON_JOB_NOT_FOUND"
+    assert payload["context"]["jobRef"] == "missing-job"
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_remove_refuses_ambiguous_name(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    first = cron_jobs.create_job(prompt="A", schedule="every 1h", name="dup")
+    second = cron_jobs.create_job(prompt="B", schedule="every 1h", name="dup")
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/cron remove dup"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "cron.removed"
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "CRON_REMOVE_AMBIGUOUS_REF"
+    assert {item["id"] for item in payload["matches"]} == {first["id"], second["id"]}
+    assert cron_jobs.get_job(first["id"]) is not None
+    assert cron_jobs.get_job(second["id"]) is not None
+
+
+@pytest.mark.asyncio
 async def test_aops_blocked_command_is_rejected_and_hidden_from_help():
     runner = _make_runner(extra={"dm_policy": "open", "blocked_commands": ["gateway"]})
 
@@ -2736,8 +3297,18 @@ async def test_aops_help_uses_structured_required_flags_for_cron_history():
 
     payload = json.loads(result)
     cron = next(item for item in payload["items"] if item["fullCommand"] == "/cron")
+    remove = next(child for child in cron["children"] if child["command"] == "remove")
     history = next(child for child in cron["children"] if child["command"] == "history")
     after = next(child for child in history["children"] if child["command"] == "after")
+    assert remove["usage"] == "/cron remove <id|name>"
+    assert remove["completions"] == [
+        {
+            "name": "idOrName",
+            "description": "定时任务 ID 或唯一名称。",
+            "required": True,
+            "choices": [],
+        },
+    ]
     assert history["completions"] == [
         {
             "name": "id",
@@ -2848,6 +3419,24 @@ async def test_aops_help_includes_security_command():
     assert security["executable"] is True
     set_child = next(child for child in security["children"] if child["command"] == "set")
     assert set_child["usage"] == "/security set <off|manual|smart>"
+
+
+@pytest.mark.asyncio
+async def test_aops_help_includes_toolsets_command():
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/help"))
+
+    payload = json.loads(result)
+    toolsets_node = next(item for item in payload["items"] if item["fullCommand"] == "/toolsets")
+    assert toolsets_node["type"] == "custom"
+    assert toolsets_node["executable"] is True
+    set_child = next(child for child in toolsets_node["children"] if child["command"] == "set")
+    assert set_child["usage"] == "/toolsets set <name> <true|false>"
+    assert set_child["completions"][1]["choices"] == [
+        {"value": "true", "description": "启用。"},
+        {"value": "false", "description": "关闭。"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -3484,6 +4073,7 @@ async def test_aops_commands_text_hides_removed_commands_and_lists_custom():
 
     assert "/update" not in result
     assert "/debug" not in result
+    assert "/cron remove <id|name>" in result
     assert "/cron history <id> [tsMs]" in result
     assert "⚡ **Skill Commands**:" in result
     assert "`/alpha-skill` -- Alpha description" in result

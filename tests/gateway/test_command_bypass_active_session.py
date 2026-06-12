@@ -13,6 +13,7 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -43,6 +44,13 @@ class _StubAdapter(BasePlatformAdapter):
         return {}
 
 
+@dataclass(frozen=True)
+class _LocalCommandResult:
+    text: str
+    content: list[dict] | None = None
+    metadata: dict | None = None
+
+
 def _make_adapter():
     """Create a minimal adapter for testing the active-session guard."""
     config = PlatformConfig(enabled=True, token="test-token")
@@ -57,6 +65,25 @@ def _make_adapter():
 
     async def _mock_send_retry(chat_id, content, **kwargs):
         adapter.sent_responses.append(content)
+
+    adapter._send_with_retry = _mock_send_retry
+    return adapter
+
+
+def _make_metadata_adapter():
+    adapter = _make_adapter()
+
+    async def _mock_handler(event):
+        return _LocalCommandResult(
+            text="handled:title",
+            metadata={"title": "已有中文标题", "sessionId": "sess-title"},
+        )
+
+    adapter._message_handler = _mock_handler
+
+    async def _mock_send_retry(chat_id, content, **kwargs):
+        adapter.sent_responses.append({"content": content, "metadata": kwargs.get("metadata")})
+        return MagicMock(success=True, message_id="reply-1")
 
     adapter._send_with_retry = _mock_send_retry
     return adapter
@@ -99,6 +126,20 @@ class TestCommandBypassActiveSession:
         assert any("handled:stop" in r for r in adapter.sent_responses), (
             "/stop response was not sent back to the user"
         )
+
+    @pytest.mark.asyncio
+    async def test_bypass_preserves_local_command_result_metadata(self):
+        """/title metadata must survive active-session bypass dispatch."""
+        adapter = _make_metadata_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/title"))
+
+        assert sk not in adapter._pending_messages
+        assert adapter.sent_responses[0]["content"] == "handled:title"
+        assert adapter.sent_responses[0]["metadata"]["title"] == "已有中文标题"
+        assert adapter.sent_responses[0]["metadata"]["sessionId"] == "sess-title"
 
     @pytest.mark.asyncio
     async def test_new_bypasses_guard(self):

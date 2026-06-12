@@ -60,6 +60,7 @@ _AOPS_NATIVE_COMMANDS = {
     "voice",
     "queue",
     "curator",
+    "toolsets",
 }
 
 _CATEGORY_MAP = {
@@ -104,6 +105,7 @@ _DESCRIPTION_ZH = {
     "voice": "切换语音模式。",
     "queue": "将提示排队到下一轮执行（不打断当前运行）。",
     "curator": "后台技能维护（状态、运行、固定、归档）。",
+    "toolsets": "查看或切换当前 profile 的 AOPS 工具集。",
     "skills": "列出已安装技能。",
     "cron": "查看定时任务。",
     "security": "查看或切换安全审批策略。",
@@ -225,6 +227,21 @@ _USAGE_COMPLETIONS = {
     ],
     "insights": [_param("days", "统计天数。", required=False)],
     "skills": [],
+    "toolsets": [
+        _param(
+            "subcommand",
+            "工具集子指令。",
+            required=False,
+            choices=[
+                _choice("list", "获取当前 agent/profile 的工具集列表。"),
+                _choice("enable", "启用工具集。"),
+                _choice("disable", "关闭工具集。"),
+                _choice("set", "按 true/false 设置工具集。"),
+            ],
+        ),
+        _param("name", "工具集名称，例如 web、terminal、file。", required=False),
+        _param("enabled", "true 或 false，仅 set 子指令需要。", required=False),
+    ],
     "cron": [],
     "security": [
         _param(
@@ -511,6 +528,8 @@ def _is_supported_custom_shape(canonical: str, raw_args: str) -> bool:
     if canonical == "cron":
         if not args or args == ["list"]:
             return True
+        if args[:1] == ["remove"]:
+            return len(args) <= 2
         if args[:1] != ["history"]:
             return False
         if len(args) >= 2 and args[1] in {"before", "after"}:
@@ -520,6 +539,8 @@ def _is_supported_custom_shape(canonical: str, raw_args: str) -> bool:
         return len(args) in {2, 3}
     if canonical == "curator":
         return True
+    if canonical == "toolsets":
+        return True
     return False
 
 
@@ -527,7 +548,7 @@ def is_supported_command(command: str | None, raw_args: str = "", canonical: str
     normalized = _effective_command(canonical or command, raw_args)
     if not normalized:
         return False
-    if normalized in {"skills", "cron", "curator"}:
+    if normalized in {"skills", "cron", "curator", "toolsets"}:
         return _is_supported_custom_shape(normalized, raw_args)
     try:
         from agent.skill_commands import resolve_skill_command_key
@@ -1016,6 +1037,206 @@ def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             )
     items.sort(key=lambda item: (str(item.get("name") or "").lower(), str(item.get("id") or "")))
     return items, {"skillsRoot": str(skills_root)}
+
+
+def _aops_agent_id(event: MessageEvent) -> str:
+    raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    value = (
+        raw.get("agentId")
+        or metadata.get("agentId")
+        or getattr(event.source, "agent_key", None)
+        or ""
+    )
+    text = str(value or "").strip()
+    return text or "main"
+
+
+def _toolset_context(event: MessageEvent) -> dict[str, Any]:
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    profile_name = "default"
+    try:
+        if home.parent.name == "profiles":
+            profile_name = home.name or "default"
+    except Exception:
+        profile_name = "default"
+    return {
+        "platform": "aops",
+        "agentId": _aops_agent_id(event),
+        "profileName": profile_name,
+        "profileHome": str(home),
+        "configPath": str(home / "config.yaml"),
+    }
+
+
+def _toolset_item(name: str, label: str, description: str, *, enabled: bool, configured: bool) -> dict[str, Any]:
+    from toolsets import resolve_toolset
+
+    return {
+        "name": name,
+        "label": re.sub(r"^[^\w\u4e00-\u9fff]+", "", str(label or "")).strip() or name,
+        "description": description,
+        "enabled": enabled,
+        "configured": configured,
+        "tools": resolve_toolset(name),
+    }
+
+
+def _toolset_payload(
+    *,
+    command_text: str,
+    event: MessageEvent,
+    type_: str = "toolsets.list",
+    updated: dict[str, Any] | None = None,
+    error: dict[str, Any] | None = None,
+    items: list[dict[str, Any]] | None = None,
+    summary: dict[str, Any] | None = None,
+) -> str:
+    item_list = items or []
+    payload = {
+        "schemaVersion": LOCAL_LIST_SCHEMA,
+        "type": type_,
+        "ok": error is None,
+        "command": command_text,
+        "itemType": "toolset",
+        "total": len(item_list),
+        "count": len(item_list),
+        "limit": None,
+        "hasMore": False,
+        "context": _toolset_context(event),
+        "summary": summary or {},
+        "items": item_list,
+        "error": error,
+    }
+    if updated is not None:
+        payload["updated"] = updated
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _toolset_list_data() -> tuple[list[dict[str, Any]], dict[str, Any], set[str], dict[str, tuple[str, str]]]:
+    from hermes_cli.config import load_config
+    from hermes_cli.tools_config import (
+        _get_effective_configurable_toolsets,
+        _get_platform_tools,
+        _toolset_allowed_for_platform,
+        _toolset_has_keys,
+    )
+
+    cfg = load_config()
+    enabled = _get_platform_tools(cfg, "aops", include_default_mcp_servers=False)
+    definitions = {
+        name: (label, description)
+        for name, label, description in _get_effective_configurable_toolsets()
+        if _toolset_allowed_for_platform(name, "aops")
+    }
+    items: list[dict[str, Any]] = []
+    for name in sorted(definitions):
+        label, description = definitions[name]
+        configured = bool(_toolset_has_keys(name, cfg))
+        items.append(
+            _toolset_item(
+                name,
+                label,
+                description,
+                enabled=name in enabled,
+                configured=configured,
+            )
+        )
+    summary = {
+        "enabled": sum(1 for item in items if item["enabled"]),
+        "disabled": sum(1 for item in items if not item["enabled"]),
+        "configured": sum(1 for item in items if item["configured"]),
+    }
+    return items, summary, enabled, definitions
+
+
+def _toolsets_command(command_text: str, event: MessageEvent, args: list[str]) -> str:
+    from hermes_cli.config import load_config
+    from hermes_cli.tools_config import _save_platform_tools
+
+    action = str(args[0] if args else "list").strip().lower().replace("_", "-")
+    if action in {"", "list"}:
+        try:
+            items, summary, _enabled, _definitions = _toolset_list_data()
+            return _toolset_payload(command_text=command_text, event=event, items=items, summary=summary)
+        except Exception as exc:
+            return _toolset_payload(
+                command_text=command_text,
+                event=event,
+                error={"code": "TOOLSETS_READ_FAILED", "message": str(exc)},
+            )
+
+    if action not in {"enable", "disable", "set"}:
+        return _toolset_payload(
+            command_text=command_text,
+            event=event,
+            type_="toolsets.updated",
+            error={
+                "code": "TOOLSETS_USAGE",
+                "message": "Usage: /toolsets list | /toolsets enable <name> | /toolsets disable <name> | /toolsets set <name> <true|false>",
+            },
+        )
+
+    if len(args) < 2:
+        return _toolset_payload(
+            command_text=command_text,
+            event=event,
+            type_="toolsets.updated",
+            error={"code": "TOOLSET_NAME_REQUIRED", "message": "Toolset name is required."},
+        )
+
+    target = str(args[1] or "").strip().lower()
+    requested_enabled: bool
+    if action == "set":
+        if len(args) != 3 or str(args[2]).strip().lower() not in {"true", "false"}:
+            return _toolset_payload(
+                command_text=command_text,
+                event=event,
+                type_="toolsets.updated",
+                error={"code": "TOOLSET_SET_USAGE", "message": "Usage: /toolsets set <name> <true|false>"},
+            )
+        requested_enabled = str(args[2]).strip().lower() == "true"
+    else:
+        requested_enabled = action == "enable"
+
+    try:
+        _items, _summary, enabled, definitions = _toolset_list_data()
+    except Exception as exc:
+        return _toolset_payload(
+            command_text=command_text,
+            event=event,
+            type_="toolsets.updated",
+            error={"code": "TOOLSETS_READ_FAILED", "message": str(exc)},
+        )
+
+    if target not in definitions:
+        return _toolset_payload(
+            command_text=command_text,
+            event=event,
+            type_="toolsets.updated",
+            error={"code": "TOOLSET_NOT_FOUND", "message": f"Toolset `{target}` not found."},
+        )
+
+    cfg = load_config()
+    updated_enabled = set(enabled)
+    if requested_enabled:
+        updated_enabled.add(target)
+    else:
+        updated_enabled.discard(target)
+    _save_platform_tools(cfg, "aops", updated_enabled)
+
+    items, summary, _enabled_after, _definitions_after = _toolset_list_data()
+    updated_item = [item for item in items if item.get("name") == target]
+    return _toolset_payload(
+        command_text=command_text,
+        event=event,
+        type_="toolsets.updated",
+        items=updated_item,
+        summary=summary,
+        updated={"name": target, "enabled": requested_enabled},
+    )
 
 
 def _cron_items() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
@@ -2085,6 +2306,111 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
     )
 
 
+def _cron_remove(command_text: str, args: list[str]) -> str:
+    from cron import jobs as cron_jobs
+
+    context = {
+        "storePath": str(cron_jobs.JOBS_FILE),
+        "jobRef": args[1] if len(args) > 1 else None,
+    }
+    if len(args) < 2:
+        return _single_response(
+            type_="cron.removed",
+            command=command_text,
+            data={"context": context},
+            ok=False,
+            error={
+                "code": "CRON_REMOVE_MISSING_REF",
+                "message": "Usage: /cron remove <id|name>",
+            },
+        )
+
+    job_ref = args[1]
+    try:
+        job = cron_jobs.resolve_job_ref(job_ref)
+    except getattr(cron_jobs, "AmbiguousJobReference") as exc:
+        matches = [
+            {
+                "id": match.get("id"),
+                "name": match.get("name"),
+                "description": _job_description(match),
+                "scheduleText": match.get("schedule_display") or (match.get("schedule") or {}).get("display"),
+            }
+            for match in getattr(exc, "matches", [])
+        ]
+        return _single_response(
+            type_="cron.removed",
+            command=command_text,
+            data={"context": context, "matches": matches},
+            ok=False,
+            error={
+                "code": "CRON_REMOVE_AMBIGUOUS_REF",
+                "message": str(exc),
+            },
+        )
+    except Exception as exc:
+        return _single_response(
+            type_="cron.removed",
+            command=command_text,
+            data={"context": context},
+            ok=False,
+            error={
+                "code": "CRON_REMOVE_FAILED",
+                "message": str(exc),
+            },
+        )
+
+    if job is None:
+        return _single_response(
+            type_="cron.removed",
+            command=command_text,
+            data={"context": context},
+            ok=False,
+            error={
+                "code": "CRON_JOB_NOT_FOUND",
+                "message": f"Cron job `{job_ref}` not found.",
+            },
+        )
+
+    summary = _history_summary_item(job)
+    try:
+        removed = cron_jobs.remove_job(job["id"])
+    except Exception as exc:
+        return _single_response(
+            type_="cron.removed",
+            command=command_text,
+            data={"context": {**context, "jobId": job.get("id")}, "task": summary},
+            ok=False,
+            error={
+                "code": "CRON_REMOVE_FAILED",
+                "message": str(exc),
+            },
+        )
+
+    if not removed:
+        return _single_response(
+            type_="cron.removed",
+            command=command_text,
+            data={"context": {**context, "jobId": job.get("id")}, "task": summary},
+            ok=False,
+            error={
+                "code": "CRON_JOB_NOT_FOUND",
+                "message": f"Cron job `{job_ref}` not found.",
+            },
+        )
+
+    return _single_response(
+        type_="cron.removed",
+        command=command_text,
+        data={
+            "context": {**context, "jobId": job.get("id")},
+            "task": summary,
+            "removed": True,
+            "message": f"Removed cron job `{job.get('name') or job.get('id')}`.",
+        },
+    )
+
+
 def maybe_local_command(event: MessageEvent) -> str | LocalCommandResult | None:
     command = event.get_command()
     skillhub_results = execute_silent_skillhub_command(event)
@@ -2119,6 +2445,9 @@ def maybe_local_command(event: MessageEvent) -> str | LocalCommandResult | None:
                 error={"code": "SKILLS_READ_FAILED", "message": str(exc)},
             )
 
+    if canonical == "toolsets":
+        return _toolsets_command(full_command, event, args)
+
     if canonical == "cron":
         if not args or args == ["list"]:
             try:
@@ -2141,6 +2470,8 @@ def maybe_local_command(event: MessageEvent) -> str | LocalCommandResult | None:
                 )
         if args[:1] == ["history"]:
             return _read_cron_history(full_command, args)
+        if args[:1] == ["remove"]:
+            return _cron_remove(full_command, args)
 
     if canonical == "model":
         try:
@@ -2334,9 +2665,79 @@ def _skills_node(config: Any) -> HelpNode:
     )
 
 
+def _toolsets_node(config: Any) -> HelpNode:
+    full_command = "/toolsets"
+    list_full = "/toolsets list"
+    enable_full = "/toolsets enable"
+    disable_full = "/toolsets disable"
+    set_full = "/toolsets set"
+    return _node(
+        type_="custom",
+        command=full_command,
+        full_command=full_command,
+        description="查看或切换当前 profile 的 AOPS 工具集。",
+        dangerous=_dangerous(config, full_command),
+        usage="/toolsets",
+        executable=True,
+        children=[
+            _node(
+                type_="custom",
+                command="list",
+                full_command=list_full,
+                description="获取当前 agent/profile 的工具集列表。",
+                dangerous=_dangerous(config, list_full),
+                usage=list_full,
+                executable=True,
+            ),
+            _node(
+                type_="custom",
+                command="enable",
+                full_command=enable_full,
+                description="启用工具集。",
+                dangerous=_dangerous(config, enable_full),
+                usage="/toolsets enable <name>",
+                executable=True,
+                completions=[_param("name", "工具集名称。", required=True)],
+            ),
+            _node(
+                type_="custom",
+                command="disable",
+                full_command=disable_full,
+                description="关闭工具集。",
+                dangerous=_dangerous(config, disable_full),
+                usage="/toolsets disable <name>",
+                executable=True,
+                completions=[_param("name", "工具集名称。", required=True)],
+            ),
+            _node(
+                type_="custom",
+                command="set",
+                full_command=set_full,
+                description="按 true/false 设置工具集。",
+                dangerous=_dangerous(config, set_full),
+                usage="/toolsets set <name> <true|false>",
+                executable=True,
+                completions=[
+                    _param("name", "工具集名称。", required=True),
+                    _param(
+                        "enabled",
+                        "是否启用。",
+                        required=True,
+                        choices=[
+                            _choice("true", "启用。"),
+                            _choice("false", "关闭。"),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
 def _cron_node(config: Any) -> HelpNode:
     full_command = "/cron"
     list_full = "/cron list"
+    remove_full = "/cron remove"
     history_full = "/cron history"
     history_before = "/cron history before"
     history_after = "/cron history after"
@@ -2398,6 +2799,18 @@ def _cron_node(config: Any) -> HelpNode:
                 dangerous=_dangerous(config, list_full),
                 usage=list_full,
                 executable=True,
+            ),
+            _node(
+                type_="custom",
+                command="remove",
+                full_command=remove_full,
+                description="删除定时任务。",
+                dangerous=_dangerous(config, remove_full),
+                usage="/cron remove <id|name>",
+                executable=False,
+                completions=[
+                    _param("idOrName", "定时任务 ID 或唯一名称。", required=True),
+                ],
             ),
             history_node,
         ],
@@ -2485,6 +2898,7 @@ def _count_nodes(nodes: list[HelpNode]) -> tuple[int, int, int]:
 def help_tree_response(config: Any, command_text: str = "/help") -> str:
     nodes = _build_official_nodes(config)
     nodes.append(_skills_node(config))
+    nodes.append(_toolsets_node(config))
     nodes.append(_cron_node(config))
     if not is_blocked(config, "security"):
         nodes.append(_security_node(config))
@@ -2548,8 +2962,12 @@ def aops_text_command_lines() -> list[str]:
     return [
         "`/skills` -- List installed skills",
         "`/skills list` -- List installed skills",
+        "`/toolsets` -- List or update AOPS toolsets",
+        "`/toolsets list` -- List AOPS toolsets",
+        "`/toolsets set <name> <true|false>` -- Enable or disable an AOPS toolset",
         "`/cron` -- Show scheduled tasks",
         "`/cron list` -- Show scheduled tasks",
+        "`/cron remove <id|name>` -- Remove a scheduled task",
         "`/cron history <id> [tsMs]` -- Show cron run history",
         "`/cron history before <id> [tsMs]` -- Show cron history before an anchor",
         "`/cron history after <id> <tsMs>` -- Show cron history after an anchor",

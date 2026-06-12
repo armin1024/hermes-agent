@@ -37,9 +37,41 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     build = Path("packaging/offline/build_aops_bundle.sh").read_text(encoding="utf-8")
     script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
     assert 'cp "$SCRIPT_DIR/tec01_oneclick_install.sh" "$BUNDLE_DIR/tec01_oneclick_install.sh"' in build
+    assert "aops-channel-interface.md" in build
+    assert "--set KEY=VALUE" in script
+    assert "--template-url" in script
+    assert "--template-file" in script
+    assert "write_default_template" in script
+    assert "AOPS_BOT_TOKEN" in script
+    assert "select_profile" in script
+    assert "json.dumps(sys.argv[2:]" in script
+    assert "set_items = json.loads" in script
+    assert "decode_markdown_escapes" in script
+    assert 'name = "default"' in script
+    assert "restartOtherRunningProfilesAfterUpgrade" in script
+    assert "restart_other_running_profiles_after_upgrade" in script
+    assert "gateway.pid" in script
+    assert "'hermes', '-p', profile, 'gateway', 'restart'" in script
+    assert "hermes-gateway-{profile}.service" in script
+    assert ".aops_bundle_sha256" in script
+    assert "RUNTIME_UPDATE_NEEDED" in script
+    assert "Hermes runtime bundle sha changed; will upgrade runtime" in script
+    assert "RUNTIME_CHANGED=true" in script
+    assert "install_skill_zips" in script
+    assert "zipfile.is_zipfile" in script
+    assert "--profile '$PROFILE_NAME'" in script
     assert "useradd -m -s /bin/bash" in script
     assert "loginctl enable-linger" in script
-    assert "hermes gateway install --force" in script
+    assert "gateway install --force" in script
     assert "ensure_gateway_service_installed \"start\"" in script
     assert "ensure_gateway_service_installed \"restart\"" in script
-    assert "--config-payload" in script
+    assert "--config-payload" not in script
+
+
+def test_aops_channel_interface_document_is_present():
+    doc = Path("docs/aops-channel-interface.md").read_text(encoding="utf-8")
+    assert "Runtime Agent Report" in doc
+    assert "Silent Slash Commands" in doc
+    assert "Toolsets" in doc
+    assert "Curl One-Click Profile" in doc
+    assert "必须同步更新本文档" in doc

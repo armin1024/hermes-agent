@@ -1,0 +1,78 @@
+parameters:
+  targetUser:
+    required: true
+  env.AOPS_BOT_TOKEN:
+    required: true
+  env.AOPS_BOT_URL:
+    required: false
+    default: http://aops-bot.internal
+  env.CLAWHUB_REGISTRY:
+    required: false
+    default: http://tec01.internal/clawhub
+
+bundle:
+  url: http://tec01.internal/hermes/packages/hermes-aops-offline-bundle.tar.gz
+  sha256: "<sha256>"
+
+profile:
+  name: ""
+  namePolicy: target-user-sequence
+  noBundledSkills: true
+  setActive: false
+
+config:
+  env:
+    AOPS_BOT_TOKEN: ${env.AOPS_BOT_TOKEN}
+    AOPS_BOT_URL: ${env.AOPS_BOT_URL}
+    AOPS_HOME_CHANNEL: ${env.AOPS_HOME_CHANNEL}
+    AOPS_HOME_CHANNEL_NAME: ${env.AOPS_HOME_CHANNEL_NAME}
+    AOPS_BASE_URL: ${env.AOPS_BASE_URL}
+    AOPS_API_KEY: ${env.AOPS_API_KEY}
+    CLAWHUB_REGISTRY: ${env.CLAWHUB_REGISTRY}
+    MODEL_GATEWAY_API_KEY: ${env.MODEL_GATEWAY_API_KEY}
+
+  configYaml:
+    model:
+      provider: ${configYaml.model.provider}
+      model: ${configYaml.model.model}
+      default: ${configYaml.model.default}
+      base_url: ${configYaml.model.base_url}
+      api_mode: ${configYaml.model.api_mode}
+      api_key_env: ${configYaml.model.api_key_env}
+      api_key: ${configYaml.model.api_key}
+    memory:
+      provider: hindsight
+    approvals:
+      mode: off
+    display:
+      busy_input_mode: queue
+    checkpoints:
+      enabled: true
+
+  hindsight:
+    mode: local_external
+    api_url: ${hindsight.api_url}
+    api_key: ${hindsight.api_key}
+    bank_id_template: users-{user}
+    budget: mid
+    timeout: 120
+    idle_timeout: 300
+
+  userMemory: |
+    # 用户偏好
+
+    请优先使用中文回答，保持专业、清晰、简洁。
+
+  soul: |
+    # Agent Identity
+
+    You are a focused AOPS operations agent.
+
+options:
+  installGatewayService: true
+  startGatewayAfterInstall: true
+  restartGatewayAfterUpgrade: true
+  restartOtherRunningProfilesAfterUpgrade: true
+  overwriteExistingConfig: false
+  overwriteFields: []
+  overwriteSkills: true
