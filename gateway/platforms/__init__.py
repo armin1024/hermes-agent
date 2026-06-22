@@ -26,12 +26,16 @@ __all__ = [
     "BasePlatformAdapter",
     "MessageEvent",
     "SendResult",
+    "AopsAdapter",
     "QQAdapter",
     "YuanbaoAdapter",
 ]
 
 
 def __getattr__(name):
+    if name == "AopsAdapter":
+        from .aops import AopsAdapter  # noqa: F401
+        return AopsAdapter
     if name == "QQAdapter":
         from .qqbot import QQAdapter  # noqa: F401
         return QQAdapter

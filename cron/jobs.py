@@ -51,6 +51,7 @@ except ImportError:
 HERMES_DIR = get_hermes_home().resolve()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
+HISTORY_FILE = CRON_DIR / "history.jsonl"
 
 # In-process lock protecting load_jobs→modify→save_jobs cycles.
 # Required when tick() runs jobs in parallel threads — without this,
@@ -182,6 +183,29 @@ def _coerce_job_text(value: Any, fallback: str = "") -> str:
     if value is None:
         return fallback
     return str(value)
+
+
+def job_description(job: Dict[str, Any], *, limit: int = 160) -> str:
+    """Return a stable human-readable description for cron list/history views."""
+    if not isinstance(job, dict):
+        return ""
+    skills = _normalize_skill_list(job.get("skill"), job.get("skills"))
+    candidates = (
+        job.get("description"),
+        job.get("prompt"),
+        job.get("name"),
+        skills[0] if skills else None,
+        job.get("script"),
+        job.get("id"),
+    )
+    for value in candidates:
+        text = " ".join(_coerce_job_text(value).split()).strip()
+        if not text:
+            continue
+        if limit > 0 and len(text) > limit:
+            return text[: max(0, limit - 1)].rstrip() + "…"
+        return text
+    return ""
 
 
 def _schedule_display_for_job(job: Dict[str, Any]) -> str:
@@ -1253,6 +1277,24 @@ def save_job_output(job_id: str, output: str):
         raise
     
     return output_file
+
+
+def append_cron_history(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Backward-compatible structured history append used by AOPS tests/tools."""
+    ensure_dirs()
+    history_file = Path(HISTORY_FILE)
+    timestamp = entry.get("timestamp") or _hermes_now().isoformat()
+    payload = {"timestamp": timestamp, **entry}
+
+    line = json.dumps(payload, ensure_ascii=False)
+    with _jobs_file_lock:
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        _secure_file(history_file)
+    return payload
 
 
 # =============================================================================

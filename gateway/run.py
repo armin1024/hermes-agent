@@ -67,6 +67,12 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_AOPS_RESERVED_MODEL_TOKENS = {"status", "current", "list", "use", "stutus", "stauts", "stattus", "statsu", "curent"}
+
+
+def _is_aops_reserved_model_token(value: str) -> bool:
+    normalized = str(value or "").strip().lower().strip("[](){}.,;:!?")
+    return normalized in _AOPS_RESERVED_MODEL_TOKENS
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
@@ -2970,6 +2976,167 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile,
         )
+
+    async def _run_aops_local_command(self, event: MessageEvent):
+        from gateway import aops_commands as _aops_commands
+
+        return await asyncio.to_thread(_aops_commands.maybe_local_command, event)
+
+    def _aops_preference_key_for_event(self, event: MessageEvent) -> Optional[str]:
+        source = event.source
+        if not source or source.platform != Platform.AOPS:
+            return None
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        agent_key = str(raw.get("agentKey") or raw.get("agentId") or "main")
+        try:
+            from gateway import aops_state
+            return aops_state.preference_key(
+                platform=source.platform.value,
+                channel_id=str(source.chat_id or ""),
+                agent_key=agent_key,
+            )
+        except Exception:
+            return None
+
+    def _aops_session_title_metadata_for_event(self, event: MessageEvent) -> dict[str, str]:
+        if not event.source or event.source.platform != Platform.AOPS:
+            return {}
+        title = ""
+        session_id = ""
+        try:
+            session_entry = self.session_store.get_or_create_session(event.source) if self.session_store else None
+            session_id = getattr(session_entry, "session_id", None)
+            if session_id and self._session_db:
+                title = self._session_db.get_session_title(session_id) or ""
+        except Exception:
+            title = ""
+            session_id = ""
+        data = {
+            "sessionKey": self._session_key_for_source(event.source),
+            "title": str(title or ""),
+        }
+        if session_id:
+            data["sessionId"] = str(session_id)
+        return data
+
+    def _aops_local_command_result_with_session_title(self, event: MessageEvent, local_reply):
+        if not hasattr(local_reply, "metadata"):
+            return local_reply
+        try:
+            from gateway import aops_commands as _aops_commands
+        except Exception:
+            return local_reply
+        existing_meta = getattr(local_reply, "metadata", None)
+        title_meta = self._aops_session_title_metadata_for_event(event)
+        base_meta = existing_meta if isinstance(existing_meta, dict) else {}
+        merged_meta = {**title_meta, **base_meta}
+        if not str(base_meta.get("title") or "").strip() and title_meta.get("title"):
+            merged_meta["title"] = title_meta["title"]
+        return _aops_commands.LocalCommandResult(
+            text=getattr(local_reply, "text", "") or "",
+            content=getattr(local_reply, "content", None),
+            metadata=merged_meta,
+        )
+
+    def _aops_session_title_for_id(self, session_id: str | None) -> str:
+        if not session_id or not self._session_db:
+            return ""
+        try:
+            return str(self._session_db.get_session_title(session_id) or "")
+        except Exception:
+            return ""
+
+    def _aops_outbound_title_for_payload(self, payload: dict) -> str:
+        if not self._session_db:
+            return ""
+        session_id = str(payload.get("runId") or payload.get("sessionId") or "").strip()
+        session_key = str(payload.get("sessionKey") or "").strip()
+        if not session_id:
+            if session_key and self.session_store:
+                try:
+                    self.session_store._ensure_loaded()
+                    entry = self.session_store._entries.get(session_key)
+                    session_id = str(getattr(entry, "session_id", "") or "")
+                except Exception:
+                    session_id = ""
+        if not session_id and self.session_store:
+            channel_id = str(payload.get("channelId") or "").strip()
+            if channel_id:
+                try:
+                    from gateway.session import SessionSource
+                    source = SessionSource(
+                        platform=Platform.AOPS,
+                        chat_id=channel_id,
+                        chat_type="dm",
+                    )
+                    session_key = self._session_key_for_source(source)
+                    self.session_store._ensure_loaded()
+                    entry = self.session_store._entries.get(session_key)
+                    session_id = str(getattr(entry, "session_id", "") or "")
+                except Exception:
+                    session_id = ""
+        return self._aops_session_title_for_id(session_id)
+
+    def _load_aops_model_preference_for_event(self, event: MessageEvent, session_key: str) -> None:
+        if not hasattr(self, "_aops_model_preferences_loaded"):
+            self._aops_model_preferences_loaded = set()
+        if not session_key or session_key in self._session_model_overrides:
+            return
+        pref_key = self._aops_preference_key_for_event(event)
+        if not pref_key or pref_key in self._aops_model_preferences_loaded:
+            return
+        try:
+            from gateway import aops_state
+            pref = aops_state.get_model_preference(pref_key)
+        except Exception as exc:
+            logger.debug("Failed to load AOPS model preference: %s", exc)
+            pref = None
+        self._aops_model_preferences_loaded.add(pref_key)
+        if not pref:
+            return
+        override = {k: pref.get(k) for k in ("model", "provider", "api_key", "base_url", "api_mode") if pref.get(k)}
+        model = str(override.get("model") or "").strip()
+        if _is_aops_reserved_model_token(model):
+            logger.warning("Ignoring invalid AOPS model preference for session %s: model=%s", session_key, model)
+            try:
+                from gateway import aops_state
+                aops_state.delete_model_preference(pref_key)
+            except Exception as exc:
+                logger.debug("Failed to delete invalid AOPS model preference %s: %s", pref_key, exc)
+            return
+        if override.get("model"):
+            self._session_model_overrides[session_key] = override
+            logger.info("Loaded AOPS model preference for session %s: %s/%s", session_key, override.get("provider"), override.get("model"))
+
+    def _remember_aops_model_preference(self, event: MessageEvent, session_key: str, preference: dict[str, Any]) -> None:
+        if not hasattr(self, "_aops_model_preferences_loaded"):
+            self._aops_model_preferences_loaded = set()
+        pref_key = self._aops_preference_key_for_event(event)
+        if not pref_key:
+            return
+        override = {
+            key: preference.get(key)
+            for key in ("model", "provider", "api_key", "base_url", "api_mode")
+            if preference.get(key)
+        }
+        model = str(override.get("model") or "").strip()
+        if _is_aops_reserved_model_token(model):
+            logger.warning("Ignoring invalid AOPS model switch preference for session %s: model=%s", session_key, model)
+            try:
+                from gateway import aops_state
+                aops_state.delete_model_preference(pref_key)
+            except Exception as exc:
+                logger.debug("Failed to delete invalid AOPS model switch preference %s: %s", pref_key, exc)
+            return
+        try:
+            from gateway import aops_state
+            aops_state.set_model_preference(pref_key, preference)
+            self._aops_model_preferences_loaded.add(pref_key)
+        except Exception as exc:
+            logger.warning("Failed to persist AOPS model preference: %s", exc)
+        if override.get("model"):
+            self._session_model_overrides[session_key] = override
+            self._evict_cached_agent(session_key)
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -7105,6 +7272,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             return YuanbaoAdapter(config)
 
+        elif platform == Platform.AOPS:
+            from gateway.platforms.aops import AopsAdapter, check_aops_requirements
+            if not check_aops_requirements():
+                logger.warning("AOPS: aiohttp not installed")
+                return None
+            return AopsAdapter(config)
+
         return None
 
 
@@ -7485,6 +7659,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+            if _evt_cmd and source.platform == Platform.AOPS:
+                from gateway import aops_commands as _aops_commands
+
+                _raw_args_inner = event.get_command_args().strip()
+                _canonical_inner = _cmd_def_inner.name if _cmd_def_inner else _evt_cmd
+                if _aops_commands.is_blocked(self.config, _evt_cmd, _raw_args_inner, _canonical_inner):
+                    return _aops_commands.block_message(_evt_cmd)
+                local_reply = await self._run_aops_local_command(event)
+                if local_reply is not None:
+                    return self._aops_local_command_result_with_session_title(event, local_reply)
+                if not _aops_commands.is_supported_command(_evt_cmd, _raw_args_inner, _canonical_inner):
+                    return _aops_commands.unsupported_message(_evt_cmd)
 
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
@@ -7865,6 +8051,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _denied is not None:
                 return _denied
 
+        if command and source.platform == Platform.AOPS:
+            from gateway import aops_commands as _aops_commands
+
+            raw_command_args = event.get_command_args().strip()
+            if _aops_commands.is_blocked(self.config, command, raw_command_args, canonical):
+                return _aops_commands.block_message(command)
+            local_reply = await self._run_aops_local_command(event)
+            if local_reply is not None:
+                if canonical == "model":
+                    try:
+                        text = getattr(local_reply, "text", local_reply)
+                        payload = json.loads(text) if isinstance(text, str) else None
+                        if isinstance(payload, dict) and payload.get("type") == "model.switch" and payload.get("ok", True):
+                            preference = None
+                            pref_key = payload.get("preferenceKey")
+                            if pref_key:
+                                try:
+                                    from gateway import aops_state
+                                    preference = aops_state.get_model_preference(str(pref_key))
+                                except Exception:
+                                    preference = None
+                            if not isinstance(preference, dict):
+                                preference = {
+                                    key: payload.get(key)
+                                    for key in ("model", "provider", "api_key", "base_url", "api_mode")
+                                    if payload.get(key)
+                                }
+                            if preference.get("model"):
+                                self._remember_aops_model_preference(
+                                    event,
+                                    self._session_key_for_source(source),
+                                    preference,
+                                )
+                    except Exception as exc:
+                        logger.debug("AOPS model local command preference sync skipped: %s", exc)
+                return self._aops_local_command_result_with_session_title(event, local_reply)
+            if canonical == "curator":
+                exit_code, output = _aops_commands.run_curator_command(raw_command_args)
+                if exit_code and "(exit " not in output:
+                    output = f"{output}\n(exit {exit_code})"
+                return output
+            if not _aops_commands.is_supported_command(command, raw_command_args, canonical):
+                return _aops_commands.unsupported_message(command)
+
         # Fire the ``command:<canonical>`` hook for any recognized slash
         # command — built-in OR plugin-registered. Handlers can return a
         # dict with ``{"decision": "deny" | "handled" | "rewrite", ...}``
@@ -8100,7 +8330,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_debug_command(event)
 
         if canonical == "title":
-            return await self._handle_title_command(event)
+            response = await self._handle_title_command(event)
+            if source.platform == Platform.AOPS:
+                from gateway import aops_commands as _aops_commands
+                return self._aops_local_command_result_with_session_title(
+                    event,
+                    _aops_commands.LocalCommandResult(text=response, metadata={}),
+                )
+            return response
 
         if canonical == "resume":
             return await self._handle_resume_command(event)
@@ -9415,6 +9652,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                route_overrides=getattr(event, "route_overrides", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -11862,6 +12100,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         adapter = self.adapters.get(source.platform)
         metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+        if source.platform == Platform.AOPS:
+            metadata = dict(metadata or {})
+            reply_to = self._reply_anchor_for_event(event)
+            if reply_to:
+                metadata["reply_to"] = reply_to
 
         used_buttons = False
         if adapter is not None:
@@ -14154,6 +14397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         channel_prompt: Optional[str] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        route_overrides: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -14171,6 +14415,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                route_overrides=route_overrides,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -14181,6 +14426,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                route_overrides=route_overrides,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -14212,6 +14458,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         channel_prompt: Optional[str] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        route_overrides: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -14380,6 +14627,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _ack_err:
                 logger.debug("voice ack schedule failed: %s", _ack_err)
 
+        native_reply_bridge = None
+        native_reply_task = None
+        if source.platform == Platform.AOPS:
+            try:
+                from gateway.platforms.aops import AopsLiveReplyBridge
+                _aops_adapter = self.adapters.get(source.platform)
+                if _aops_adapter is not None:
+                    native_reply_bridge = AopsLiveReplyBridge(
+                        _aops_adapter,
+                        chat_id=source.chat_id,
+                        reply_to_id=event_message_id,
+                        run_id=session_id,
+                    )
+                    # AOPS has its own websocket message_reply stream. Disable
+                    # generic progress bubbles so tool events are not dropped by
+                    # non-editable adapter handling or duplicated as plain text.
+                    progress_queue = None
+                    native_reply_task = asyncio.create_task(native_reply_bridge.run())
+            except Exception as exc:
+                logger.debug("AOPS native reply bridge unavailable: %s", exc)
+
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
         # ``display.platforms.<platform>.cleanup_progress: true``, message IDs
@@ -14404,6 +14672,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
+            if native_reply_bridge is not None:
+                if not _run_still_current():
+                    return
+                try:
+                    native_reply_bridge.on_tool_progress(
+                        event_type,
+                        tool_name,
+                        preview,
+                        args,
+                        **kwargs,
+                    )
+                except Exception as exc:
+                    logger.debug("AOPS native tool progress enqueue failed: %s", exc)
+                return
             if not progress_queue or not _run_still_current():
                 return
 
@@ -15180,6 +15462,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
+                if native_reply_bridge is not None:
+                    native_reply_bridge.on_commentary(text, already_streamed=already_streamed)
+                    return
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
@@ -15199,6 +15484,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
+            if isinstance(route_overrides, dict) and route_overrides:
+                if route_overrides.get("model"):
+                    model = str(route_overrides["model"])
+                for key in ("provider", "api_key", "base_url", "api_mode", "command", "args", "credential_pool"):
+                    if key in route_overrides and route_overrides[key] is not None:
+                        runtime_kwargs[key] = route_overrides[key]
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
             # Check agent cache — reuse the AIAgent from the previous message
@@ -15871,6 +16162,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                if native_reply_bridge is not None:
+                    native_reply_bridge.send_final(error_msg, conversation_ended=True)
+                    native_reply_bridge.finish()
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -15961,6 +16255,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             effective_session_id,
                             title,
                         )
+                    elif source.platform == Platform.AOPS and native_reply_bridge is not None:
+                        maybe_auto_title_kwargs["title_callback"] = native_reply_bridge.update_title
                     maybe_auto_title(
                         self._session_db,
                         effective_session_id,
@@ -15971,6 +16267,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 except Exception:
                     pass
+
+            if native_reply_bridge is not None:
+                native_reply_bridge.send_final(
+                    final_response,
+                    conversation_ended=True,
+                )
+                native_reply_bridge.finish()
 
             return {
                 "final_response": final_response,
@@ -16562,7 +16865,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not was_interrupted:
                     # Queued message after normal completion — deliver the first
                     # response before processing the queued follow-up.
-                    # Skip if streaming already delivered it.
+                    # Skip if streaming or the AOPS native reply bridge already
+                    # delivered it. AOPS sends final replies through its websocket
+                    # message_reply stream; falling back to adapter.send() here
+                    # would duplicate the same answer.
                     _sc = stream_consumer_holder[0]
                     if _sc and stream_task:
                         try:
@@ -16575,9 +16881,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 pass
                         except Exception as e:
                             logger.debug("Stream consumer wait before queued message failed: %s", e)
+                    if native_reply_task:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(native_reply_task), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            logger.debug("AOPS native reply wait before queued message timed out")
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            logger.debug("AOPS native reply wait before queued message failed: %s", e)
                     _previewed = bool(result.get("response_previewed"))
+                    _native_sent = bool(
+                        native_reply_bridge
+                        and getattr(native_reply_bridge, "final_response_sent", False)
+                    )
                     _already_streamed = bool(
-                        (_sc and getattr(_sc, "final_response_sent", False))
+                        _native_sent
+                        or (_sc and getattr(_sc, "final_response_sent", False))
                         or _previewed
                         or (_sc and getattr(_sc, "final_content_delivered", False))
                     )
@@ -16676,6 +16996,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    route_overrides=route_overrides,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
@@ -16728,7 +17049,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._update_runtime_status("draining")
             
             # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task, _notify_task]:
+            for task in [progress_task, interrupt_monitor, tracking_task, _notify_task, native_reply_task]:
                 if task:
                     try:
                         await task
@@ -16752,6 +17073,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
+            _native_sent = bool(
+                native_reply_bridge
+                and getattr(native_reply_bridge, "final_response_sent", False)
+            )
             _streamed = bool(
                 _sc and getattr(_sc, "final_response_sent", False)
             )
@@ -16765,10 +17090,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # after streaming finished — when the response was transformed, always
             # send the final version so the appended content reaches the client.
             _transformed = bool(response.get("response_transformed"))
-            if not _is_empty_sentinel and not _transformed and (_streamed or _previewed or _content_delivered):
+            if not _is_empty_sentinel and not _transformed and (_native_sent or _streamed or _previewed or _content_delivered):
                 logger.info(
-                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
+                    "Suppressing normal final send for session %s: final delivery already confirmed (native=%s streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
+                    _native_sent,
                     _streamed,
                     _previewed,
                     _content_delivered,

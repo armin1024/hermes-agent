@@ -205,8 +205,8 @@ GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
 
 def _get_default_output_dir() -> str:
-    from hermes_constants import get_hermes_dir
-    return str(get_hermes_dir("cache/audio", "audio_cache"))
+    from hermes_constants import get_hermes_home
+    return str(get_hermes_home() / "cache" / "audio")
 
 DEFAULT_OUTPUT_DIR = _get_default_output_dir()
 
@@ -2825,7 +2825,7 @@ TTS_SCHEMA = {
             },
             "output_path": {
                 "type": "string",
-                "description": f"Optional custom file path to save the audio. Defaults to {display_hermes_home()}/audio_cache/<timestamp>.mp3"
+                "description": f"Optional custom file path to save the audio. Defaults to {display_hermes_home()}/cache/audio/<timestamp>.mp3"
             }
         },
         "required": ["text"]

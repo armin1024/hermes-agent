@@ -243,6 +243,7 @@ class GatewayAuthorizationMixin:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            Platform.AOPS: "AOPS_ALLOWED_USERS",
         }
         platform_group_user_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -270,6 +271,7 @@ class GatewayAuthorizationMixin:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+            Platform.AOPS: "AOPS_ALLOW_ALL_USERS",
         }
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
         platform_allow_bots_map = {
@@ -312,6 +314,27 @@ class GatewayAuthorizationMixin:
         platform_name = source.platform.value if source.platform else ""
         if self.pairing_store.is_approved(platform_name, user_id):
             return True
+
+        # AOPS uses dm_policy / allow_from semantics instead of the generic
+        # gateway allowlist flow.
+        if source.platform == Platform.AOPS:
+            platform_cfg = self.config.platforms.get(Platform.AOPS) if hasattr(self.config, "platforms") else None
+            extra = getattr(platform_cfg, "extra", {}) if platform_cfg else {}
+            dm_policy = str(extra.get("dm_policy", "open")).strip().lower() or "open"
+            allow_from = extra.get("allow_from") or []
+            allowed_ids = {str(item).strip() for item in allow_from if str(item).strip()}
+            if os.getenv("AOPS_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+                return True
+            compat_allowlist = os.getenv("AOPS_ALLOWED_USERS", "").strip()
+            if compat_allowlist:
+                allowed_ids.update(uid.strip() for uid in compat_allowlist.split(",") if uid.strip())
+            if dm_policy == "open":
+                return True
+            if dm_policy == "disabled":
+                return False
+            if dm_policy == "allowlist":
+                return "*" in allowed_ids or user_id in allowed_ids
+            return False
 
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
@@ -516,6 +539,7 @@ class GatewayAuthorizationMixin:
                 Platform.WEIXIN:   "WEIXIN_ALLOWED_USERS",
                 Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
                 Platform.QQBOT:    "QQ_ALLOWED_USERS",
+                Platform.AOPS:     "AOPS_ALLOWED_USERS",
             }
             platform_group_env_map = {
                 Platform.TELEGRAM: (

@@ -1858,8 +1858,10 @@ function Copy-ConfigTemplates {
     New-Item -ItemType Directory -Force -Path "$HermesHome\logs" | Out-Null
     New-Item -ItemType Directory -Force -Path "$HermesHome\pairing" | Out-Null
     New-Item -ItemType Directory -Force -Path "$HermesHome\hooks" | Out-Null
-    New-Item -ItemType Directory -Force -Path "$HermesHome\image_cache" | Out-Null
-    New-Item -ItemType Directory -Force -Path "$HermesHome\audio_cache" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$HermesHome\cache\images" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$HermesHome\cache\audio" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$HermesHome\cache\videos" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$HermesHome\cache\documents" | Out-Null
     New-Item -ItemType Directory -Force -Path "$HermesHome\memories" | Out-Null
     New-Item -ItemType Directory -Force -Path "$HermesHome\skills" | Out-Null
 

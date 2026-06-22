@@ -532,6 +532,8 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
     # Matrix room IDs (start with !) and user IDs (start with @) are explicit
+    if platform_name == "aops" and target_ref and target_ref.strip() == target_ref and not any(ch.isspace() for ch in target_ref):
+        return target_ref, None, True
     if platform_name == "matrix" and (target_ref.startswith("!") or target_ref.startswith("@")):
         return target_ref, None, True
     # XMPP JIDs (user@server or room@conference.server) are explicit
@@ -939,6 +941,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
         if isinstance(result, dict) and result.get("error"):
             return result
+        if platform == Platform.AOPS and isinstance(result, dict) and result.get("success"):
+            result.setdefault("platform", platform.value)
+            result.setdefault("chat_id", chat_id)
         last_result = result
 
     if warning and isinstance(last_result, dict) and last_result.get("success"):

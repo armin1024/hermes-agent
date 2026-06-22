@@ -10757,7 +10757,7 @@ def _(rid, params: dict) -> dict:
                 unified_search(
                     query,
                     create_source_router(GitHubAuth()),
-                    source_filter="all",
+                    source_filter=str(params.get("source") or "clawhub"),
                     limit=20,
                 )
                 or []
@@ -10786,7 +10786,12 @@ def _(rid, params: dict) -> dict:
                 int(query) if query.isdigit() else 1
             )
             return _ok(
-                rid, browse_skills(page=pg, page_size=int(params.get("page_size", 20)))
+                rid,
+                browse_skills(
+                    page=pg,
+                    page_size=int(params.get("page_size", 20)),
+                    source=str(params.get("source") or "clawhub"),
+                ),
             )
         if action == "inspect":
             from hermes_cli.skills_hub import inspect_skill

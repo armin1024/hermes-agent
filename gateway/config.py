@@ -36,6 +36,15 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return is_truthy_value(value, default=default)
 
 
+def _coerce_csv_list(value: Any) -> List[str]:
+    """Coerce comma-separated env/config values into a trimmed string list."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
 def _coerce_float(value: Any, default: float) -> float:
     """Coerce numeric config values, falling back on malformed input."""
     if value is None:
@@ -164,6 +173,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    AOPS = "aops"
     RELAY = "relay"  # generic relay adapter fronted by the connector (EXPERIMENTAL)
     @classmethod
     def _missing_(cls, value):
@@ -489,6 +499,7 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.YUANBAO: lambda cfg: bool(
         cfg.extra.get("app_id") and cfg.extra.get("app_secret")
     ),
+    Platform.AOPS: lambda cfg: bool(cfg.token and cfg.extra.get("base_url")),
     Platform.DINGTALK: lambda cfg: bool(
         (cfg.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
         and (cfg.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
@@ -1343,6 +1354,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
         Platform.MATTERMOST: "MATTERMOST_TOKEN",
         Platform.MATRIX: "MATRIX_ACCESS_TOKEN",
         Platform.WEIXIN: "WEIXIN_TOKEN",
+        Platform.AOPS: "AOPS_BOT_TOKEN",
     }
     for platform, pconfig in config.platforms.items():
         if not pconfig.enabled:
@@ -1702,6 +1714,56 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
+
+    # AOPS platform.  The customized AOPS channel intentionally uses
+    # AOPS_BOT_URL as the canonical upstream base URL; AOPS_BASE_URL is not
+    # migrated or rewritten so legacy env files remain explicit.
+    aops_bot_token = os.getenv("AOPS_BOT_TOKEN")
+    aops_bot_url = os.getenv("AOPS_BOT_URL", "").strip()
+    if aops_bot_token or aops_bot_url or Platform.AOPS in config.platforms:
+        if Platform.AOPS not in config.platforms:
+            config.platforms[Platform.AOPS] = PlatformConfig()
+        config.platforms[Platform.AOPS].enabled = True
+        if aops_bot_token:
+            config.platforms[Platform.AOPS].token = aops_bot_token
+        extra = config.platforms[Platform.AOPS].extra
+        if aops_bot_url:
+            extra["base_url"] = aops_bot_url.rstrip("/")
+        aops_push_tool_calls = os.getenv("AOPS_PUSH_TOOL_CALLS", "").strip()
+        if aops_push_tool_calls:
+            extra["push_tool_calls"] = _coerce_bool(aops_push_tool_calls, True)
+        aops_dm_policy = os.getenv("AOPS_DM_POLICY", "").strip().lower()
+        if aops_dm_policy:
+            extra["dm_policy"] = aops_dm_policy
+        aops_allow_from = os.getenv("AOPS_ALLOW_FROM", "").strip()
+        if aops_allow_from:
+            extra["allow_from"] = _coerce_csv_list(aops_allow_from)
+        aops_trusted = os.getenv("AOPS_TRUSTED_AGENT_KEY_FROM", "").strip()
+        if aops_trusted:
+            extra["trusted_agent_key_from"] = _coerce_csv_list(aops_trusted)
+        aops_proxy = os.getenv("AOPS_PROXY", "").strip()
+        if aops_proxy:
+            extra["proxy"] = aops_proxy
+        aops_connect_timeout = os.getenv("AOPS_CONNECT_TIMEOUT", "").strip()
+        if aops_connect_timeout:
+            try:
+                extra["connect_timeout"] = float(aops_connect_timeout)
+            except ValueError:
+                pass
+        aops_log_retention = os.getenv("AOPS_LOG_RETENTION_DAYS", "").strip()
+        if aops_log_retention:
+            try:
+                extra["log_retention_days"] = int(aops_log_retention)
+            except ValueError:
+                pass
+        aops_home = os.getenv("AOPS_HOME_CHANNEL", "").strip()
+        if aops_home:
+            config.platforms[Platform.AOPS].home_channel = HomeChannel(
+                platform=Platform.AOPS,
+                chat_id=aops_home,
+                name=os.getenv("AOPS_HOME_CHANNEL_NAME", "Home"),
+                thread_id=os.getenv("AOPS_HOME_CHANNEL_THREAD_ID") or None,
+            )
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in {"true", "1", "yes"}

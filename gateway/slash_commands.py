@@ -950,6 +950,13 @@ class GatewaySlashCommandsMixin:
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
         from gateway.run import _telegramize_command_mentions
+        from gateway.config import Platform
+
+        if event.source.platform == Platform.AOPS:
+            from gateway import aops_commands as _aops_commands
+
+            return _aops_commands.help_tree_response(self.config)
+
         from hermes_cli.commands import gateway_help_lines
         lines = [
             t("gateway.help.header"),
@@ -988,23 +995,33 @@ class GatewaySlashCommandsMixin:
 
         # Build combined entry list: built-in commands + skill commands
         entries = list(gateway_help_lines())
-        try:
-            from agent.skill_commands import get_skill_commands
-            skill_cmds = get_skill_commands()
-            if skill_cmds:
-                entries.append("")
-                entries.append(t("gateway.commands.skill_header"))
-                for cmd in sorted(skill_cmds):
-                    desc = skill_cmds[cmd].get("description", "").strip() or t("gateway.commands.default_desc")
-                    entries.append(f"`{cmd}` — {desc}")
-        except Exception:
-            pass
+        from gateway.config import Platform
+        if event.source.platform == Platform.AOPS:
+            from gateway import aops_commands as _aops_commands
+
+            filtered_entries = _aops_commands.filter_help_lines(entries, self.config)
+            entries = ["🧰 **AOPS Local Commands**", *_aops_commands.aops_text_command_lines(), ""]
+            skill_entries = _aops_commands.aops_skill_command_lines(self.config)
+            if skill_entries:
+                entries.extend(["⚡ **Skill Commands**:", *skill_entries, ""])
+            entries.extend(filtered_entries)
+        else:
+            try:
+                from agent.skill_commands import get_skill_commands
+                skill_cmds = get_skill_commands()
+                if skill_cmds:
+                    entries.append("")
+                    entries.append(t("gateway.commands.skill_header"))
+                    for cmd in sorted(skill_cmds):
+                        desc = skill_cmds[cmd].get("description", "").strip() or t("gateway.commands.default_desc")
+                        entries.append(f"`{cmd}` — {desc}")
+            except Exception:
+                pass
 
         if not entries:
             return t("gateway.commands.none")
 
-        from gateway.config import Platform
-        page_size = 15 if event.source.platform == Platform.TELEGRAM else 20
+        page_size = 30 if event.source.platform == Platform.AOPS else (15 if event.source.platform == Platform.TELEGRAM else 20)
         total_pages = max(1, (len(entries) + page_size - 1) // page_size)
         page = max(1, min(requested_page, total_pages))
         start = (page - 1) * page_size
@@ -1051,6 +1068,15 @@ class GatewaySlashCommandsMixin:
         from hermes_cli.providers import get_label
 
         raw_args = event.get_command_args().strip()
+        try:
+            from gateway.config import Platform
+            if event.source.platform == Platform.AOPS:
+                from gateway import aops_commands as _aops_commands
+                local = _aops_commands.maybe_local_command(event)
+                if local is not None:
+                    return getattr(local, "text", local)
+        except Exception:
+            pass
 
         # Parse --provider, --global, --session, and --refresh flags
         (
