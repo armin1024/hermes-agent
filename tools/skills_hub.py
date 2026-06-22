@@ -1944,8 +1944,7 @@ class ClawHubSource(SkillSource):
     their vetting is insufficient (341 malicious skills found Feb 2026).
     """
 
-    _registry = os.environ.get("CLAWHUB_REGISTRY", "https://clawhub.ai").rstrip("/")
-    BASE_URL = f"{_registry}/api/v1"
+    BASE_URL = "https://clawhub.ai/api/v1"
 
     # Wall-clock budget for a full catalog walk. ClawHub has 50k+ skills and
     # the walk is sequential (~250 requests, each under per-request
@@ -1955,6 +1954,13 @@ class ClawHubSource(SkillSource):
 
     def source_id(self) -> str:
         return "clawhub"
+
+    @classmethod
+    def configured_base_url(cls) -> str:
+        registry = os.environ.get("CLAWHUB_REGISTRY", "").strip().rstrip("/")
+        if registry:
+            return f"{registry}/api/v1"
+        return str(cls.BASE_URL).rstrip("/")
 
     def trust_level_for(self, identifier: str) -> str:
         return "community"
@@ -2143,7 +2149,7 @@ class ClawHubSource(SkillSource):
 
         try:
             resp = httpx.get(
-                f"{self.BASE_URL}/skills",
+                f"{self.configured_base_url()}/skills",
                 params={"search": query, "limit": limit},
                 timeout=15,
             )
@@ -2181,7 +2187,7 @@ class ClawHubSource(SkillSource):
     def fetch(self, identifier: str) -> Optional[SkillBundle]:
         slug = identifier.split("/")[-1]
 
-        skill_data = self._get_json(f"{self.BASE_URL}/skills/{slug}")
+        skill_data = self._get_json(f"{self.configured_base_url()}/skills/{slug}")
         if not isinstance(skill_data, dict):
             return None
 
@@ -2195,7 +2201,7 @@ class ClawHubSource(SkillSource):
 
         # Fallback: try the version metadata endpoint for inline/raw content
         if "SKILL.md" not in files:
-            version_data = self._get_json(f"{self.BASE_URL}/skills/{slug}/versions/{latest_version}")
+            version_data = self._get_json(f"{self.configured_base_url()}/skills/{slug}/versions/{latest_version}")
             if isinstance(version_data, dict):
                 # Files may be nested under version_data["version"]["files"]
                 files = self._extract_files(version_data) or files
@@ -2222,7 +2228,7 @@ class ClawHubSource(SkillSource):
 
     def inspect(self, identifier: str) -> Optional[SkillMeta]:
         slug = identifier.split("/")[-1]
-        data = self._coerce_skill_payload(self._get_json(f"{self.BASE_URL}/skills/{slug}"))
+        data = self._coerce_skill_payload(self._get_json(f"{self.configured_base_url()}/skills/{slug}"))
         if not isinstance(data, dict):
             return None
 
@@ -2301,7 +2307,7 @@ class ClawHubSource(SkillSource):
                 params["cursor"] = cursor
 
             try:
-                resp = httpx.get(f"{self.BASE_URL}/skills", params=params, timeout=30)
+                resp = httpx.get(f"{self.configured_base_url()}/skills", params=params, timeout=30)
                 if resp.status_code != 200:
                     break
                 data = resp.json()
@@ -2370,7 +2376,7 @@ class ClawHubSource(SkillSource):
             if isinstance(latest_tag, str) and latest_tag:
                 return latest_tag
 
-        versions_data = self._get_json(f"{self.BASE_URL}/skills/{slug}/versions")
+        versions_data = self._get_json(f"{self.configured_base_url()}/skills/{slug}/versions")
         if isinstance(versions_data, list) and versions_data:
             first = versions_data[0]
             if isinstance(first, dict):
@@ -2420,7 +2426,7 @@ class ClawHubSource(SkillSource):
         for attempt in range(max_retries):
             try:
                 resp = httpx.get(
-                    f"{self.BASE_URL}/download",
+                    f"{self.configured_base_url()}/download",
                     params={"slug": slug, "version": version},
                     timeout=30,
                     follow_redirects=True,
