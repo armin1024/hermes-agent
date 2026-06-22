@@ -152,6 +152,20 @@ def gui_toolset_label(label: str) -> str:
 # model if the credential later goes missing or expires.
 _DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search"}
 
+AOPS_TERMINAL_DEFAULT_TOOLSETS: Set[str] = {
+    "terminal",
+    "file",
+    "code_execution",
+    "skills",
+    "todo",
+    "memory",
+    "session_search",
+    "clarify",
+    "delegation",
+    "cronjob",
+    "messaging",
+}
+
 
 def _xai_credentials_present() -> bool:
     """Cheap, side-effect-free check for usable xAI credentials.
@@ -1734,6 +1748,16 @@ def _get_platform_tools(
     # ``hermes-discord``) is an opt-in to the platform's native default-off
     # toolsets — see _exempt_explicit_platform_native (#35527).
     explicitly_configured = isinstance(toolset_names, list)
+    if platform == "aops":
+        cli_toolsets = platform_toolsets.get("cli")
+        legacy_aops_toolsets = platform_toolsets.get("aops")
+        if isinstance(cli_toolsets, list):
+            toolset_names = cli_toolsets
+        elif isinstance(legacy_aops_toolsets, list):
+            toolset_names = legacy_aops_toolsets
+        else:
+            toolset_names = sorted(AOPS_TERMINAL_DEFAULT_TOOLSETS)
+        explicitly_configured = isinstance(toolset_names, list)
 
     if toolset_names is None or not isinstance(toolset_names, list):
         plat_info = PLATFORMS.get(platform)
@@ -2012,6 +2036,42 @@ def _get_platform_tools(
             )
 
     return enabled_toolsets
+
+
+def _has_platform_toolset_config(config: dict, platform: str) -> bool:
+    platform_toolsets = config.get("platform_toolsets") or {}
+    return isinstance(platform_toolsets, dict) and isinstance(platform_toolsets.get(platform), list)
+
+
+def _get_aops_dashboard_toolsets(
+    config: dict,
+    *,
+    include_default_mcp_servers: bool = True,
+) -> Set[str]:
+    """Resolve AOPS toolsets from dashboard-compatible CLI state."""
+    if _has_platform_toolset_config(config, "cli"):
+        platform = "cli"
+        resolved_config = config
+    elif _has_platform_toolset_config(config, "aops"):
+        platform = "aops"
+        resolved_config = config
+    else:
+        platform = "cli"
+        resolved_config = dict(config or {})
+        platform_toolsets = dict(resolved_config.get("platform_toolsets") or {})
+        platform_toolsets["cli"] = sorted(AOPS_TERMINAL_DEFAULT_TOOLSETS)
+        resolved_config["platform_toolsets"] = platform_toolsets
+    return _get_platform_tools(
+        resolved_config,
+        platform,
+        include_default_mcp_servers=include_default_mcp_servers,
+    )
+
+
+def _save_aops_dashboard_toolsets(config: dict, enabled_toolset_keys: Set[str]):
+    """Save AOPS switches to dashboard CLI state and mirror legacy AOPS."""
+    _save_platform_tools(config, "cli", enabled_toolset_keys)
+    _save_platform_tools(config, "aops", enabled_toolset_keys)
 
 
 def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[str]):

@@ -2179,7 +2179,8 @@ class ClawHubSource(SkillSource):
     their vetting is insufficient (341 malicious skills found Feb 2026).
     """
 
-    BASE_URL = "https://clawhub.ai/api/v1"
+    _registry = os.environ.get("CLAWHUB_REGISTRY", "https://clawhub.ai").rstrip("/")
+    BASE_URL = f"{_registry}/api/v1"
 
     # Wall-clock budget for a full catalog walk. ClawHub has 50k+ skills and
     # the walk is sequential (~250 requests, each under per-request
