@@ -112,6 +112,60 @@ _DESCRIPTION_ZH = {
     "securty": "查看或切换安全审批策略。",
 }
 
+_TOOLSET_DESCRIPTION_ZH = {
+    "web": "执行网页搜索和网页内容抓取。内网纯终端环境通常不可用，除非已配置可访问的搜索或抓取服务。",
+    "browser": "驱动浏览器进行页面导航、点击、输入和滚动。无图形浏览器的 Linux 服务器默认不可用。",
+    "terminal": "执行终端命令、管理进程和读取命令输出。适合服务器运维。",
+    "file": "读取、搜索、创建和修改文件。适合配置、日志和代码处理。",
+    "code_execution": "运行受控代码片段，用于数据处理、脚本验证和快速计算。",
+    "vision": "分析图片内容。需要视觉模型或相关服务配置。",
+    "video": "分析视频内容。需要支持视频的模型或后端服务。",
+    "image_gen": "生成图片。需要图像生成后端或 API Key。",
+    "video_gen": "生成视频。需要视频生成后端或 API Key。",
+    "x_search": "搜索 X/Twitter 内容。需要 xAI 或 X 相关凭证。",
+    "moa": "使用多个模型协作回答。通常需要外部模型凭证。",
+    "tts": "文本转语音。纯终端服务器默认不需要启用。",
+    "skills": "列出、查看和管理 Hermes Skills。",
+    "todo": "维护任务计划和待办事项。",
+    "memory": "读写长期记忆。",
+    "session_search": "搜索历史会话内容。",
+    "clarify": "在信息不足时发起澄清问题。",
+    "delegation": "委派子任务给其他 agent 或执行单元。",
+    "cronjob": "创建、查看、更新和运行定时任务。",
+    "messaging": "通过已配置平台发送消息。",
+    "homeassistant": "控制 Home Assistant 智能家居。需要 HASS_TOKEN 和服务地址。",
+    "spotify": "控制 Spotify 播放、搜索和媒体库。需要 Spotify 凭证。",
+    "discord": "读取和参与 Discord 会话。需要 Discord 平台配置。",
+    "discord_admin": "管理 Discord 频道、角色和帖子。需要 Discord 管理权限配置。",
+    "yuanbao": "使用元宝平台相关消息能力。需要平台配置。",
+    "computer_use": "控制 macOS 桌面。Linux 纯终端服务器不可用。",
+}
+
+_LINUX_TERMINAL_UNSUPPORTED_REASONS = {
+    "web": "内网 Linux 服务器通常无法访问公网搜索/抓取服务，默认关闭。",
+    "browser": "需要可用浏览器或浏览器自动化运行环境，纯终端服务器默认关闭。",
+    "vision": "需要视觉模型或外部服务配置，默认关闭。",
+    "video": "需要视频理解模型或外部服务配置，默认关闭。",
+    "image_gen": "需要图像生成服务或 API Key，默认关闭。",
+    "video_gen": "需要视频生成服务或 API Key，默认关闭。",
+    "x_search": "需要 X/xAI 凭证和外网访问，默认关闭。",
+    "moa": "需要额外模型供应商凭证，默认关闭。",
+    "tts": "需要语音服务或音频输出场景，纯终端默认关闭。",
+    "homeassistant": "需要 Home Assistant 服务配置，默认关闭。",
+    "spotify": "需要 Spotify 凭证和外网服务，默认关闭。",
+    "discord": "需要 Discord 平台配置，默认关闭。",
+    "discord_admin": "需要 Discord 平台和管理权限配置，默认关闭。",
+    "yuanbao": "需要元宝平台配置，默认关闭。",
+    "computer_use": "仅适用于 macOS 桌面控制，Linux 纯终端不可用。",
+}
+
+_SKILL_DESCRIPTION_ZH = {
+    "code-review": "辅助进行代码审查，关注缺陷、风险和测试缺口。",
+    "debug": "辅助定位和修复运行时问题。",
+    "docs": "辅助编写、整理或更新文档。",
+    "testing": "辅助设计和执行测试。",
+}
+
 def _choice(value: str, description: str) -> dict[str, str]:
     return {"value": value, "description": description}
 
@@ -524,7 +578,13 @@ def _aops_skill_commands(config: Any) -> dict[str, dict[str, Any]]:
 def _is_supported_custom_shape(canonical: str, raw_args: str) -> bool:
     args = _tokens(raw_args)
     if canonical == "skills":
-        return not args or args == ["list"]
+        if not args or args == ["list"]:
+            return True
+        if args[:1] in (["enable"], ["disable"]):
+            return len(args) >= 2
+        if args[:1] == ["set"]:
+            return len(args) >= 3
+        return False
     if canonical == "cron":
         if not args or args == ["list"]:
             return True
@@ -573,6 +633,7 @@ def _list_response(
     summary: dict[str, Any] | None = None,
     total: int | None = None,
     limit: int | None = None,
+    updated: dict[str, Any] | None = None,
     error: dict[str, Any] | None = None,
 ) -> str:
     ok = error is None
@@ -591,6 +652,8 @@ def _list_response(
         "items": items,
         "error": error,
     }
+    if updated is not None:
+        payload["updated"] = updated
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
@@ -977,13 +1040,40 @@ def _iter_cron_history_entries_newest_first(path: Path):
             yield entry
 
 
+def _skill_description_zh(name: str, frontmatter: dict[str, Any], description: Any) -> str:
+    for key in ("description_zh", "descriptionZh", "zh_description"):
+        value = frontmatter.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    normalized = str(name or "").strip().lower().replace("_", "-").replace(" ", "-")
+    mapped = _SKILL_DESCRIPTION_ZH.get(normalized)
+    if mapped:
+        return mapped
+    return str(description or "").strip()
+
+
+def _skill_ref_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", "-").lstrip("/")
+
+
+def _skills_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "enabled": sum(1 for item in items if item.get("enabled") is True),
+        "disabled": sum(1 for item in items if item.get("disabled") is True),
+        "categories": len({item.get("category") or "uncategorized" for item in items}),
+    }
+
+
 def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from agent.skill_commands import get_skill_commands, scan_skill_commands
     from agent.skill_utils import iter_skill_index_files
+    from hermes_cli.config import load_config
+    from hermes_cli.skills_config import get_disabled_skills
     from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform
 
     skills_root = SKILLS_DIR
     items: list[dict[str, Any]] = []
+    disabled = get_disabled_skills(load_config())
     command_by_path: dict[str, str] = {}
     command_by_name: dict[str, str] = {}
     try:
@@ -1018,6 +1108,9 @@ def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 pass
             name = str(frontmatter.get("name") or skill_md.parent.name)
             item_id = _safe_relative(skill_md.parent, skills_root)
+            category = item_id.split("/", 1)[0] if "/" in item_id else None
+            description = frontmatter.get("description") or None
+            enabled = name not in disabled
             command = (
                 command_by_path.get(str(skill_md.resolve()))
                 or command_by_name.get(name)
@@ -1029,7 +1122,11 @@ def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 {
                     "id": item_id,
                     "name": name,
-                    "description": frontmatter.get("description") or None,
+                    "description": description,
+                    "descriptionZh": _skill_description_zh(name, frontmatter, description),
+                    "category": category,
+                    "enabled": enabled,
+                    "disabled": not enabled,
                     "homepage": frontmatter.get("homepage") or frontmatter.get("url") or None,
                     "command": command,
                     "path": str(skill_md),
@@ -1037,6 +1134,125 @@ def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             )
     items.sort(key=lambda item: (str(item.get("name") or "").lower(), str(item.get("id") or "")))
     return items, {"skillsRoot": str(skills_root)}
+
+
+def _skills_command(command_text: str, args: list[str]) -> str:
+    from hermes_cli.config import load_config
+    from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
+
+    action = str(args[0] if args else "list").strip().lower().replace("_", "-")
+    if action in {"", "list"}:
+        try:
+            items, context = _skill_items()
+            context.update({"agentId": "main", "workspaceDir": os.getcwd()})
+            return _list_response(
+                type_="skills.list",
+                command=command_text,
+                item_type="skill",
+                items=items,
+                context=context,
+                summary=_skills_summary(items),
+            )
+        except Exception as exc:
+            return _list_response(
+                type_="skills.list",
+                command=command_text,
+                item_type="skill",
+                items=[],
+                error={"code": "SKILLS_READ_FAILED", "message": str(exc)},
+            )
+
+    if action not in {"enable", "disable", "set"}:
+        return _list_response(
+            type_="skills.updated",
+            command=command_text,
+            item_type="skill",
+            items=[],
+            error={
+                "code": "SKILLS_USAGE",
+                "message": "Usage: /skills list | /skills enable <name> | /skills disable <name> | /skills set <name> <true|false>",
+            },
+        )
+    if len(args) < 2:
+        return _list_response(
+            type_="skills.updated",
+            command=command_text,
+            item_type="skill",
+            items=[],
+            error={"code": "SKILL_NAME_REQUIRED", "message": "Skill name is required."},
+        )
+
+    requested_enabled = action == "enable"
+    target_ref = " ".join(args[1:]).strip()
+    if action == "set":
+        if len(args) < 3 or str(args[-1]).strip().lower() not in {"true", "false"}:
+            return _list_response(
+                type_="skills.updated",
+                command=command_text,
+                item_type="skill",
+                items=[],
+                error={"code": "SKILL_SET_USAGE", "message": "Usage: /skills set <name> <true|false>"},
+            )
+        requested_enabled = str(args[-1]).strip().lower() == "true"
+        target_ref = " ".join(args[1:-1]).strip()
+
+    try:
+        items, context = _skill_items()
+    except Exception as exc:
+        return _list_response(
+            type_="skills.updated",
+            command=command_text,
+            item_type="skill",
+            items=[],
+            error={"code": "SKILLS_READ_FAILED", "message": str(exc)},
+        )
+
+    target_key = _skill_ref_key(target_ref)
+    matched = None
+    for item in items:
+        candidates = {
+            _skill_ref_key(item.get("name")),
+            _skill_ref_key(item.get("id")),
+            _skill_ref_key(item.get("command")),
+        }
+        if target_key in candidates:
+            matched = item
+            break
+    if matched is None:
+        return _list_response(
+            type_="skills.updated",
+            command=command_text,
+            item_type="skill",
+            items=[],
+            context=context,
+            summary=_skills_summary(items),
+            error={"code": "SKILL_NOT_FOUND", "message": f"Skill `{target_ref}` not found."},
+        )
+
+    cfg = load_config()
+    disabled = get_disabled_skills(cfg)
+    skill_name = str(matched.get("name") or "")
+    if requested_enabled:
+        disabled.discard(skill_name)
+    else:
+        disabled.add(skill_name)
+    save_disabled_skills(cfg, disabled)
+
+    items_after, context_after = _skill_items()
+    updated_item = next(
+        (item for item in items_after if _skill_ref_key(item.get("name")) == _skill_ref_key(skill_name)),
+        {**matched, "enabled": requested_enabled, "disabled": not requested_enabled},
+    )
+    context_after.update({"agentId": "main", "workspaceDir": os.getcwd()})
+    return _list_response(
+        type_="skills.updated",
+        command=command_text,
+        item_type="skill",
+        items=[updated_item],
+        context=context_after,
+        summary=_skills_summary(items_after),
+        updated={"name": skill_name, "enabled": requested_enabled},
+    )
 
 
 def _aops_agent_id(event: MessageEvent) -> str:
@@ -1071,15 +1287,57 @@ def _toolset_context(event: MessageEvent) -> dict[str, Any]:
     }
 
 
-def _toolset_item(name: str, label: str, description: str, *, enabled: bool, configured: bool) -> dict[str, Any]:
+def _configured_toolset_ui_state(cfg: dict[str, Any]) -> tuple[set[str], dict[str, str]]:
+    aops_cfg = cfg.get("aops") if isinstance(cfg, dict) else {}
+    toolsets_cfg = aops_cfg.get("toolsets") if isinstance(aops_cfg, dict) else {}
+    if not isinstance(toolsets_cfg, dict):
+        toolsets_cfg = {}
+
+    raw_disabled = toolsets_cfg.get("disabled")
+    if isinstance(raw_disabled, list):
+        ui_disabled = {str(item).strip() for item in raw_disabled if str(item).strip()}
+        reasons: dict[str, str] = {}
+    else:
+        ui_disabled = set(_LINUX_TERMINAL_UNSUPPORTED_REASONS)
+        reasons = dict(_LINUX_TERMINAL_UNSUPPORTED_REASONS)
+    raw_reasons = toolsets_cfg.get("unsupportedReasons")
+    if raw_reasons is None:
+        raw_reasons = toolsets_cfg.get("unsupported_reasons")
+    if isinstance(raw_reasons, dict):
+        for raw_name, raw_reason in raw_reasons.items():
+            name = str(raw_name).strip()
+            if not name:
+                continue
+            reason = str(raw_reason or "").strip()
+            if reason:
+                reasons[name] = reason
+            else:
+                reasons.pop(name, None)
+    return ui_disabled, reasons
+
+
+def _toolset_item(
+    name: str,
+    label: str,
+    description: str,
+    *,
+    enabled: bool,
+    configured: bool,
+    ui_disabled: bool,
+    unsupported_reason: str | None,
+) -> dict[str, Any]:
     from toolsets import resolve_toolset
 
     return {
         "name": name,
         "label": re.sub(r"^[^\w\u4e00-\u9fff]+", "", str(label or "")).strip() or name,
         "description": description,
+        "descriptionZh": _TOOLSET_DESCRIPTION_ZH.get(name) or description,
         "enabled": enabled,
+        "disabled": ui_disabled,
         "configured": configured,
+        "configurable": configured and not ui_disabled,
+        "unsupportedReason": unsupported_reason,
         "tools": resolve_toolset(name),
     }
 
@@ -1126,6 +1384,7 @@ def _toolset_list_data() -> tuple[list[dict[str, Any]], dict[str, Any], set[str]
 
     cfg = load_config()
     enabled = _get_aops_dashboard_toolsets(cfg, include_default_mcp_servers=False)
+    ui_disabled, unsupported_reasons = _configured_toolset_ui_state(cfg)
     definitions = {
         name: (label, description)
         for name, label, description in _get_effective_configurable_toolsets()
@@ -1142,12 +1401,15 @@ def _toolset_list_data() -> tuple[list[dict[str, Any]], dict[str, Any], set[str]
                 description,
                 enabled=name in enabled,
                 configured=configured,
+                ui_disabled=name in ui_disabled,
+                unsupported_reason=unsupported_reasons.get(name),
             )
         )
     summary = {
         "enabled": sum(1 for item in items if item["enabled"]),
         "disabled": sum(1 for item in items if not item["enabled"]),
         "configured": sum(1 for item in items if item["configured"]),
+        "uiDisabled": sum(1 for item in items if item["disabled"]),
     }
     return items, summary, enabled, definitions
 
@@ -2426,24 +2688,7 @@ def maybe_local_command(event: MessageEvent) -> str | LocalCommandResult | None:
     full_command = f"/{command} {raw_args}".strip()
 
     if canonical == "skills" and _is_supported_custom_shape("skills", raw_args):
-        try:
-            items, context = _skill_items()
-            context.update({"agentId": "main", "workspaceDir": os.getcwd()})
-            return _list_response(
-                type_="skills.list",
-                command=full_command,
-                item_type="skill",
-                items=items,
-                context=context,
-            )
-        except Exception as exc:
-            return _list_response(
-                type_="skills.list",
-                command=full_command,
-                item_type="skill",
-                items=[],
-                error={"code": "SKILLS_READ_FAILED", "message": str(exc)},
-            )
+        return _skills_command(full_command, args)
 
     if canonical == "toolsets":
         return _toolsets_command(full_command, event, args)
@@ -2643,11 +2888,14 @@ def _extension_nodes(config: Any) -> list[HelpNode]:
 def _skills_node(config: Any) -> HelpNode:
     full_command = "/skills"
     child_full = "/skills list"
+    enable_full = "/skills enable"
+    disable_full = "/skills disable"
+    set_full = "/skills set"
     return _node(
         type_="custom",
         command=full_command,
         full_command=full_command,
-        description="列出已安装技能。",
+        description="列出或切换已安装技能。",
         dangerous=_dangerous(config, full_command),
         usage="/skills",
         executable=True,
@@ -2660,7 +2908,48 @@ def _skills_node(config: Any) -> HelpNode:
                 dangerous=_dangerous(config, child_full),
                 usage=child_full,
                 executable=True,
-            )
+            ),
+            _node(
+                type_="custom",
+                command="enable",
+                full_command=enable_full,
+                description="启用技能。",
+                dangerous=_dangerous(config, enable_full),
+                usage="/skills enable <name>",
+                executable=True,
+                completions=[_param("name", "技能名称。", required=True)],
+            ),
+            _node(
+                type_="custom",
+                command="disable",
+                full_command=disable_full,
+                description="禁用技能。",
+                dangerous=_dangerous(config, disable_full),
+                usage="/skills disable <name>",
+                executable=True,
+                completions=[_param("name", "技能名称。", required=True)],
+            ),
+            _node(
+                type_="custom",
+                command="set",
+                full_command=set_full,
+                description="按 true/false 设置技能。",
+                dangerous=_dangerous(config, set_full),
+                usage="/skills set <name> <true|false>",
+                executable=True,
+                completions=[
+                    _param("name", "技能名称。", required=True),
+                    _param(
+                        "enabled",
+                        "是否启用。",
+                        required=True,
+                        choices=[
+                            _choice("true", "启用。"),
+                            _choice("false", "禁用。"),
+                        ],
+                    ),
+                ],
+            ),
         ],
     )
 
@@ -2962,8 +3251,13 @@ def aops_text_command_lines() -> list[str]:
     return [
         "`/skills` -- List installed skills",
         "`/skills list` -- List installed skills",
+        "`/skills enable <name>` -- Enable an installed skill",
+        "`/skills disable <name>` -- Disable an installed skill",
+        "`/skills set <name> <true|false>` -- Enable or disable an installed skill",
         "`/toolsets` -- List or update AOPS toolsets",
         "`/toolsets list` -- List AOPS toolsets",
+        "`/toolsets enable <name>` -- Enable an AOPS toolset",
+        "`/toolsets disable <name>` -- Disable an AOPS toolset",
         "`/toolsets set <name> <true|false>` -- Enable or disable an AOPS toolset",
         "`/cron` -- Show scheduled tasks",
         "`/cron list` -- Show scheduled tasks",

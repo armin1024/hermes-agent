@@ -94,6 +94,20 @@ CONFIGURABLE_TOOLSETS = [
 # the schema won't appear to the model even if enabled without credentials.
 _DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search"}
 
+AOPS_TERMINAL_DEFAULT_TOOLSETS: Set[str] = {
+    "terminal",
+    "file",
+    "code_execution",
+    "skills",
+    "todo",
+    "memory",
+    "session_search",
+    "clarify",
+    "delegation",
+    "cronjob",
+    "messaging",
+}
+
 # Platform-scoped toolsets: only appear in the `hermes tools` checklist for
 # these platforms, and only resolve/save for these platforms.  A toolset
 # absent from this map is available on every platform (current behaviour).
@@ -1306,11 +1320,26 @@ def _get_aops_dashboard_toolsets(
 
     AOPS used to store its switches under ``platform_toolsets.aops``.  The
     dashboard uses ``platform_toolsets.cli`` by default, so new AOPS reads use
-    CLI when present and only fall back to the legacy AOPS key.
+    CLI when present, then the legacy AOPS key.  If neither key is present,
+    use the one-click terminal Linux default instead of the broad platform
+    default, otherwise old/new installs without explicit toolset config would
+    unexpectedly enable browser, web, image, and other desktop/public-network
+    toolsets.
     """
-    platform = "cli" if _has_platform_toolset_config(config, "cli") else "aops"
+    if _has_platform_toolset_config(config, "cli"):
+        platform = "cli"
+        resolved_config = config
+    elif _has_platform_toolset_config(config, "aops"):
+        platform = "aops"
+        resolved_config = config
+    else:
+        platform = "cli"
+        resolved_config = dict(config or {})
+        platform_toolsets = dict(resolved_config.get("platform_toolsets") or {})
+        platform_toolsets["cli"] = sorted(AOPS_TERMINAL_DEFAULT_TOOLSETS)
+        resolved_config["platform_toolsets"] = platform_toolsets
     return _get_platform_tools(
-        config,
+        resolved_config,
         platform,
         include_default_mcp_servers=include_default_mcp_servers,
     )

@@ -16779,7 +16779,10 @@ class GatewayRunner:
                 if not was_interrupted:
                     # Queued message after normal completion — deliver the first
                     # response before processing the queued follow-up.
-                    # Skip if streaming already delivered it.
+                    # Skip if streaming or the AOPS native reply bridge already
+                    # delivered it.  AOPS sends final replies through its websocket
+                    # message_reply stream; falling back to adapter.send() here
+                    # would create a second start/end pair for the same answer.
                     _sc = stream_consumer_holder[0]
                     if _sc and stream_task:
                         try:
@@ -16792,9 +16795,23 @@ class GatewayRunner:
                                 pass
                         except Exception as e:
                             logger.debug("Stream consumer wait before queued message failed: %s", e)
+                    if native_reply_task:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(native_reply_task), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            logger.debug("AOPS native reply wait before queued message timed out")
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            logger.debug("AOPS native reply wait before queued message failed: %s", e)
                     _previewed = bool(result.get("response_previewed"))
+                    _native_sent = bool(
+                        native_reply_bridge
+                        and getattr(native_reply_bridge, "final_response_sent", False)
+                    )
                     _already_streamed = bool(
-                        (_sc and getattr(_sc, "final_response_sent", False))
+                        _native_sent
+                        or (_sc and getattr(_sc, "final_response_sent", False))
                         or _previewed
                         or (_sc and getattr(_sc, "final_content_delivered", False))
                     )

@@ -163,7 +163,8 @@ AOPS 上游统一通过 `send_message` 静默消息调用本地命令：
 - `/model use <provider> <model>`：切换当前 AOPS channel + agent 的模型偏好，并同步更新当前 profile 的 `config.yaml`。
 - `/toolsets list`：返回当前 profile 的工具集开关状态，与 dashboard 默认 Toolsets 页面使用同一状态源。
 - `/toolsets enable <name>`、`/toolsets disable <name>`、`/toolsets set <name> <true|false>`：修改当前 profile 的 `config.yaml platform_toolsets.cli`，并同步镜像到历史兼容键 `platform_toolsets.aops`，立即影响后续新任务。
-- `/skills`、`/skills list`：返回已安装技能和命令缓存。
+- `/skills`、`/skills list`：返回已安装技能，字段与 dashboard 技能状态保持一致。
+- `/skills enable <name>`、`/skills disable <name>`、`/skills set <name> <true|false>`：修改当前 profile 的 `config.yaml skills.disabled`，立即影响后续新任务。
 - `/cron`、`/cron list`：返回计划任务。
 - `/cron remove <id|name>`：按任务 ID 或唯一任务名删除计划任务。
 - `/cron history <id> [tsMs]`、`/cron history before <id> [tsMs]`、`/cron history after <id> <tsMs>`：分页读取 cron 历史，最新记录在前。
@@ -285,8 +286,12 @@ platform_toolsets:
       "name": "web",
       "label": "Web Search & Scraping",
       "description": "web_search, web_extract",
+      "descriptionZh": "执行网页搜索和网页内容抓取。内网纯终端环境通常不可用，除非已配置可访问的搜索或抓取服务。",
       "enabled": true,
+      "disabled": true,
       "configured": true,
+      "configurable": false,
+      "unsupportedReason": "内网 Linux 服务器通常无法访问公网搜索/抓取服务，默认关闭。",
       "tools": ["web_search", "web_extract"]
     }
   ],
@@ -294,7 +299,30 @@ platform_toolsets:
 }
 ```
 
-`configured=false` 表示工具集缺少 API key 或运行依赖，前端应展示“需要配置”，但不阻止开关操作。开关修改立即写配置，AOPS gateway 每个新用户 query/new turn 都会重新读取 `config.yaml`，因此下一条用户消息立即生效；已在运行中的 agent turn 不强制中断或热替换。
+字段说明：
+- `enabled`：真实工具集开关状态，决定新用户 query/new turn 是否加载该工具集。
+- `disabled`：前端控件是否不可操作，仅用于 UI 展示/交互控制，不代表真实工具集关闭状态。
+- `configured=false`：工具集缺少 API key 或运行依赖，前端应展示“需要配置”。
+- `configurable=false`：当前部署环境不建议前端开放操作，通常会同时返回 `unsupportedReason`。
+
+开关修改立即写配置，AOPS gateway 每个新用户 query/new turn 都会重新读取 `config.yaml`，因此下一条用户消息立即生效；已在运行中的 agent turn 不强制中断或热替换。
+
+`disabled` 字段可通过当前 profile 的 `config.yaml` 配置，推荐由一键安装模板下发：
+
+```yaml
+aops:
+  toolsets:
+    disabled:
+      - browser
+      - web
+      - computer_use
+    unsupportedReasons:
+      browser: 需要可用浏览器或浏览器自动化运行环境，纯终端服务器默认关闭。
+      web: 内网 Linux 服务器通常无法访问公网搜索/抓取服务，默认关闭。
+      computer_use: 仅适用于 macOS 桌面控制，Linux 纯终端不可用。
+```
+
+如果显式配置了 `aops.toolsets.disabled`，则该列表就是前端置灰来源；没有配置时，AOPS 使用内置“内网 Linux 纯终端”默认置灰列表兜底。`unsupportedReasons` 只影响展示原因，不改变工具是否启用。
 
 Hermes dashboard 的普通 Toolsets 页面默认读取同一份 `platform_toolsets.cli` 状态，因此 AOPS `/toolsets set web false` 后，刷新或重新进入 dashboard Toolsets 页面即可看到 `web.enabled=false`。
 
@@ -308,6 +336,90 @@ GET /api/tools/toolsets?platform=aops&profile=<profile>
 - `profile=<name>` 读取 `~/.hermes/profiles/<name>/config.yaml`。
 - 不传参数时 dashboard 保持原有行为，读取当前 dashboard profile 的 `platform_toolsets.cli`。
 - AOPS `/toolsets` 与普通 dashboard 一致性不依赖 `platform=aops` 查询参数；它们共享 `platform_toolsets.cli`。
+
+一键部署模板面向内网 Linux 纯终端服务器，默认只启用：
+
+```yaml
+platform_toolsets:
+  cli:
+    - terminal
+    - file
+    - code_execution
+    - skills
+    - todo
+    - memory
+    - session_search
+    - clarify
+    - delegation
+    - cronjob
+    - messaging
+```
+
+默认禁用浏览器、视觉/视频、图像/视频生成、TTS、X Search、MOA、Home Assistant、Spotify、Discord、元宝、Computer Use 和公网 web 搜索；如果历史配置缺少 `platform_toolsets.cli/aops`，AOPS 也会按这套内网 Linux 纯终端默认值兜底解析，避免 browser/web 等工具集被平台默认全集意外启用。
+
+## Skills 接口
+
+技能配置按 Hermes profile 独立生效，AOPS 与 dashboard 共享当前 profile 的 `config.yaml skills.disabled`：
+
+```yaml
+skills:
+  disabled:
+    - draft-notes
+```
+
+`/skills list` 返回示例：
+
+```json
+{
+  "schemaVersion": "local-command-list.v1",
+  "type": "skills.list",
+  "ok": true,
+  "command": "/skills list",
+  "itemType": "skill",
+  "total": 1,
+  "count": 1,
+  "limit": null,
+  "hasMore": false,
+  "context": {
+    "skillsRoot": "/home/user/.hermes/skills",
+    "agentId": "main",
+    "workspaceDir": "/home/user"
+  },
+  "summary": {
+    "enabled": 1,
+    "disabled": 0,
+    "categories": 1
+  },
+  "items": [
+    {
+      "id": "ops/restart-service",
+      "name": "Restart Service",
+      "description": "Restart a service safely.",
+      "descriptionZh": "安全重启服务。",
+      "category": "ops",
+      "enabled": true,
+      "disabled": false,
+      "homepage": "https://example.com/restart-service",
+      "command": "/restart-service",
+      "path": "/home/user/.hermes/skills/ops/restart-service/SKILL.md"
+    }
+  ],
+  "error": null
+}
+```
+
+更新响应仍使用同一外层结构，`type=skills.updated`，`items[0]` 为被更新的 skill，并包含：
+
+```json
+{
+  "updated": {
+    "name": "Restart Service",
+    "enabled": false
+  }
+}
+```
+
+技能启停无需重启 gateway；后续新用户 query/new turn 会重新读取 `skills.disabled` 并生效，已运行中的 agent turn 不热替换。
 
 ## 审批接口
 

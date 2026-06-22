@@ -2527,8 +2527,11 @@ def test_aops_dm_policy_auth_open_allowlist_pairing_disabled(monkeypatch):
 @pytest.mark.asyncio
 async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path):
     import agent.skill_commands as skill_commands
+    import hermes_cli.config as hermes_config
     import tools.skills_tool as skills_tool
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    hermes_config.save_config({"skills": {"disabled": ["Draft Notes"]}})
     skills_root = tmp_path / "skills"
     skill_dir = skills_root / "ops" / "restart-service"
     skill_dir.mkdir(parents=True)
@@ -2536,6 +2539,7 @@ async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path
         "---\n"
         "name: Restart Service\n"
         "description: Restart a service safely.\n"
+        "description_zh: 安全重启服务。\n"
         "homepage: https://example.com/restart-service\n"
         "---\n"
         "# Restart Service\n",
@@ -2588,16 +2592,80 @@ async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path
     assert payload["count"] == 2
     items_by_id = {item["id"]: item for item in payload["items"]}
     assert items_by_id["ops/restart-service"]["name"] == "Restart Service"
+    assert items_by_id["ops/restart-service"]["category"] == "ops"
+    assert items_by_id["ops/restart-service"]["descriptionZh"] == "安全重启服务。"
+    assert items_by_id["ops/restart-service"]["enabled"] is True
+    assert items_by_id["ops/restart-service"]["disabled"] is False
     assert items_by_id["ops/restart-service"]["homepage"] == "https://example.com/restart-service"
     assert items_by_id["ops/restart-service"]["command"] == "/restart-service"
     assert items_by_id["ops/draft-notes"]["name"] == "Draft Notes"
+    assert items_by_id["ops/draft-notes"]["enabled"] is False
+    assert items_by_id["ops/draft-notes"]["disabled"] is True
     assert items_by_id["ops/draft-notes"]["command"] == "/draft-notes"
+    assert payload["summary"]["enabled"] == 1
+    assert payload["summary"]["disabled"] == 1
 
     result = await runner._handle_message(_make_aops_event("/skills list"))
     payload = json.loads(result)
     items_by_id = {item["id"]: item for item in payload["items"]}
     assert items_by_id["ops/restart-service"]["command"] == "/restart-service"
     assert items_by_id["ops/draft-notes"]["command"] == "/draft-notes"
+
+
+@pytest.mark.asyncio
+async def test_aops_skills_set_updates_dashboard_disabled_config(monkeypatch, tmp_path):
+    import agent.skill_commands as skill_commands
+    import hermes_cli.config as hermes_config
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    skills_root = tmp_path / "skills"
+    skill_dir = skills_root / "ops" / "restart-service"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: Restart Service\ndescription: Restart a service safely.\n---\n# Restart Service\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
+    monkeypatch.setattr(skill_commands, "scan_skill_commands", lambda: {})
+    monkeypatch.setattr(skill_commands, "get_skill_commands", lambda: {})
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/skills set Restart Service false"))
+    payload = json.loads(result)
+    assert payload["type"] == "skills.updated"
+    assert payload["ok"] is True
+    assert payload["updated"] == {"name": "Restart Service", "enabled": False}
+    assert payload["items"][0]["enabled"] is False
+    assert "Restart Service" in hermes_config.load_config()["skills"]["disabled"]
+
+    result = await runner._handle_message(_make_aops_event("/skills enable ops/restart-service"))
+    payload = json.loads(result)
+    assert payload["ok"] is True
+    assert payload["updated"] == {"name": "Restart Service", "enabled": True}
+    assert "Restart Service" not in hermes_config.load_config()["skills"]["disabled"]
+
+
+@pytest.mark.asyncio
+async def test_aops_skills_unknown_name_returns_structured_error(monkeypatch, tmp_path):
+    import agent.skill_commands as skill_commands
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir(parents=True)
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
+    monkeypatch.setattr(skill_commands, "scan_skill_commands", lambda: {})
+    monkeypatch.setattr(skill_commands, "get_skill_commands", lambda: {})
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/skills disable unknown"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "skills.updated"
+    assert payload["ok"] is False
+    assert payload["error"] == {"code": "SKILL_NOT_FOUND", "message": "Skill `unknown` not found."}
 
 
 @pytest.mark.asyncio
@@ -2621,11 +2689,66 @@ async def test_aops_toolsets_list_returns_dashboard_config_json(monkeypatch, tmp
     assert payload["context"]["configPath"] == str(tmp_path / "config.yaml")
     items_by_name = {item["name"]: item for item in payload["items"]}
     assert items_by_name["web"]["label"] == "Web Search & Scraping"
+    assert items_by_name["web"]["descriptionZh"]
     assert items_by_name["web"]["enabled"] is True
+    assert items_by_name["web"]["disabled"] is True
+    assert items_by_name["web"]["configurable"] is False
+    assert items_by_name["web"]["unsupportedReason"]
     assert set(items_by_name["web"]["tools"]) == {"web_search", "web_extract"}
     assert items_by_name["terminal"]["enabled"] is True
     assert items_by_name["file"]["enabled"] is False
+    assert items_by_name["file"]["disabled"] is False
     assert payload["summary"]["enabled"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_aops_toolsets_list_defaults_to_terminal_linux_toolsets(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_cli.config as hermes_config
+
+    hermes_config.save_config({})
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/toolsets list"))
+
+    payload = json.loads(result)
+    assert payload["ok"] is True
+    items_by_name = {item["name"]: item for item in payload["items"]}
+    assert items_by_name["terminal"]["enabled"] is True
+    assert items_by_name["file"]["enabled"] is True
+    assert items_by_name["browser"]["enabled"] is False
+    assert items_by_name["browser"]["disabled"] is True
+    assert items_by_name["web"]["enabled"] is False
+    assert items_by_name["web"]["disabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_aops_toolsets_ui_disabled_is_configurable(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_cli.config as hermes_config
+
+    hermes_config.save_config(
+        {
+            "platform_toolsets": {"cli": ["browser", "terminal"]},
+            "aops": {
+                "toolsets": {
+                    "disabled": ["web"],
+                    "unsupportedReasons": {"web": "内网不可用"},
+                }
+            },
+        }
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/toolsets list"))
+
+    payload = json.loads(result)
+    items_by_name = {item["name"]: item for item in payload["items"]}
+    assert items_by_name["browser"]["enabled"] is True
+    assert items_by_name["browser"]["disabled"] is False
+    assert items_by_name["browser"]["unsupportedReason"] is None
+    assert items_by_name["web"]["disabled"] is True
+    assert items_by_name["web"]["unsupportedReason"] == "内网不可用"
 
 
 @pytest.mark.asyncio
@@ -3491,6 +3614,14 @@ async def test_aops_help_includes_toolsets_command():
     assert toolsets_node["executable"] is True
     set_child = next(child for child in toolsets_node["children"] if child["command"] == "set")
     assert set_child["usage"] == "/toolsets set <name> <true|false>"
+
+    skills_node = next(item for item in payload["items"] if item["fullCommand"] == "/skills")
+    skills_enable_child = next(child for child in skills_node["children"] if child["command"] == "enable")
+    skills_disable_child = next(child for child in skills_node["children"] if child["command"] == "disable")
+    skills_set_child = next(child for child in skills_node["children"] if child["command"] == "set")
+    assert skills_enable_child["usage"] == "/skills enable <name>"
+    assert skills_disable_child["usage"] == "/skills disable <name>"
+    assert skills_set_child["usage"] == "/skills set <name> <true|false>"
     assert set_child["completions"][1]["choices"] == [
         {"value": "true", "description": "启用。"},
         {"value": "false", "description": "关闭。"},

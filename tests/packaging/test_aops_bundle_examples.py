@@ -65,7 +65,23 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "gateway install --force" in script
     assert "ensure_gateway_service_installed \"start\"" in script
     assert "ensure_gateway_service_installed \"restart\"" in script
+    assert '"platform_toolsets"' in script
+    assert '"terminal"' in script
+    assert '"browser"' not in script
     assert "--config-payload" not in script
+
+
+def test_aops_profile_template_defaults_to_terminal_linux_toolsets():
+    template = Path("packaging/offline/templates/aops-profile-template.yaml").read_text(encoding="utf-8")
+    assert "platform_toolsets:" in template
+    assert "    - terminal" in template
+    assert "    - file" in template
+    assert "    - code_execution" in template
+    assert "    - messaging" in template
+    assert "disabled:" in template
+    assert "          - browser" in template
+    assert "          - web" in template
+    assert "unsupportedReasons:" in template
 
 
 def test_aops_channel_interface_document_is_present():

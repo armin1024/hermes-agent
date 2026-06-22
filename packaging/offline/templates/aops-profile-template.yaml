@@ -48,6 +48,55 @@ config:
       busy_input_mode: queue
     checkpoints:
       enabled: true
+    platform_toolsets:
+      cli:
+        - terminal
+        - file
+        - code_execution
+        - skills
+        - todo
+        - memory
+        - session_search
+        - clarify
+        - delegation
+        - cronjob
+        - messaging
+      aops:
+        - terminal
+        - file
+        - code_execution
+        - skills
+        - todo
+        - memory
+        - session_search
+        - clarify
+        - delegation
+        - cronjob
+        - messaging
+    aops:
+      toolsets:
+        # UI-only: toolsets listed here return disabled=true for the frontend
+        # toggle control. This does not change the runtime enabled state.
+        disabled:
+          - browser
+          - vision
+          - video
+          - image_gen
+          - video_gen
+          - x_search
+          - moa
+          - tts
+          - homeassistant
+          - spotify
+          - discord
+          - discord_admin
+          - yuanbao
+          - computer_use
+          - web
+        unsupportedReasons:
+          web: 内网 Linux 服务器通常无法访问公网搜索/抓取服务，默认关闭。
+          browser: 需要可用浏览器或浏览器自动化运行环境，纯终端服务器默认关闭。
+          computer_use: 仅适用于 macOS 桌面控制，Linux 纯终端不可用。
 
   hindsight:
     mode: local_external
