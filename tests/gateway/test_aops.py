@@ -4616,12 +4616,7 @@ def test_clawhub_base_url_uses_registry_env(monkeypatch):
     import tools.skills_hub as skills_hub
 
     monkeypatch.setenv("CLAWHUB_REGISTRY", "http://clawhub.internal")
-    reloaded = importlib.reload(skills_hub)
-    try:
-        assert reloaded.ClawHubSource.BASE_URL == "http://clawhub.internal/api/v1"
-    finally:
-        monkeypatch.delenv("CLAWHUB_REGISTRY", raising=False)
-        importlib.reload(skills_hub)
+    assert skills_hub.ClawHubSource.configured_base_url() == "http://clawhub.internal/api/v1"
 
 
 def test_aops_clawhub_base_url_reuses_skills_hub_registry_env(monkeypatch):
@@ -4629,12 +4624,7 @@ def test_aops_clawhub_base_url_reuses_skills_hub_registry_env(monkeypatch):
     import tools.skills_hub as skills_hub
 
     monkeypatch.setenv("CLAWHUB_REGISTRY", "http://clawhub.internal")
-    importlib.reload(skills_hub)
-    try:
-        assert bridge._clawhub_base_url() == skills_hub.ClawHubSource.BASE_URL
-    finally:
-        monkeypatch.delenv("CLAWHUB_REGISTRY", raising=False)
-        importlib.reload(skills_hub)
+    assert bridge._clawhub_base_url() == skills_hub.ClawHubSource.configured_base_url()
 
 
 def test_aops_clawhub_base_url_reads_bashrc_when_process_env_missing(monkeypatch, tmp_path):
@@ -4644,13 +4634,8 @@ def test_aops_clawhub_base_url_reads_bashrc_when_process_env_missing(monkeypatch
     (tmp_path / ".bashrc").write_text("export CLAWHUB_REGISTRY=http://bashrc-clawhub.internal\n", encoding="utf-8")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("CLAWHUB_REGISTRY", raising=False)
-    importlib.reload(skills_hub)
-    try:
-        assert bridge._clawhub_base_url() == "http://bashrc-clawhub.internal/api/v1"
-        assert os.environ["CLAWHUB_REGISTRY"] == "http://bashrc-clawhub.internal"
-    finally:
-        monkeypatch.delenv("CLAWHUB_REGISTRY", raising=False)
-        importlib.reload(skills_hub)
+    assert bridge._clawhub_base_url() == "http://bashrc-clawhub.internal/api/v1"
+    assert os.environ["CLAWHUB_REGISTRY"] == "http://bashrc-clawhub.internal"
 
 
 def test_aops_target_ref_is_explicit_without_whitespace():

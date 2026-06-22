@@ -176,6 +176,8 @@ def _clawhub_base_url() -> str:
     _load_clawhub_registry_from_shell_init()
     from tools.skills_hub import ClawHubSource
 
+    if hasattr(ClawHubSource, "configured_base_url"):
+        return str(ClawHubSource.configured_base_url()).rstrip("/")
     registry = os.environ.get("CLAWHUB_REGISTRY", "").strip().rstrip("/")
     if registry:
         return f"{registry}/api/v1"
