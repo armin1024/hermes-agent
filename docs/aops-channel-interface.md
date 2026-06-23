@@ -497,7 +497,7 @@ Profile 策略：
 - 后续不同 token 创建 named profile，默认命名 `<targetUser>-N`，如 `hermes-1`；存量旧命名 profile 参与序号统计但不重命名。
 - 相同 token 重新执行时更新原 default/profile；多个 profile 命中相同 token 时失败。
 - 已安装 runtime 会比较 `~/hermes-agent/.aops_bundle_sha256` 与模板 `bundle.sha256`，不一致则下载新 bundle 并升级。
-- default agent 发生 runtime 升级后，会重启其他已运行或已有 systemd user service 的 named profile gateway；不主动启动从未运行过的 profile。
+- 任意 profile 触发 runtime 升级后，会重启同一系统用户下其他已运行或已有 systemd user service 的 default/named profile gateway；不主动启动从未运行过的 profile。
 
 模板默认能力：
 

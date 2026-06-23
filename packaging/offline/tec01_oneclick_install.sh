@@ -699,36 +699,46 @@ ensure_gateway_service_installed() {
   if json_bool options.installGatewayService true; then
     STAGE="gateway_install_service"
     log "Ensuring Hermes gateway service is installed for $TARGET_USER profile $profile"
-    run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; hermes $profile_arg gateway install --force"
+    run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; hermes $profile_arg gateway install --force --no-start-now --start-on-login"
   fi
   STAGE="gateway_${action}"
   run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; hermes $profile_arg gateway $action"
 }
 
 restart_other_running_profiles_after_upgrade() {
-  [[ "$PROFILE_NAME" == "default" ]] || return 0
   [[ "${RUNTIME_CHANGED:-false}" == "true" ]] || return 0
   json_bool options.restartOtherRunningProfilesAfterUpgrade true || return 0
-  [[ -d "$TARGET_HOME/.hermes/profiles" ]] || return 0
 
   STAGE="gateway_restart_other_profiles"
-  log "Restarting other running Hermes profile gateways after default runtime upgrade"
-  run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; python3 - <<'PY'
+  log "Restarting other running Hermes profile gateways after runtime upgrade"
+  run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; CURRENT_PROFILE=$(shell_quote "$PROFILE_NAME") python3 - <<'PY'
+import os
 import subprocess
 from pathlib import Path
 
 home = Path.home()
+current_profile = os.environ.get('CURRENT_PROFILE') or 'default'
+root = home / '.hermes'
 profiles_root = home / '.hermes' / 'profiles'
-if not profiles_root.is_dir():
-    raise SystemExit(0)
+
+def service_name(profile: str) -> str:
+    if profile == 'default':
+        return 'hermes-gateway.service'
+    return f'hermes-gateway-{profile}.service'
+
+def profile_home(profile: str) -> Path:
+    if profile == 'default':
+        return root
+    return profiles_root / profile
 
 def service_exists(profile: str) -> bool:
-    unit = home / '.config' / 'systemd' / 'user' / f'hermes-gateway-{profile}.service'
+    unit_name = service_name(profile)
+    unit = home / '.config' / 'systemd' / 'user' / unit_name
     if unit.exists():
         return True
     try:
         result = subprocess.run(
-            ['systemctl', '--user', 'is-enabled', f'hermes-gateway-{profile}.service'],
+            ['systemctl', '--user', 'is-enabled', unit_name],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=5,
@@ -739,16 +749,25 @@ def service_exists(profile: str) -> bool:
 
 attempted = []
 failed = []
-for child in sorted(profiles_root.iterdir()):
-    if not child.is_dir():
+
+candidates = [('default', root)]
+if profiles_root.is_dir():
+    for child in sorted(profiles_root.iterdir()):
+        if child.is_dir():
+            candidates.append((child.name, child))
+
+for profile, directory in candidates:
+    if profile == current_profile:
         continue
-    profile = child.name
-    pid_file = child / 'gateway.pid'
+    pid_file = directory / 'gateway.pid'
     if not pid_file.exists() and not service_exists(profile):
         continue
     attempted.append(profile)
     try:
-        result = subprocess.run(['hermes', '-p', profile, 'gateway', 'restart'], check=False, timeout=120)
+        cmd = ['hermes', 'gateway', 'restart']
+        if profile != 'default':
+            cmd = ['hermes', '-p', profile, 'gateway', 'restart']
+        result = subprocess.run(cmd, check=False, timeout=120)
         if result.returncode != 0:
             failed.append(profile)
     except Exception:
