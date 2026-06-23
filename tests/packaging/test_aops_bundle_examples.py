@@ -51,6 +51,10 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "restartOtherRunningProfilesAfterUpgrade" in script
     assert "restart_other_running_profiles_after_upgrade" in script
     assert "gateway.pid" in script
+    assert "CURRENT_PROFILE=$(shell_quote \"$PROFILE_NAME\")" in script
+    assert "('default', root)" in script
+    assert "hermes-gateway.service" in script
+    assert "'hermes', 'gateway', 'restart'" in script
     assert "'hermes', '-p', profile, 'gateway', 'restart'" in script
     assert "hermes-gateway-{profile}.service" in script
     assert ".aops_bundle_sha256" in script
@@ -62,7 +66,7 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "--profile '$PROFILE_NAME'" in script
     assert "useradd -m -s /bin/bash" in script
     assert "loginctl enable-linger" in script
-    assert "gateway install --force" in script
+    assert "gateway install --force --no-start-now --start-on-login" in script
     assert "ensure_gateway_service_installed \"start\"" in script
     assert "ensure_gateway_service_installed \"restart\"" in script
     assert '"platform_toolsets"' in script
