@@ -79,6 +79,12 @@ web/public/ds-assets/
 .release_notes.md
 mini-swe-agent/
 
+# Local offline/package build outputs. These can contain vendored runtimes,
+# wheels, and tarballs; keep them local and publish separately as release
+# artifacts when needed.
+/dist/
+/dist-aops*/
+
 # Nix
 .direnv/
 .nix-stamps/
