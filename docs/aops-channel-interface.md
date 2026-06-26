@@ -112,10 +112,66 @@ AOPS WebSocket 地址由 `AOPS_BOT_URL` 转换为 `/api/v1/ws`，例如 `https:/
 `messageType` 规则：
 
 - `common`：普通对话和普通 slash 命令。
-- `silent`：入站 `silent=true`、`metadata.silent=true` 或 `messageType=silent`；包含 `messageType=common` 但 `metadata.silent=true` 的消息。
+- `silent`：入站顶层 `silent=true` 或既有 `messageType=silent`。不识别误拼 `slient`，也不把 `metadata.silent` 作为入站静默开关。
 - `cron`：cron/后台投递。
 
+cron 投递消息必须带 `data.channel` 数组，供 Tec01 后台路由到一个或多个前端渠道：
+
+```json
+{
+  "event": "message_reply",
+  "data": {
+    "messageType": "cron",
+    "channel": ["tec01", "anyi"],
+    "job_id": "job_all001",
+    "text": "⏰ 全渠道日报\\n\\n今日运行日报：无高优先级异常。",
+    "botReplyExtra": {"messageType": "cron", "channel": ["tec01", "anyi"], "job_id": "job_all001"}
+  }
+}
+```
+
+合法渠道为 `tec01` 和 `anyi`。存量 cron 任务缺失 `channel` 时会迁移为 `["tec01"]`。cron 投递 `message_reply.data.job_id` 必填，值为触发本次投递的定时任务 ID；`botReplyExtra.job_id` 同步填充同一个值，方便 Tec01 后台按 extra 统一解析。注意：`channel` 是 Tec01 后台的前端路由字段，不是 Hermes 内部投递目标；`channelId` 是 AOPS 消息投递会话 ID，内部保存为 `origin.chat_id`。AOPS slash command 在会话内创建 cron 时默认保存创建会话为 `origin` 并写入 `deliver="origin"`，触发后回复到创建时的 `channelId`；旧会话归档后可通过 `/cron update <id> {"channelId":"new_channel_id"}` 迁移投递目标。仅在没有可用 origin 时才退回 `deliver="aops"`，并通过 `AOPS_HOME_CHANNEL` 或 gateway config 的 `home_channel` 投递到 AOPS home channel。
+
+cron 每次执行都会保存本地输出文件并写入历史快照。快照包含执行当时的 `channelId`、`channel`、`deliver`、名称、提示词和 schedule；`outputPath` 是 gateway 机器上的本地路径，Tec01/Anyi 对端不能直接读取该文件。对端能看到的是 `message_reply.data.text` 中已推送的结果摘要/正文。若 UI 需要查看完整文件，需要新增受控的 history 文件读取或下载接口。
+
+工具进度消息仍通过 `message_reply` 中间帧发送。`tool.completed` 会回传有界结果摘要，默认最多 4096 字符：
+
+```json
+{
+  "event": "message_reply",
+  "data": {
+    "phase": "tool",
+    "kind": "tool",
+    "channelId": "conv_xxx",
+    "messageType": "common",
+    "conversationEnded": false,
+    "tool": {
+      "phase": "result",
+      "name": "exec",
+      "result": {
+        "text": "{\"stdout\":\"hello\"}",
+        "length": 18,
+        "truncated": false
+      },
+      "durationMs": 1250,
+      "isError": false
+    }
+  }
+}
+```
+
+`platforms.aops.extra.push_tool_calls=false` 或 `AOPS_PUSH_TOOL_CALLS=false` 时，不发送 `tool.started/tool.completed` 中间帧；最终 assistant reply 不受影响。多模态/文件类工具结果只回传文本摘要，不上传本地文件内容。
+
 静默回包保持 `messageType=silent`、`silent=true`、`replyToId=<原消息 id>`。同一 websocket 收到的 silent/common-silent 命令按接收顺序处理，避免 `/help`、`/model status` 回包乱序。
+
+## 首条消息标题生成
+
+AOPS 新会话标题在首条消息回复时同步返回，字段位于 `message_reply.data.title`：
+
+- 首条消息是 `/cron create {json}`：不调用 LLM，按规则生成标题。payload 有 `name` 时为 `定时任务：{name}`；没有 `name` 时从 `prompt` 提取短摘要，例如 `定时任务：检查磁盘空间并汇报`。
+- 首条普通 common 消息：在 final reply 返回前同步调用内部标题生成，只触发一次，并随同一条 final `message_reply` 返回 `title`。
+- 其他 local command 不生成标题。
+- 已有标题或用户通过 `/title` 设置过标题时不覆盖。
 
 ## Silent Slash Commands
 
@@ -130,8 +186,8 @@ AOPS 上游统一通过 `send_message` 静默消息调用本地命令：
     "content": "/model status",
     "contentType": "text",
     "model": "hermes",
+    "silent": true,
     "metadata": {
-      "silent": true,
       "id": "123456",
       "botId": "bot_xxx",
       "agentId": "main"
@@ -165,13 +221,24 @@ AOPS 上游统一通过 `send_message` 静默消息调用本地命令：
 - `/toolsets enable <name>`、`/toolsets disable <name>`、`/toolsets set <name> <true|false>`：修改当前 profile 的 `config.yaml platform_toolsets.cli`，并同步镜像到历史兼容键 `platform_toolsets.aops`，立即影响后续新任务。
 - `/skills`、`/skills list`：返回已安装技能，字段与 dashboard 技能状态保持一致。
 - `/skills enable <name>`、`/skills disable <name>`、`/skills set <name> <true|false>`：修改当前 profile 的 `config.yaml skills.disabled`，立即影响后续新任务。
-- `/cron`、`/cron list`：返回计划任务。
+- `/skills uninstall <name>`、`/skills remove <name>`：卸载技能；先尝试 hub-installed 卸载，若确认不是 hub 技能，则安全删除当前 profile `~/.hermes/skills` 下的本地技能目录。
+- `/cron`、`/cron list`：返回全部计划任务。
+- `/cron list <tec01|anyi>`：按渠道包含式筛选计划任务；多渠道任务会同时出现在对应渠道列表中。
+- `/cron create {json}`：创建计划任务，payload 支持 `name`、`prompt`、`schedule`、`channel`、`channelId`、`deliver`、`enabled`、`triggerNow`；`channel` 缺省为 `["tec01"]`，`channelId` 缺省为当前 AOPS 会话，AOPS 会话内缺省 `deliver` 为 `"origin"`；`triggerNow=true` 会在命令返回后立即后台触发一次，不等待下一轮 scheduler tick。
+- `/cron update <id|name> {json}`：更新计划任务，支持修改名称、提示词、执行时间、Tec01/Anyi 路由渠道、AOPS 投递 `channelId`、投递目标、启用状态和是否立即触发；设置 `channelId` 会更新 `origin.chat_id` 并默认 `deliver="origin"`，除非显式传 `deliver="local"`；`triggerNow=true` 会立即后台触发一次。
+- `/cron pause <id|name>`、`/cron resume <id|name>`、`/cron enable <id|name>`、`/cron disable <id|name>`、`/cron trigger <id|name>`：暂停、恢复/启用、禁用和立即触发计划任务；`/cron trigger` 会立即后台执行一次，不只是把 `next_run_at` 标记为下一轮 tick 到期。
 - `/cron remove <id|name>`：按任务 ID 或唯一任务名删除计划任务。
-- `/cron history <id> [tsMs]`、`/cron history before <id> [tsMs]`、`/cron history after <id> <tsMs>`：分页读取 cron 历史，最新记录在前。
+- `/cron history <id> [tsMs]`、`/cron history before <id> [tsMs]`、`/cron history after <id> <tsMs>`：分页读取 cron 历史，最新记录在前；历史条目优先展示执行当时保存的名称、提示词、执行时间、`channelId`、`channel` 和 `deliver` 快照，不会随任务后续 update 改变。
+- `/soul`、`/soul get`：读取当前 profile 的 `SOUL.md`，返回 `type="soul.status"`、`path`、`content`、`contentLength`、`updatedAtMs`。
+- `/soul set {"content":"..."}`、`/soul append {"content":"..."}`：覆盖或追加 `SOUL.md`，返回 `type="soul.updated"`、`contentPreview`、`effectiveImmediately=true`；写入后会驱逐 idle agent cache，后续新 turn 立即加载新指令，正在运行的 turn 不热替换。
+- `/user`、`/user get`：读取当前 profile 的 `memories/USER.md`，返回 `type="user.status"`。
+- `/user set {"content":"..."}`、`/user append {"content":"..."}`：覆盖或追加 `memories/USER.md`，行为同 `/soul`。
+- `/busy`、`/busy status`：返回当前 `display.busy_input_mode`。
+- `/busy queue|steer|interrupt`：写入当前 profile 的 `config.yaml display.busy_input_mode`，并立即同步 gateway runner 内存态；返回 `type="busy.updated"`、`mode`、`saved`、`effectiveImmediately=true`。
 - `/security`：返回当前审批策略。
 - `/security set <off|manual|smart>`：修改审批策略；`off` 会关闭破坏性 slash 二次确认。
 - `/reasoning`、`/reasoning status`、`/reasoning set ...`：读取或修改 reasoning 配置。
-- `/bash clawhub explore --json`、`/bash clawhub install <slug>`、`/bash clawhub uninstall <slug>`：静默 SkillHub/ClawHub 对接命令。
+- `/bash clawhub explore --json`、`/bash clawhub install <slug>`、`/bash clawhub uninstall <slug>`：静默 SkillHub/ClawHub 对接命令；`uninstall` 同样兼容本地技能 fallback。
 
 ## 模型接口
 

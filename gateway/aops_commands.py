@@ -61,6 +61,7 @@ _AOPS_NATIVE_COMMANDS = {
     "queue",
     "curator",
     "toolsets",
+    "skills",
 }
 
 _CATEGORY_MAP = {
@@ -108,6 +109,9 @@ _DESCRIPTION_ZH = {
     "toolsets": "查看或切换当前 profile 的 AOPS 工具集。",
     "skills": "列出已安装技能。",
     "cron": "查看定时任务。",
+    "soul": "查看或编辑当前 profile 的 SOUL.md 指令。",
+    "user": "查看或编辑当前 profile 的 memories/USER.md 指令。",
+    "busy": "查看或切换 busy 输入策略。",
     "security": "查看或切换安全审批策略。",
     "securty": "查看或切换安全审批策略。",
 }
@@ -370,11 +374,24 @@ class HelpNode:
         }
 
 
-@dataclass(frozen=True)
-class LocalCommandResult:
+class LocalCommandResult(str):
+    """String-compatible local command reply with optional AOPS metadata."""
+
     text: str
-    content: list[dict[str, Any]] | None = None
-    metadata: dict[str, Any] | None = None
+    content: list[dict[str, Any]] | None
+    metadata: dict[str, Any] | None
+
+    def __new__(
+        cls,
+        text: str,
+        content: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        obj = str.__new__(cls, text or "")
+        obj.text = text or ""
+        obj.content = content
+        obj.metadata = metadata
+        return obj
 
 
 @dataclass(frozen=True)
@@ -584,6 +601,8 @@ def _is_supported_custom_shape(canonical: str, raw_args: str) -> bool:
             return len(args) >= 2
         if args[:1] == ["set"]:
             return len(args) >= 3
+        if args[:1] in (["uninstall"], ["remove"]):
+            return len(args) >= 2
         return False
     if canonical == "cron":
         if not args or args == ["list"]:
@@ -601,6 +620,14 @@ def _is_supported_custom_shape(canonical: str, raw_args: str) -> bool:
         return True
     if canonical == "toolsets":
         return True
+    if canonical in {"soul", "user"}:
+        if not args or args == ["get"]:
+            return True
+        if args[:1] in (["set"], ["append"]):
+            return len(args) >= 2
+        return False
+    if canonical == "busy":
+        return (not args) or (len(args) == 1 and args[0] in {"status", "queue", "steer", "interrupt"})
     return False
 
 
@@ -608,7 +635,7 @@ def is_supported_command(command: str | None, raw_args: str = "", canonical: str
     normalized = _effective_command(canonical or command, raw_args)
     if not normalized:
         return False
-    if normalized in {"skills", "cron", "curator", "toolsets"}:
+    if normalized in {"skills", "cron", "curator", "toolsets", "soul", "user", "busy"}:
         return _is_supported_custom_shape(normalized, raw_args)
     try:
         from agent.skill_commands import resolve_skill_command_key
@@ -635,6 +662,7 @@ def _list_response(
     limit: int | None = None,
     updated: dict[str, Any] | None = None,
     error: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> str:
     ok = error is None
     payload = {
@@ -654,6 +682,8 @@ def _list_response(
     }
     if updated is not None:
         payload["updated"] = updated
+    if extra:
+        payload.update(extra)
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
@@ -674,6 +704,263 @@ def _single_response(
         "error": error,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+_INSTRUCTION_CONTENT_PREVIEW_LIMIT = 300
+_BUSY_MODES = {"queue", "steer", "interrupt"}
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _instruction_path(kind: str) -> Path:
+    from hermes_constants import get_hermes_home
+
+    home = Path(get_hermes_home())
+    if kind == "soul":
+        return home / "SOUL.md"
+    return home / "memories" / "USER.md"
+
+
+def _read_text_file(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    from utils import atomic_replace
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        atomic_replace(tmp_path, path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+
+def _json_payload_after_action(raw_args: str, action: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    text = str(raw_args or "").strip()
+    prefix = str(action or "").strip()
+    if prefix and text.lower().startswith(prefix.lower()):
+        text = text[len(prefix):].strip()
+    if not text:
+        return None, {
+            "code": "AOPS_INSTRUCTION_INVALID_JSON",
+            "message": "Expected JSON payload, for example {\"content\":\"...\"}.",
+        }
+    try:
+        payload = json.loads(text)
+    except Exception as exc:
+        return None, {"code": "AOPS_INSTRUCTION_INVALID_JSON", "message": str(exc)}
+    if not isinstance(payload, dict):
+        return None, {
+            "code": "AOPS_INSTRUCTION_INVALID_JSON",
+            "message": "Payload must be a JSON object.",
+        }
+    return payload, None
+
+
+def _instruction_error_response(command: str, kind: str, code: str, message: str, path: Path | None = None) -> str:
+    return _single_response(
+        type_=f"{kind}.updated",
+        command=command,
+        data={
+            "path": str(path) if path else str(_instruction_path(kind)),
+            "effectiveImmediately": False,
+        },
+        ok=False,
+        error={"code": code, "message": message},
+    )
+
+
+def _instruction_command(kind: str, command_text: str, raw_args: str, args: list[str]) -> LocalCommandResult:
+    action = args[0].lower() if args else "get"
+    path = _instruction_path(kind)
+    type_prefix = "soul" if kind == "soul" else "user"
+    label = "SOUL.md" if kind == "soul" else "memories/USER.md"
+
+    if action in {"", "get"}:
+        content = _read_text_file(path)
+        text = _single_response(
+            type_=f"{type_prefix}.status",
+            command=command_text,
+            data={
+                "path": str(path),
+                "content": content,
+                "contentLength": len(content),
+                "updatedAtMs": _to_ms(datetime.fromtimestamp(path.stat().st_mtime)) if path.exists() else None,
+                "effectiveImmediately": True,
+                "message": f"Current {label} content.",
+            },
+        )
+        return LocalCommandResult(text=text, metadata={})
+
+    if action not in {"set", "append"}:
+        text = _instruction_error_response(
+            command_text,
+            type_prefix,
+            "AOPS_INSTRUCTION_INVALID_JSON",
+            f"Usage: /{type_prefix} [get|set|append] {{json}}",
+            path,
+        )
+        return LocalCommandResult(text=text, metadata={})
+
+    payload, error = _json_payload_after_action(raw_args, action)
+    if error:
+        text = _instruction_error_response(command_text, type_prefix, error["code"], error["message"], path)
+        return LocalCommandResult(text=text, metadata={})
+    assert payload is not None
+    content = payload.get("content")
+    if not isinstance(content, str) or not content.strip():
+        text = _instruction_error_response(
+            command_text,
+            type_prefix,
+            "AOPS_INSTRUCTION_EMPTY_CONTENT",
+            "Payload field 'content' must be a non-empty string.",
+            path,
+        )
+        return LocalCommandResult(text=text, metadata={})
+    try:
+        from tools.memory_tool import _scan_memory_content
+
+        scan_error = _scan_memory_content(content)
+    except Exception:
+        scan_error = None
+    if scan_error:
+        text = _instruction_error_response(
+            command_text,
+            type_prefix,
+            "AOPS_INSTRUCTION_THREAT_DETECTED",
+            scan_error,
+            path,
+        )
+        return LocalCommandResult(text=text, metadata={})
+
+    before = _read_text_file(path)
+    if action == "append" and before:
+        new_content = before.rstrip("\n") + "\n\n" + content.strip() + "\n"
+    elif action == "append":
+        new_content = content.strip() + "\n"
+    else:
+        new_content = content
+        if not new_content.endswith("\n"):
+            new_content += "\n"
+    _atomic_write_text(path, new_content)
+    now = _now_ms()
+    preview = new_content[:_INSTRUCTION_CONTENT_PREVIEW_LIMIT]
+    if len(new_content) > _INSTRUCTION_CONTENT_PREVIEW_LIMIT:
+        preview += "…"
+    text = _single_response(
+        type_=f"{type_prefix}.updated",
+        command=command_text,
+        data={
+            "path": str(path),
+            "contentPreview": preview,
+            "contentLength": len(new_content),
+            "updatedAtMs": now,
+            "operation": action,
+            "effectiveImmediately": True,
+            "message": f"Updated {label}. Future turns will reload the updated instruction file.",
+        },
+    )
+    return LocalCommandResult(
+        text=text,
+        metadata={
+            "effects": {
+                "invalidateAgentCache": True,
+                "reason": f"aops_{type_prefix}_updated",
+                "path": str(path),
+            }
+        },
+    )
+
+
+def _busy_current_mode() -> str:
+    mode = os.getenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "").strip().lower()
+    if not mode:
+        try:
+            import yaml
+            from hermes_constants import get_hermes_home
+
+            config_path = Path(get_hermes_home()) / "config.yaml"
+            cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+            display = cfg.get("display") if isinstance(cfg, dict) else {}
+            mode = str((display or {}).get("busy_input_mode") or "").strip().lower()
+        except Exception:
+            mode = ""
+    return mode if mode in _BUSY_MODES else "interrupt"
+
+
+def _save_busy_input_mode(mode: str) -> bool:
+    try:
+        from hermes_constants import get_hermes_home
+        from utils import atomic_roundtrip_yaml_update
+
+        config_path = Path(get_hermes_home()) / "config.yaml"
+        atomic_roundtrip_yaml_update(config_path, "display.busy_input_mode", mode)
+        try:
+            os.chmod(config_path, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _busy_command(command_text: str, args: list[str]) -> LocalCommandResult:
+    mode = args[0].lower() if args else "status"
+    if mode == "status":
+        mode = _busy_current_mode()
+        text = _single_response(
+            type_="busy.status",
+            command=command_text,
+            data={
+                "mode": mode,
+                "effectiveImmediately": True,
+                "usage": "/busy [queue|steer|interrupt|status]",
+            },
+        )
+        return LocalCommandResult(text=text, metadata={})
+    if mode not in _BUSY_MODES:
+        text = _single_response(
+            type_="busy.updated",
+            command=command_text,
+            data={
+                "mode": _busy_current_mode(),
+                "effectiveImmediately": False,
+                "usage": "/busy [queue|steer|interrupt|status]",
+            },
+            ok=False,
+            error={"code": "AOPS_BUSY_INVALID_MODE", "message": f"Unsupported busy mode: {mode}"},
+        )
+        return LocalCommandResult(text=text, metadata={})
+    saved = _save_busy_input_mode(mode)
+    text = _single_response(
+        type_="busy.updated",
+        command=command_text,
+        data={
+            "mode": mode,
+            "saved": saved,
+            "effectiveImmediately": True,
+            "usage": "/busy [queue|steer|interrupt|status]",
+        },
+    )
+    return LocalCommandResult(
+        text=text,
+        metadata={
+            "effects": {
+                "busyInputMode": mode,
+                "reason": "aops_busy_updated",
+            }
+        },
+    )
 
 
 def _cfg_get(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -935,8 +1222,7 @@ def _history_duration_ms(entry: dict[str, Any]) -> Optional[int]:
 def _history_next_run_ms(entry: dict[str, Any], job: dict[str, Any]) -> Optional[int]:
     for value in (
         _first_history_value(entry, "nextRunAtMs", "next_run_at_ms"),
-        _first_history_value(entry, "next_run_at", "nextRunAt", "next_run_at_after", "nextRunAtAfter"),
-        job.get("next_run_at"),
+        _first_history_value(entry, "next_run_at_after", "nextRunAtAfter", "next_run_at", "nextRunAt"),
         _first_history_value(entry, "scheduled_for", "scheduledFor"),
     ):
         ms = _to_ms(value)
@@ -1162,7 +1448,7 @@ def _skills_command(command_text: str, args: list[str]) -> str:
                 error={"code": "SKILLS_READ_FAILED", "message": str(exc)},
             )
 
-    if action not in {"enable", "disable", "set"}:
+    if action not in {"enable", "disable", "set", "uninstall", "remove"}:
         return _list_response(
             type_="skills.updated",
             command=command_text,
@@ -1170,7 +1456,7 @@ def _skills_command(command_text: str, args: list[str]) -> str:
             items=[],
             error={
                 "code": "SKILLS_USAGE",
-                "message": "Usage: /skills list | /skills enable <name> | /skills disable <name> | /skills set <name> <true|false>",
+                "message": "Usage: /skills list | /skills enable <name> | /skills disable <name> | /skills set <name> <true|false> | /skills uninstall <name>",
             },
         )
     if len(args) < 2:
@@ -1180,6 +1466,95 @@ def _skills_command(command_text: str, args: list[str]) -> str:
             item_type="skill",
             items=[],
             error={"code": "SKILL_NAME_REQUIRED", "message": "Skill name is required."},
+        )
+
+    if action in {"uninstall", "remove"}:
+        from gateway.aops_skill_uninstall import (
+            is_not_hub_installed_message,
+            uninstall_local_skill_fallback,
+        )
+        from tools.skills_hub import uninstall_skill
+
+        target_ref = " ".join(args[1:]).strip()
+        try:
+            ok, message = uninstall_skill(target_ref)
+        except Exception as exc:
+            ok, message = False, str(exc)
+        if ok:
+            try:
+                from agent.prompt_builder import clear_skills_system_prompt_cache
+
+                clear_skills_system_prompt_cache(clear_snapshot=True)
+            except Exception:
+                pass
+            try:
+                from agent.skill_commands import reload_skills
+
+                reload_skills()
+            except Exception:
+                pass
+            items_after, context_after = _skill_items()
+            context_after.update({"agentId": "main", "workspaceDir": os.getcwd()})
+            return _list_response(
+                type_="skills.updated",
+                command=command_text,
+                item_type="skill",
+                items=items_after,
+                context=context_after,
+                summary=_skills_summary(items_after),
+                updated={
+                    "name": target_ref,
+                    "action": "uninstall",
+                    "source": "hub",
+                    "removedPath": None,
+                    "message": message,
+                },
+            )
+        if not is_not_hub_installed_message(message):
+            return _list_response(
+                type_="skills.updated",
+                command=command_text,
+                item_type="skill",
+                items=[],
+                error={"code": "SKILL_UNINSTALL_FAILED", "message": message or f"Failed to uninstall `{target_ref}`."},
+            )
+        try:
+            items, context = _skill_items()
+        except Exception as exc:
+            return _list_response(
+                type_="skills.updated",
+                command=command_text,
+                item_type="skill",
+                items=[],
+                error={"code": "SKILLS_READ_FAILED", "message": str(exc)},
+            )
+        result = uninstall_local_skill_fallback(target_ref, items=items)
+        if not result.get("ok"):
+            return _list_response(
+                type_="skills.updated",
+                command=command_text,
+                item_type="skill",
+                items=[],
+                context=result.get("context") or context,
+                summary=_skills_summary(items),
+                error=result.get("error") or {"code": "SKILL_UNINSTALL_FAILED", "message": f"Failed to uninstall `{target_ref}`."},
+            )
+        items_after, context_after = _skill_items()
+        context_after.update({"agentId": "main", "workspaceDir": os.getcwd()})
+        return _list_response(
+            type_="skills.updated",
+            command=command_text,
+            item_type="skill",
+            items=items_after,
+            context=context_after,
+            summary=_skills_summary(items_after),
+            updated={
+                "name": result.get("name") or target_ref,
+                "action": "uninstall",
+                "source": "local",
+                "removedPath": result.get("removedPath"),
+                "message": result.get("message"),
+            },
         )
 
     requested_enabled = action == "enable"
@@ -1501,10 +1876,102 @@ def _toolsets_command(command_text: str, event: MessageEvent, args: list[str]) -
     )
 
 
-def _cron_items() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+def _cron_channel_error(command_text: str, channel_value: Any) -> str:
+    return _list_response(
+        type_="cron.list",
+        command=command_text,
+        item_type="cron.task",
+        items=[],
+        error={
+            "code": "CRON_INVALID_CHANNEL",
+            "message": "Cron channel must be one of: tec01, anyi.",
+            "details": {"channel": channel_value},
+        },
+    )
+
+
+def _cron_parse_list_channel(args: list[str]) -> list[str] | None:
+    if not args:
+        return None
+    if args == ["list"]:
+        return None
+    if len(args) == 2 and args[0] == "list":
+        channel = args[1].strip().lower()
+        if channel in {"tec01", "anyi"}:
+            return [channel]
+    raise ValueError("invalid cron list channel")
+
+
+def _cron_item(job: dict[str, Any], latest_entry: dict[str, Any] | None = None) -> dict[str, Any]:
+    latest_entry = latest_entry or {}
+    state = str(job.get("state") or "").lower()
+    is_enabled = bool(job.get("enabled", True))
+    is_schedulable = is_enabled and state not in {"paused", "completed", "deleted", "disabled"}
+    schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+    schedule_flags = _cron_schedule_flags(job)
+    channel = list(job.get("channel") or ["tec01"])
+    channel_id = _cron_channel_id(job)
+    return {
+        "id": job.get("id"),
+        "name": job.get("name") or job.get("id"),
+        "description": _job_description(job),
+        "enabled": is_enabled,
+        "agentId": None,
+        "sessionKey": None,
+        "sessionTarget": None,
+        "wakeMode": None,
+        "deleteAfterRun": schedule_flags["isOneShot"],
+        **schedule_flags,
+        "createdAtMs": _to_ms(job.get("created_at")),
+        "updatedAtMs": _to_ms(job.get("updated_at") or job.get("created_at")),
+        "scheduleText": job.get("schedule_display") or schedule.get("display"),
+        "payloadKind": "agentTurn",
+        "payloadSummary": (str(job.get("prompt") or "").strip() or None),
+        "prompt": (str(job.get("prompt") or "").strip() or None),
+        "payloadModel": job.get("model"),
+        "payloadFallbacks": None,
+        "payloadThinking": None,
+        "payloadTimeoutSeconds": None,
+        "payloadAllowUnsafeExternalContent": None,
+        "payloadLightContext": None,
+        "payloadToolsAllow": job.get("enabled_toolsets"),
+        "payloadExternalContentSource": None,
+        "nextRunAtMs": _to_ms(job.get("next_run_at")) if is_schedulable else None,
+        "lastRunAtMs": _to_ms(job.get("last_run_at")),
+        "runningAtMs": None,
+        "lastRunStatus": job.get("last_status"),
+        "lastError": job.get("last_error"),
+        "lastErrorReason": None,
+        "lastDurationMs": _history_duration_ms(latest_entry),
+        "consecutiveErrors": None,
+        "lastFailureAlertAtMs": None,
+        "scheduleErrorCount": None,
+        "lastDeliveryStatus": _status_to_delivery(
+            job.get("last_status"),
+            job.get("last_delivery_error") or latest_entry.get("delivery_error"),
+            None if latest_entry.get("silent") else (False if latest_entry.get("delivery_error") else None),
+        ),
+        "lastDeliveryError": job.get("last_delivery_error"),
+        "lastDelivered": (
+            None
+            if latest_entry.get("silent")
+            else (False if (job.get("last_delivery_error") or latest_entry.get("delivery_error")) else None)
+        ),
+        "deliveryText": job.get("deliver"),
+        "channelId": channel_id,
+        "failureAlertText": None,
+        "state": state or ("scheduled" if is_enabled else "disabled"),
+        "origin": job.get("origin"),
+        "skills": job.get("skills") or [],
+        "workdir": job.get("workdir"),
+        "channel": channel,
+    }
+
+
+def _cron_items(channel_filter: list[str] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     from cron import jobs as cron_jobs
 
-    jobs = cron_jobs.load_jobs()
+    jobs = cron_jobs.list_jobs(include_disabled=True)
     history_path = Path(cron_jobs.HISTORY_FILE)
     history_by_job: dict[str, dict[str, Any]] = {}
     wanted_job_ids = {str(job.get("id") or "").strip() for job in jobs if str(job.get("id") or "").strip()}
@@ -1519,68 +1986,14 @@ def _cron_items() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
     enabled = 0
     disabled = 0
     for job in jobs:
+        channel = list(job.get("channel") or ["tec01"])
+        if channel_filter and not any(item in channel for item in channel_filter):
+            continue
         latest_entry = history_by_job.get(str(job.get("id")), {})
-        state = str(job.get("state") or "").lower()
         is_enabled = bool(job.get("enabled", True))
-        is_schedulable = is_enabled and state not in {"paused", "completed", "deleted", "disabled"}
         enabled += 1 if is_enabled else 0
         disabled += 0 if is_enabled else 1
-        schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
-        schedule_flags = _cron_schedule_flags(job)
-        items.append(
-            {
-                "id": job.get("id"),
-                "name": job.get("name") or job.get("id"),
-                "description": _job_description(job),
-                "enabled": is_enabled,
-                "agentId": None,
-                "sessionKey": None,
-                "sessionTarget": None,
-                "wakeMode": None,
-                "deleteAfterRun": schedule_flags["isOneShot"],
-                **schedule_flags,
-                "createdAtMs": _to_ms(job.get("created_at")),
-                "updatedAtMs": _to_ms(job.get("updated_at") or job.get("created_at")),
-                "scheduleText": job.get("schedule_display") or schedule.get("display"),
-                "payloadKind": "agentTurn",
-                "payloadSummary": (str(job.get("prompt") or "").strip() or None),
-                "payloadModel": job.get("model"),
-                "payloadFallbacks": None,
-                "payloadThinking": None,
-                "payloadTimeoutSeconds": None,
-                "payloadAllowUnsafeExternalContent": None,
-                "payloadLightContext": None,
-                "payloadToolsAllow": job.get("enabled_toolsets"),
-                "payloadExternalContentSource": None,
-                "nextRunAtMs": _to_ms(job.get("next_run_at")) if is_schedulable else None,
-                "lastRunAtMs": _to_ms(job.get("last_run_at")),
-                "runningAtMs": None,
-                "lastRunStatus": job.get("last_status"),
-                "lastError": job.get("last_error"),
-                "lastErrorReason": None,
-                "lastDurationMs": _history_duration_ms(latest_entry),
-                "consecutiveErrors": None,
-                "lastFailureAlertAtMs": None,
-                "scheduleErrorCount": None,
-                "lastDeliveryStatus": _status_to_delivery(
-                    job.get("last_status"),
-                    job.get("last_delivery_error") or latest_entry.get("delivery_error"),
-                    None if latest_entry.get("silent") else (False if latest_entry.get("delivery_error") else None),
-                ),
-                "lastDeliveryError": job.get("last_delivery_error"),
-                "lastDelivered": (
-                    None
-                    if latest_entry.get("silent")
-                    else (False if (job.get("last_delivery_error") or latest_entry.get("delivery_error")) else None)
-                ),
-                "deliveryText": job.get("deliver"),
-                "failureAlertText": None,
-                "state": state or ("scheduled" if is_enabled else "disabled"),
-                "origin": job.get("origin"),
-                "skills": job.get("skills") or [],
-                "workdir": job.get("workdir"),
-            }
-        )
+        items.append(_cron_item(job, latest_entry))
     context = {"storePath": str(cron_jobs.JOBS_FILE)}
     summary = {"enabled": enabled, "disabled": disabled}
     return items, context, summary
@@ -2292,7 +2705,89 @@ def _history_summary_item(job: dict[str, Any] | None) -> dict[str, Any] | None:
         **schedule_flags,
         "nextRunAtMs": _to_ms(job.get("next_run_at")),
         "lastRunAtMs": _to_ms(job.get("last_run_at")),
+        "deliveryText": job.get("deliver"),
+        "channelId": _cron_channel_id(job),
+        "channel": list(job.get("channel") or ["tec01"]),
     }
+
+
+def _cron_channel_id(job: dict[str, Any] | None) -> str | None:
+    if not isinstance(job, dict):
+        return None
+    origin = job.get("origin")
+    if isinstance(origin, dict):
+        value = origin.get("chat_id") or origin.get("channelId") or origin.get("channel_id")
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    value = job.get("channelId") or job.get("channel_id")
+    if value is not None and str(value).strip():
+        return str(value).strip()
+    return None
+
+
+def _cron_validate_channel_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Cron channelId must be a non-empty string.")
+    channel_id = value.strip()
+    if not channel_id:
+        raise ValueError("Cron channelId must be a non-empty string.")
+    return channel_id
+
+
+def _cron_origin_for_channel_id(channel_id: str, base: dict[str, Any] | None = None) -> dict[str, Any]:
+    origin = dict(base or {})
+    origin["platform"] = "aops"
+    origin["chat_id"] = channel_id
+    return origin
+
+
+def _history_entry_channel(entry: dict[str, Any], job: dict[str, Any]) -> list[str]:
+    try:
+        from cron.jobs import normalize_channel_selection
+
+        return normalize_channel_selection(entry.get("channel"), strict=False)
+    except Exception:
+        channel = entry.get("channel")
+        if isinstance(channel, str):
+            items = [channel]
+        elif isinstance(channel, list):
+            items = channel
+        else:
+            items = ["tec01"]
+        normalized: list[str] = []
+        for item in items:
+            text = str(item or "").strip().lower()
+            if text in {"tec01", "anyi"} and text not in normalized:
+                normalized.append(text)
+        return normalized or ["tec01"]
+
+
+def _history_output_snapshot(entry: dict[str, Any]) -> dict[str, str]:
+    """Best-effort snapshot recovery for legacy history rows without metadata."""
+    text = ""
+    output_path = str(entry.get("output_path") or entry.get("outputPath") or "").strip()
+    if output_path:
+        try:
+            path = Path(output_path).expanduser()
+            if path.exists() and path.is_file():
+                text = path.read_text(encoding="utf-8", errors="replace")[:12000]
+        except Exception:
+            text = ""
+    if not text:
+        text = str(entry.get("response_preview") or entry.get("summary") or "")
+    snapshot: dict[str, str] = {}
+    name_match = re.search(r"(?m)^#\s*Cron Job:\s*(.+?)\s*$", text)
+    if name_match:
+        snapshot["job_name"] = name_match.group(1).strip()
+    schedule_match = re.search(r"(?m)^\*\*Schedule:\*\*\s*(.+?)\s*$", text)
+    if schedule_match:
+        snapshot["schedule_display"] = schedule_match.group(1).strip()
+    prompt_match = re.search(r"(?s)##\s*Prompt\s*\n(.+?)(?:\n##\s+|\Z)", text)
+    if prompt_match:
+        prompt = prompt_match.group(1).strip()
+        if prompt:
+            snapshot["prompt"] = prompt[:500]
+    return snapshot
 
 
 def _history_error(command: str, context: dict[str, Any], code: str, message: str, details: dict[str, Any] | None = None) -> str:
@@ -2471,6 +2966,13 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
 
     normalized: list[dict[str, Any]] = []
     for entry in entries:
+        legacy_snapshot = _history_output_snapshot(entry)
+        entry_job_name = entry.get("job_name") or legacy_snapshot.get("job_name")
+        entry_prompt = entry.get("prompt") or legacy_snapshot.get("prompt")
+        entry_schedule_text = entry.get("schedule_display") or legacy_snapshot.get("schedule_display")
+        if not entry_schedule_text and isinstance(entry.get("schedule"), dict):
+            entry_schedule_text = entry.get("schedule", {}).get("display")
+        entry_channel_id = _cron_channel_id(entry)
         ts = _to_ms(
             _first_history_value(
                 entry,
@@ -2489,7 +2991,7 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
             {
                 "ts": ts,
                 "jobId": entry.get("job_id"),
-                "description": entry.get("job_description") or _job_description(job) or _compact_text(entry.get("job_name")),
+                "description": entry.get("job_description") or _compact_text(entry_prompt) or _compact_text(entry_job_name) or _compact_text(entry.get("response_preview")),
                 "action": "finished",
                 "status": status,
                 "error": entry.get("error"),
@@ -2502,10 +3004,15 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
                 "runAtMs": _to_ms(_first_history_value(entry, "started_at", "startedAt", "run_at", "runAt", "timestamp")),
                 "durationMs": duration_ms,
                 "nextRunAtMs": _history_next_run_ms(entry, job),
-                "model": entry.get("model") or job.get("model"),
-                "provider": entry.get("provider") or job.get("provider"),
+                "model": entry.get("model"),
+                "provider": entry.get("provider"),
                 "usage": _history_usage(entry, duration_ms),
-                "jobName": entry.get("job_name") or job.get("name"),
+                "jobName": entry_job_name,
+                "prompt": entry_prompt,
+                "scheduleText": entry_schedule_text,
+                "deliveryText": entry.get("deliver"),
+                "channelId": entry_channel_id,
+                "channel": _history_entry_channel(entry, job),
                 "outputPath": entry.get("output_path"),
             }
         )
@@ -2568,6 +3075,220 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
     )
 
 
+def _cron_single_error(command: str, type_: str, code: str, message: str, details: dict[str, Any] | None = None) -> str:
+    return _single_response(
+        type_=type_,
+        command=command,
+        data={},
+        ok=False,
+        error={"code": code, "message": message, "details": details or {}},
+    )
+
+
+def _cron_decode_payload(command_text: str, raw_json: str, type_: str) -> dict[str, Any] | str:
+    if not raw_json.strip():
+        return _cron_single_error(command_text, type_, "CRON_MISSING_PAYLOAD", "Expected a JSON object payload.")
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        return _cron_single_error(command_text, type_, "CRON_INVALID_JSON", str(exc), {"payload": raw_json})
+    if not isinstance(payload, dict):
+        return _cron_single_error(command_text, type_, "CRON_INVALID_JSON", "Cron payload must be a JSON object.", {"payload": payload})
+    return payload
+
+
+def _cron_task_response(type_: str, command_text: str, job: dict[str, Any], *, message: str | None = None) -> str:
+    task = _cron_item(job)
+    data: dict[str, Any] = {"task": task, "channel": list(task.get("channel") or ["tec01"])}
+    if message:
+        data["message"] = message
+    return _single_response(type_=type_, command=command_text, data=data)
+
+
+def _cron_task_result(
+    type_: str,
+    command_text: str,
+    job: dict[str, Any],
+    *,
+    message: str | None = None,
+    trigger_now: bool = False,
+) -> LocalCommandResult:
+    text = _cron_task_response(type_, command_text, job, message=message)
+    metadata: dict[str, Any] = {}
+    if trigger_now and job.get("id"):
+        metadata = {"effects": {"triggerCronJobId": str(job["id"])}}
+    return LocalCommandResult(text=text, metadata=metadata)
+
+
+def _cron_origin_from_event(event: MessageEvent | None) -> dict[str, Any] | None:
+    source = getattr(event, "source", None)
+    if not source or not getattr(source, "chat_id", None):
+        return None
+    platform = getattr(source, "platform", None)
+    platform_value = getattr(platform, "value", platform) or "aops"
+    origin: dict[str, Any] = {
+        "platform": str(platform_value),
+        "chat_id": str(source.chat_id),
+    }
+    for attr in ("chat_name", "chat_type", "user_id", "user_name", "thread_id", "parent_chat_id", "profile"):
+        value = getattr(source, attr, None)
+        if value is not None and str(value).strip():
+            origin[attr] = str(value)
+    return origin
+
+
+def _cron_create(command_text: str, raw_args: str, event: MessageEvent | None = None) -> str | LocalCommandResult:
+    from cron import jobs as cron_jobs
+
+    raw_payload = raw_args.strip()[len("create"):].strip()
+    payload = _cron_decode_payload(command_text, raw_payload, "cron.created")
+    if isinstance(payload, str):
+        return payload
+    prompt = str(payload.get("prompt") or "").strip()
+    schedule = str(payload.get("schedule") or "").strip()
+    if not prompt:
+        return _cron_single_error(command_text, "cron.created", "CRON_MISSING_PROMPT", "Cron create requires prompt.")
+    if not schedule:
+        return _cron_single_error(command_text, "cron.created", "CRON_MISSING_SCHEDULE", "Cron create requires schedule.")
+    origin = _cron_origin_from_event(event)
+    if "channelId" in payload:
+        try:
+            origin = _cron_origin_for_channel_id(_cron_validate_channel_id(payload.get("channelId")), origin)
+        except ValueError as exc:
+            return _cron_single_error(command_text, "cron.created", "CRON_INVALID_CHANNEL_ID", str(exc), {"channelId": payload.get("channelId")})
+    try:
+        job = cron_jobs.create_job(
+            prompt=prompt,
+            schedule=schedule,
+            name=payload.get("name"),
+            deliver=payload.get("deliver") or ("origin" if origin else "aops"),
+            origin=origin,
+            channel=payload.get("channel"),
+        )
+        trigger_now = payload.get("triggerNow") is True and payload.get("enabled") is not False
+        if payload.get("enabled") is False:
+            job = cron_jobs.pause_job(job["id"]) or job
+    except getattr(cron_jobs, "InvalidCronChannel") as exc:
+        return _cron_single_error(command_text, "cron.created", "CRON_INVALID_CHANNEL", str(exc), {"channel": payload.get("channel")})
+    except ValueError as exc:
+        return _cron_single_error(command_text, "cron.created", "CRON_INVALID_SCHEDULE", str(exc))
+    except Exception as exc:
+        return _cron_single_error(command_text, "cron.created", "CRON_CREATE_FAILED", str(exc))
+    message = f"Created cron job `{job.get('name') or job.get('id')}`."
+    if trigger_now:
+        message += " Immediate trigger accepted."
+        return _cron_task_result("cron.created", command_text, job, message=message, trigger_now=True)
+    return _cron_task_response("cron.created", command_text, job, message=message)
+
+
+def _cron_resolve_ref(cron_jobs: Any, command_text: str, type_: str, job_ref: str) -> dict[str, Any] | str | None:
+    try:
+        return cron_jobs.resolve_job_ref(job_ref)
+    except getattr(cron_jobs, "AmbiguousJobReference") as exc:
+        matches = [_history_summary_item(match) for match in getattr(exc, "matches", [])]
+        return _single_response(
+            type_=type_,
+            command=command_text,
+            data={"matches": matches},
+            ok=False,
+            error={"code": "CRON_JOB_AMBIGUOUS", "message": str(exc)},
+        )
+
+
+def _cron_update(command_text: str, raw_args: str, event: MessageEvent | None = None) -> str | LocalCommandResult:
+    from cron import jobs as cron_jobs
+
+    rest = raw_args.strip()[len("update"):].strip()
+    parts = rest.split(None, 1)
+    if len(parts) < 2:
+        return _cron_single_error(command_text, "cron.updated", "CRON_UPDATE_USAGE", "Usage: /cron update <id|name> {json}")
+    job_ref, raw_payload = parts
+    resolved = _cron_resolve_ref(cron_jobs, command_text, "cron.updated", job_ref)
+    if isinstance(resolved, str):
+        return resolved
+    if not resolved:
+        return _cron_single_error(command_text, "cron.updated", "CRON_JOB_NOT_FOUND", f"Cron job `{job_ref}` not found.")
+    payload = _cron_decode_payload(command_text, raw_payload, "cron.updated")
+    if isinstance(payload, str):
+        return payload
+    allowed = {"name", "prompt", "schedule", "channel", "deliver"}
+    updates = {key: payload[key] for key in allowed if key in payload}
+    origin = _cron_origin_from_event(event)
+    if "channelId" in payload:
+        try:
+            base_origin = resolved.get("origin") if isinstance(resolved.get("origin"), dict) else origin
+            updates["origin"] = _cron_origin_for_channel_id(_cron_validate_channel_id(payload.get("channelId")), base_origin)
+            if str(updates.get("deliver") or "").strip().lower() != "local":
+                updates["deliver"] = "origin"
+        except ValueError as exc:
+            return _cron_single_error(command_text, "cron.updated", "CRON_INVALID_CHANNEL_ID", str(exc), {"channelId": payload.get("channelId")})
+    if "deliver" not in updates and str(resolved.get("deliver") or "local").strip().lower() == "local":
+        updates["deliver"] = "origin" if origin else "aops"
+    if "origin" not in updates and origin and not resolved.get("origin") and str(updates.get("deliver") or resolved.get("deliver") or "").strip().lower() == "origin":
+        updates["origin"] = origin
+    try:
+        job = resolved
+        if updates:
+            updated = cron_jobs.update_job(str(resolved["id"]), updates)
+            job = updated or job
+        if payload.get("enabled") is False:
+            job = cron_jobs.pause_job(str(job["id"])) or job
+        elif payload.get("enabled") is True:
+            job = cron_jobs.resume_job(str(job["id"])) or job
+        trigger_now = payload.get("triggerNow") is True and job.get("enabled", True)
+    except getattr(cron_jobs, "InvalidCronChannel") as exc:
+        return _cron_single_error(command_text, "cron.updated", "CRON_INVALID_CHANNEL", str(exc), {"channel": payload.get("channel")})
+    except ValueError as exc:
+        return _cron_single_error(command_text, "cron.updated", "CRON_UPDATE_FAILED", str(exc))
+    except Exception as exc:
+        return _cron_single_error(command_text, "cron.updated", "CRON_UPDATE_FAILED", str(exc))
+    message = f"Updated cron job `{job.get('name') or job.get('id')}`."
+    if trigger_now:
+        message += " Immediate trigger accepted."
+        return _cron_task_result("cron.updated", command_text, job, message=message, trigger_now=True)
+    return _cron_task_response("cron.updated", command_text, job, message=message)
+
+
+def _cron_ref_action(command_text: str, args: list[str], *, action: str, type_: str) -> str | LocalCommandResult:
+    from cron import jobs as cron_jobs
+
+    if len(args) < 2:
+        return _cron_single_error(command_text, type_, f"CRON_{action.upper()}_MISSING_REF", f"Usage: /cron {action} <id|name>")
+    job_ref = args[1]
+    try:
+        if action == "pause":
+            job = cron_jobs.pause_job(job_ref)
+        elif action == "resume":
+            job = cron_jobs.resume_job(job_ref)
+        elif action == "trigger":
+            job = cron_jobs.resolve_job_ref(job_ref)
+        else:
+            job = None
+    except getattr(cron_jobs, "AmbiguousJobReference") as exc:
+        matches = [_history_summary_item(match) for match in getattr(exc, "matches", [])]
+        return _single_response(
+            type_=type_,
+            command=command_text,
+            data={"matches": matches},
+            ok=False,
+            error={"code": "CRON_JOB_AMBIGUOUS", "message": str(exc)},
+        )
+    except Exception as exc:
+        return _cron_single_error(command_text, type_, f"CRON_{action.upper()}_FAILED", str(exc))
+    if not job:
+        return _cron_single_error(command_text, type_, "CRON_JOB_NOT_FOUND", f"Cron job `{job_ref}` not found.")
+    past = {"pause": "paused", "resume": "resumed", "trigger": "triggered"}.get(action, action)
+    if action == "trigger":
+        return _cron_task_result(
+            type_,
+            command_text,
+            job,
+            message=f"Cron job `{job.get('name') or job.get('id')}` immediate trigger accepted.",
+            trigger_now=True,
+        )
+    return _cron_task_response(type_, command_text, job, message=f"Cron job `{job.get('name') or job.get('id')}` {past}.")
+
+
 def _cron_remove(command_text: str, args: list[str]) -> str:
     from cron import jobs as cron_jobs
 
@@ -2597,6 +3318,7 @@ def _cron_remove(command_text: str, args: list[str]) -> str:
                 "name": match.get("name"),
                 "description": _job_description(match),
                 "scheduleText": match.get("schedule_display") or (match.get("schedule") or {}).get("display"),
+                "channel": list(match.get("channel") or ["tec01"]),
             }
             for match in getattr(exc, "matches", [])
         ]
@@ -2667,6 +3389,7 @@ def _cron_remove(command_text: str, args: list[str]) -> str:
         data={
             "context": {**context, "jobId": job.get("id")},
             "task": summary,
+            "channel": list((summary or {}).get("channel") or ["tec01"]),
             "removed": True,
             "message": f"Removed cron job `{job.get('name') or job.get('id')}`.",
         },
@@ -2693,10 +3416,17 @@ def maybe_local_command(event: MessageEvent) -> str | LocalCommandResult | None:
     if canonical == "toolsets":
         return _toolsets_command(full_command, event, args)
 
+    if canonical in {"soul", "user"}:
+        return _instruction_command(canonical, full_command, raw_args, args)
+
+    if canonical == "busy":
+        return _busy_command(full_command, args)
+
     if canonical == "cron":
-        if not args or args == ["list"]:
+        if not args or args[:1] == ["list"]:
             try:
-                items, context, summary = _cron_items()
+                channel_filter = _cron_parse_list_channel(args)
+                items, context, summary = _cron_items(channel_filter)
                 return _list_response(
                     type_="cron.list",
                     command=full_command,
@@ -2704,7 +3434,10 @@ def maybe_local_command(event: MessageEvent) -> str | LocalCommandResult | None:
                     items=items,
                     context=context,
                     summary=summary,
+                    extra={"channel": channel_filter} if channel_filter else None,
                 )
+            except ValueError:
+                return _cron_channel_error(full_command, args[1] if len(args) > 1 else None)
             except Exception as exc:
                 return _list_response(
                     type_="cron.list",
@@ -2713,6 +3446,16 @@ def maybe_local_command(event: MessageEvent) -> str | LocalCommandResult | None:
                     items=[],
                     error={"code": "CRON_STORE_READ_FAILED", "message": str(exc)},
                 )
+        if args[:1] == ["create"]:
+            return _cron_create(full_command, raw_args, event)
+        if args[:1] == ["update"]:
+            return _cron_update(full_command, raw_args, event)
+        if args[:1] in (["pause"], ["disable"]):
+            return _cron_ref_action(full_command, args, action="pause", type_="cron.paused")
+        if args[:1] in (["resume"], ["enable"]):
+            return _cron_ref_action(full_command, args, action="resume", type_="cron.resumed")
+        if args[:1] == ["trigger"]:
+            return _cron_ref_action(full_command, args, action="trigger", type_="cron.triggered")
         if args[:1] == ["history"]:
             return _read_cron_history(full_command, args)
         if args[:1] == ["remove"]:
@@ -2891,11 +3634,13 @@ def _skills_node(config: Any) -> HelpNode:
     enable_full = "/skills enable"
     disable_full = "/skills disable"
     set_full = "/skills set"
+    uninstall_full = "/skills uninstall"
+    remove_full = "/skills remove"
     return _node(
         type_="custom",
         command=full_command,
         full_command=full_command,
-        description="列出或切换已安装技能。",
+        description="列出、切换或卸载已安装技能。",
         dangerous=_dangerous(config, full_command),
         usage="/skills",
         executable=True,
@@ -2949,6 +3694,26 @@ def _skills_node(config: Any) -> HelpNode:
                         ],
                     ),
                 ],
+            ),
+            _node(
+                type_="custom",
+                command="uninstall",
+                full_command=uninstall_full,
+                description="卸载技能；hub 技能优先走 hub 卸载，本地技能安全删除。",
+                dangerous=True,
+                usage="/skills uninstall <name>",
+                executable=True,
+                completions=[_param("name", "技能名称、ID 或命令。", required=True)],
+            ),
+            _node(
+                type_="custom",
+                command="remove",
+                full_command=remove_full,
+                description="卸载技能，等价于 /skills uninstall。",
+                dangerous=True,
+                usage="/skills remove <name>",
+                executable=True,
+                completions=[_param("name", "技能名称、ID 或命令。", required=True)],
             ),
         ],
     )
@@ -3026,6 +3791,13 @@ def _toolsets_node(config: Any) -> HelpNode:
 def _cron_node(config: Any) -> HelpNode:
     full_command = "/cron"
     list_full = "/cron list"
+    create_full = "/cron create"
+    update_full = "/cron update"
+    pause_full = "/cron pause"
+    resume_full = "/cron resume"
+    enable_full = "/cron enable"
+    disable_full = "/cron disable"
+    trigger_full = "/cron trigger"
     remove_full = "/cron remove"
     history_full = "/cron history"
     history_before = "/cron history before"
@@ -3086,8 +3858,92 @@ def _cron_node(config: Any) -> HelpNode:
                 full_command=list_full,
                 description="查看定时任务。",
                 dangerous=_dangerous(config, list_full),
-                usage=list_full,
+                usage="/cron list [channel]",
                 executable=True,
+                completions=[
+                    _param(
+                        "channel",
+                        "渠道筛选，可选 tec01 或 anyi。缺省返回全部任务。",
+                        required=False,
+                        choices=[
+                            _choice("tec01", "Tec01 UI 渠道。"),
+                            _choice("anyi", "安逸公众号渠道。"),
+                        ],
+                    ),
+                ],
+            ),
+            _node(
+                type_="custom",
+                command="create",
+                full_command=create_full,
+                description="创建定时任务。",
+                dangerous=_dangerous(config, create_full),
+                usage="/cron create {json}",
+                executable=False,
+                completions=[_param("payload", "JSON 对象，包含 prompt、schedule、channel、channelId 等。", required=True)],
+            ),
+            _node(
+                type_="custom",
+                command="update",
+                full_command=update_full,
+                description="更新定时任务。",
+                dangerous=_dangerous(config, update_full),
+                usage="/cron update <id|name> {json}",
+                executable=False,
+                completions=[
+                    _param("idOrName", "定时任务 ID 或唯一名称。", required=True),
+                    _param("payload", "JSON 对象，包含 name、prompt、schedule、channel、channelId 等。", required=True),
+                ],
+            ),
+            _node(
+                type_="custom",
+                command="pause",
+                full_command=pause_full,
+                description="暂停定时任务。",
+                dangerous=_dangerous(config, pause_full),
+                usage="/cron pause <id|name>",
+                executable=False,
+                completions=[_param("idOrName", "定时任务 ID 或唯一名称。", required=True)],
+            ),
+            _node(
+                type_="custom",
+                command="resume",
+                full_command=resume_full,
+                description="恢复定时任务。",
+                dangerous=_dangerous(config, resume_full),
+                usage="/cron resume <id|name>",
+                executable=False,
+                completions=[_param("idOrName", "定时任务 ID 或唯一名称。", required=True)],
+            ),
+            _node(
+                type_="custom",
+                command="enable",
+                full_command=enable_full,
+                description="启用定时任务，同 resume。",
+                dangerous=_dangerous(config, enable_full),
+                usage="/cron enable <id|name>",
+                executable=False,
+                completions=[_param("idOrName", "定时任务 ID 或唯一名称。", required=True)],
+            ),
+            _node(
+                type_="custom",
+                command="disable",
+                full_command=disable_full,
+                description="禁用定时任务，同 pause。",
+                dangerous=_dangerous(config, disable_full),
+                usage="/cron disable <id|name>",
+                executable=False,
+                completions=[_param("idOrName", "定时任务 ID 或唯一名称。", required=True)],
+            ),
+            _node(
+                type_="custom",
+                command="trigger",
+                full_command=trigger_full,
+                description="立即触发定时任务。",
+                dangerous=_dangerous(config, trigger_full),
+                usage="/cron trigger <id|name>",
+                executable=False,
+                completions=[_param("idOrName", "定时任务 ID 或唯一名称。", required=True)],
             ),
             _node(
                 type_="custom",
@@ -3128,6 +3984,92 @@ def _security_node(config: Any) -> HelpNode:
                 usage="/security set <off|manual|smart>",
                 executable=False,
                 completions=list(_USAGE_COMPLETIONS.get("security", [])),
+            )
+        ],
+    )
+
+
+def _instruction_node(config: Any, kind: str) -> HelpNode:
+    full_command = f"/{kind}"
+    get_full = f"/{kind} get"
+    set_full = f"/{kind} set"
+    append_full = f"/{kind} append"
+    target = "SOUL.md" if kind == "soul" else "memories/USER.md"
+    return _node(
+        type_="configuration",
+        command=full_command,
+        full_command=full_command,
+        description=f"查看或编辑当前 profile 的 {target}。",
+        dangerous=_dangerous(config, full_command),
+        usage=f"/{kind} [get|set|append]",
+        executable=True,
+        completions=[
+            _param(
+                "subcommand",
+                "指令文件操作。",
+                required=False,
+                choices=[
+                    _choice("get", f"读取 {target}。"),
+                    _choice("set", f"覆盖写入 {target}。"),
+                    _choice("append", f"追加到 {target}。"),
+                ],
+            ),
+        ],
+        children=[
+            _node(
+                type_="configuration",
+                command="get",
+                full_command=get_full,
+                description=f"读取当前 profile 的 {target}。",
+                dangerous=_dangerous(config, get_full),
+                usage=get_full,
+                executable=True,
+            ),
+            _node(
+                type_="configuration",
+                command="set",
+                full_command=set_full,
+                description=f"覆盖写入当前 profile 的 {target}，后续新 turn 立即生效。",
+                dangerous=_dangerous(config, set_full),
+                usage=f"/{kind} set {{\"content\":\"...\"}}",
+                executable=False,
+                completions=[_param("payload", "JSON 对象，包含 content。", required=True)],
+            ),
+            _node(
+                type_="configuration",
+                command="append",
+                full_command=append_full,
+                description=f"追加内容到当前 profile 的 {target}，后续新 turn 立即生效。",
+                dangerous=_dangerous(config, append_full),
+                usage=f"/{kind} append {{\"content\":\"...\"}}",
+                executable=False,
+                completions=[_param("payload", "JSON 对象，包含 content。", required=True)],
+            ),
+        ],
+    )
+
+
+def _busy_node(config: Any) -> HelpNode:
+    full_command = "/busy"
+    return _node(
+        type_="configuration",
+        command=full_command,
+        full_command=full_command,
+        description="查看或切换 busy 输入策略，命令返回后立即生效。",
+        dangerous=_dangerous(config, full_command),
+        usage="/busy [queue|steer|interrupt|status]",
+        executable=True,
+        completions=[
+            _param(
+                "mode",
+                "busy 输入策略。",
+                required=False,
+                choices=[
+                    _choice("queue", "忙碌时排队到下一轮。"),
+                    _choice("steer", "忙碌时注入当前运行。"),
+                    _choice("interrupt", "忙碌时中断当前运行。"),
+                    _choice("status", "查看当前策略。"),
+                ],
             )
         ],
     )
@@ -3189,6 +4131,9 @@ def help_tree_response(config: Any, command_text: str = "/help") -> str:
     nodes.append(_skills_node(config))
     nodes.append(_toolsets_node(config))
     nodes.append(_cron_node(config))
+    nodes.append(_instruction_node(config, "soul"))
+    nodes.append(_instruction_node(config, "user"))
+    nodes.append(_busy_node(config))
     if not is_blocked(config, "security"):
         nodes.append(_security_node(config))
     nodes = [node for node in nodes if node.full_command != "/curator"]
@@ -3260,11 +4205,23 @@ def aops_text_command_lines() -> list[str]:
         "`/toolsets disable <name>` -- Disable an AOPS toolset",
         "`/toolsets set <name> <true|false>` -- Enable or disable an AOPS toolset",
         "`/cron` -- Show scheduled tasks",
-        "`/cron list` -- Show scheduled tasks",
+        "`/cron list [channel]` -- Show scheduled tasks, optionally filtered by tec01 or anyi",
+        "`/cron create {json}` -- Create a scheduled task",
+        "`/cron update <id|name> {json}` -- Update a scheduled task",
+        "`/cron pause <id|name>` -- Pause a scheduled task",
+        "`/cron resume <id|name>` -- Resume a scheduled task",
+        "`/cron trigger <id|name>` -- Trigger a scheduled task immediately",
         "`/cron remove <id|name>` -- Remove a scheduled task",
         "`/cron history <id> [tsMs]` -- Show cron run history",
         "`/cron history before <id> [tsMs]` -- Show cron history before an anchor",
         "`/cron history after <id> <tsMs>` -- Show cron history after an anchor",
+        "`/soul` -- Show current SOUL.md instructions",
+        "`/soul set {json}` -- Replace SOUL.md instructions",
+        "`/soul append {json}` -- Append to SOUL.md instructions",
+        "`/user` -- Show current memories/USER.md instructions",
+        "`/user set {json}` -- Replace memories/USER.md instructions",
+        "`/user append {json}` -- Append to memories/USER.md instructions",
+        "`/busy [queue|steer|interrupt|status]` -- Show or switch busy input mode",
         "`/security` -- Show current approval policy",
         "`/security set <off|manual|smart>` -- Switch approval policy",
     ]

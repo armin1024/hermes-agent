@@ -79,6 +79,8 @@ def test_remote_config_applies_allowed_fields(tmp_path, monkeypatch):
     assert cfg["approvals"]["mode"] == "off"
     assert cfg["display"]["busy_input_mode"] == "queue"
     assert cfg["memory"]["provider"] == "hindsight"
+    assert cfg["platforms"]["aops"]["enabled"] is True
+    assert cfg["platforms"]["aops"]["extra"]["base_url"] == "http://aops.example"
 
     user_md = tmp_path / "memories" / "USER.md"
     assert "请优先使用中文回答。" in user_md.read_text(encoding="utf-8")

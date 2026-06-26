@@ -14,6 +14,10 @@ fi
 BASE_BUNDLE="${1:-}"
 OUTPUT_DIR="${2:-$REPO_ROOT/dist}"
 HINDSIGHT_WHEEL_DIR="${HINDSIGHT_WHEEL_DIR:-/private/tmp/hindsight-linux-wheel-cache}"
+AOPS_WHEEL_CACHE_DIR="${AOPS_WHEEL_CACHE_DIR:-/private/tmp/hermes-aops-linux-wheel-cache}"
+AOPS_WHEEL_REQUIREMENTS=(
+  "aiohttp==3.13.4"
+)
 
 if [[ -z "$BASE_BUNDLE" ]]; then
   echo "Usage: $0 <base-offline-bundle.tar.gz> [output-dir]" >&2
@@ -68,14 +72,47 @@ fi
 # Drop macOS metadata noise from the extracted bundle before overlaying files.
 find "$WORK_DIR" \( -name '._*' -o -name '__MACOSX' \) -exec rm -rf {} +
 
+# The base may itself be a previous AOPS bundle during iterative internal builds.
+# Clear any stale overlay before staging the current repository snapshot so
+# removed files do not linger in the new archive.
+rm -rf "$BUNDLE_DIR/overlay" "$BUNDLE_DIR/overlay.manifest"
 mkdir -p "$BUNDLE_DIR/overlay" "$BUNDLE_DIR/examples"
+
+ensure_requirement_line() {
+  local requirement="$1"
+  [[ -f "$BUNDLE_DIR/requirements.txt" ]] || return 0
+  if ! grep -qxF "$requirement" "$BUNDLE_DIR/requirements.txt"; then
+    printf '\n%s\n' "$requirement" >> "$BUNDLE_DIR/requirements.txt"
+  fi
+}
+
+ensure_aops_runtime_wheels() {
+  # AOPS uses gateway/platforms/aops.py, which requires aiohttp at runtime.
+  # Official/lightweight base offline bundles may omit the messaging extra, so
+  # the overlay must carry its own Linux wheels instead of relying on network
+  # installs or on whatever the chosen base bundle happened to include.
+  mkdir -p "$BUNDLE_DIR/wheels" "$AOPS_WHEEL_CACHE_DIR"
+  "$PYTHON_BIN" -m pip download \
+    --only-binary=:all: \
+    --implementation cp \
+    --python-version 3.11 \
+    --abi cp311 \
+    --platform manylinux2014_x86_64 \
+    --dest "$AOPS_WHEEL_CACHE_DIR" \
+    "${AOPS_WHEEL_REQUIREMENTS[@]}"
+  cp "$AOPS_WHEEL_CACHE_DIR"/*.whl "$BUNDLE_DIR/wheels/"
+  local requirement
+  for requirement in "${AOPS_WHEEL_REQUIREMENTS[@]}"; do
+    ensure_requirement_line "$requirement"
+  done
+}
+
+ensure_aops_runtime_wheels
 
 if [[ -d "$HINDSIGHT_WHEEL_DIR" ]] && compgen -G "$HINDSIGHT_WHEEL_DIR/*.whl" >/dev/null; then
   mkdir -p "$BUNDLE_DIR/wheels"
   cp "$HINDSIGHT_WHEEL_DIR"/*.whl "$BUNDLE_DIR/wheels/"
-  if [[ -f "$BUNDLE_DIR/requirements.txt" ]] && ! grep -q '^hindsight-client==0.6.1$' "$BUNDLE_DIR/requirements.txt"; then
-    printf '\nhindsight-client==0.6.1\n' >> "$BUNDLE_DIR/requirements.txt"
-  fi
+  ensure_requirement_line "hindsight-client==0.6.1"
 fi
 
 PACKAGE_DIRS=(

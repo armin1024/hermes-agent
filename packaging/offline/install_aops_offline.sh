@@ -115,6 +115,9 @@ from pathlib import Path
 
 from hermes_cli.config import ensure_hermes_home
 import hermes_cli.config as config_mod
+from hermes_cli.env_loader import load_hermes_dotenv
+from gateway.config import Platform, load_gateway_config
+from gateway.platforms.aops import AIOHTTP_AVAILABLE, AopsAdapter
 
 home = Path(os.environ["HERMES_HOME"])
 ensure_hermes_home()
@@ -133,14 +136,37 @@ legacy = [
 missing = [str(path) for path in expected if not path.is_dir()]
 created_legacy = [str(path) for path in legacy if path.exists()]
 
-print(f"hermes_cli.config={config_mod.__file__}")
-print(f"selfcheck_home={home}")
+(home / ".env").write_text(
+    "AOPS_BOT_TOKEN=selfcheck-token\n"
+    "AOPS_BOT_URL=https://aops-selfcheck.invalid\n",
+    encoding="utf-8",
+)
+load_hermes_dotenv(hermes_home=home)
+gateway_cfg = load_gateway_config()
+connected = [platform.value for platform in gateway_cfg.get_connected_platforms()]
+aops_cfg = gateway_cfg.platforms.get(Platform.AOPS)
 
-if missing or created_legacy:
+print(f"hermes_cli.config={config_mod.__file__}")
+print(f"gateway.platforms.aops={sys.modules[AopsAdapter.__module__].__file__}")
+print(f"selfcheck_home={home}")
+print(f"connected_platforms={','.join(connected)}")
+print(f"aops_aiohttp_available={AIOHTTP_AVAILABLE}")
+
+if missing or created_legacy or "aops" not in connected or aops_cfg is None or not AIOHTTP_AVAILABLE:
     if missing:
         print("missing expected cache dirs:", ", ".join(missing), file=sys.stderr)
     if created_legacy:
         print("legacy cache dirs were created:", ", ".join(created_legacy), file=sys.stderr)
+    if not AIOHTTP_AVAILABLE:
+        print(
+            "AOPS runtime dependency is missing: aiohttp is not importable",
+            file=sys.stderr,
+        )
+    if "aops" not in connected or aops_cfg is None:
+        print(
+            "AOPS gateway overlay is not active or not connectable from AOPS_BOT_TOKEN/AOPS_BOT_URL",
+            file=sys.stderr,
+        )
     raise SystemExit(1)
 PY
   )"; then

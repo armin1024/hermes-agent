@@ -416,7 +416,7 @@ def _aops_message_type(*, metadata: dict[str, Any], inherited_silent: bool | Non
     explicit = str(metadata.get("message_type") or "").strip().lower()
     if explicit == "cron":
         return "cron"
-    if inherited_silent is True:
+    if inherited_silent is True or metadata.get("silent") is True:
         return "silent"
     return "common"
 
@@ -427,15 +427,25 @@ def _aops_outbound_extra_fields(metadata: dict[str, Any], *, message_type: str) 
     source = str(metadata.get("source") or "").strip()
     if source:
         outbound["source"] = source
+    channel = metadata.get("channel")
+    if isinstance(channel, list) and channel:
+        outbound["channel"] = [str(item) for item in channel]
+    job_id = str(metadata.get("job_id") or "").strip()
+    if job_id:
+        outbound["job_id"] = job_id
     bot_reply_extra = metadata.get("botReplyExtra")
     if isinstance(bot_reply_extra, dict):
         nested = bot_reply_extra.get("botReplyExtra")
         if isinstance(nested, dict):
             bot_reply_extra = nested
-        for key in ("messageType", "id", "name"):
+        preserved_bot_extra: dict[str, Any] = {}
+        for key in ("messageType", "id", "name", "channel", "job_id"):
             value = bot_reply_extra.get(key)
             if value is not None:
                 outbound[key] = value
+                preserved_bot_extra[key] = value
+        if "channel" in preserved_bot_extra:
+            outbound["botReplyExtra"] = preserved_bot_extra
     elif message_type:
         outbound["messageType"] = message_type
     return outbound
@@ -455,10 +465,14 @@ def _aops_normalize_outbound_protocol_fields(data: dict[str, Any]) -> dict[str, 
         nested = bot_reply_extra.get("botReplyExtra")
         if isinstance(nested, dict):
             bot_reply_extra = nested
-        for key in ("messageType", "id", "name"):
+        preserved_bot_extra: dict[str, Any] = {}
+        for key in ("messageType", "id", "name", "channel", "job_id"):
             value = bot_reply_extra.get(key)
             if value is not None:
                 normalized[key] = value
+                preserved_bot_extra[key] = value
+        if "channel" in preserved_bot_extra:
+            normalized["botReplyExtra"] = preserved_bot_extra
     normalized.setdefault("messageType", message_type)
     return normalized
 
@@ -1003,6 +1017,8 @@ class _ReplyContext:
 class AopsLiveReplyBridge:
     """Thread-safe bridge for AOPS native streaming replies."""
 
+    _TOOL_RESULT_TEXT_LIMIT = 4096
+
     def __init__(
         self,
         adapter: "AopsAdapter",
@@ -1160,6 +1176,50 @@ class AopsLiveReplyBridge:
         await self._send_event(phase="delta", kind="final", delta=text, text=text, conversation_ended=False)
         await self._close_segment(conversation_ended=False)
 
+    @classmethod
+    def _stringify_tool_result(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            return str(value)
+
+    @classmethod
+    def _bounded_tool_result(cls, value: Any, fallback: str | None = None) -> dict[str, Any] | None:
+        text = cls._stringify_tool_result(value)
+        if not text and fallback:
+            text = str(fallback)
+        if not text:
+            return None
+        length = len(text)
+        truncated = length > cls._TOOL_RESULT_TEXT_LIMIT
+        if truncated:
+            text = text[: cls._TOOL_RESULT_TEXT_LIMIT]
+        return {"text": text, "length": length, "truncated": truncated}
+
+    @staticmethod
+    def _duration_ms(payload: dict[str, Any]) -> int | None:
+        raw = payload.get("durationMs")
+        if raw is None:
+            raw = payload.get("duration_ms")
+        if raw is not None:
+            try:
+                value = int(float(raw))
+                return value if value >= 0 else None
+            except Exception:
+                return None
+        raw = payload.get("duration")
+        if raw is None:
+            return None
+        try:
+            value = int(float(raw) * 1000)
+            return value if value >= 0 else None
+        except Exception:
+            return None
+
     async def _emit_tool(self, payload: dict[str, Any]) -> None:
         event_type = str(payload.get("event_type") or "").strip()
         if event_type in ("reasoning.available", "_thinking"):
@@ -1183,6 +1243,11 @@ class AopsLiveReplyBridge:
         elif event_type == "tool.started":
             phase = "start"
         tool_text = preview
+        result_payload = None
+        if phase == "result":
+            result_payload = self._bounded_tool_result(payload.get("result"), fallback=preview)
+            if result_payload:
+                tool_text = result_payload.get("text") or tool_text
         if not tool_text:
             if phase == "start" and tool_name:
                 tool_text = f"calling tool: {tool_name}"
@@ -1192,10 +1257,14 @@ class AopsLiveReplyBridge:
         tool_payload: dict[str, Any] = {"phase": phase}
         if tool_name:
             tool_payload["name"] = tool_name
-        if tool_text:
+        if result_payload:
+            tool_payload["result"] = result_payload
+        elif tool_text:
             tool_payload["result"] = {"text": tool_text}
-        if is_error:
-            tool_payload["isError"] = True
+        duration_ms = self._duration_ms(payload)
+        if duration_ms is not None:
+            tool_payload["durationMs"] = duration_ms
+        tool_payload["isError"] = is_error
         await self._send_event(
             phase="tool",
             kind="tool",
@@ -1372,14 +1441,29 @@ class AopsAdapter(BasePlatformAdapter):
     def set_title_resolver(self, resolver) -> None:
         self._title_resolver = resolver
 
+    @staticmethod
+    def _outbound_title_is_silent(data: dict[str, Any]) -> bool:
+        if data.get("silent") is True:
+            return True
+        message_type = str(data.get("messageType") or data.get("message_type") or "").strip().lower()
+        if message_type == "silent":
+            return True
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = _metadata_dict(metadata)
+        if metadata.get("silent") is True:
+            return True
+        metadata_message_type = str(
+            metadata.get("messageType") or metadata.get("message_type") or ""
+        ).strip().lower()
+        return metadata_message_type == "silent"
+
     def _resolve_outbound_title(self, data: dict[str, Any]) -> str:
+        if self._outbound_title_is_silent(data):
+            return ""
         title = str(data.get("title") or "").strip()
         if title:
             return title
-        channel_id = str(data.get("channelId") or "").strip()
-        cached_title = self._conversation_titles.get(channel_id, "")
-        if cached_title:
-            return cached_title
         resolver = self._title_resolver
         if callable(resolver):
             try:
@@ -1388,6 +1472,10 @@ class AopsAdapter(BasePlatformAdapter):
                     return str(resolved).strip()
             except Exception as exc:
                 logger.debug("[%s] AOPS title resolver failed: %s", self.name, exc)
+        channel_id = str(data.get("channelId") or "").strip()
+        cached_title = self._conversation_titles.get(channel_id, "")
+        if cached_title:
+            return cached_title
         return ""
 
     @property
@@ -1808,6 +1896,11 @@ class AopsAdapter(BasePlatformAdapter):
                 if skill_entries:
                     lines.extend(["⚡ **Skill Commands**:", *skill_entries, ""])
                 response = "\n".join(lines).strip()
+            elif self._message_handler is not None:
+                response = await asyncio.wait_for(
+                    self._message_handler(event),
+                    timeout=_aops_local_command_exec_timeout(),
+                )
             else:
                 response = await asyncio.wait_for(
                     asyncio.to_thread(_aops_commands.maybe_local_command, event),
@@ -1870,7 +1963,7 @@ class AopsAdapter(BasePlatformAdapter):
             "ts": _now_ms(),
             "messageType": "silent",
             "silent": True,
-            "title": str(raw.get("title") or raw.get("conversationTitle") or ""),
+            "title": "",
             "botReplyExtra": {"messageType": "silent"},
         }
         if isinstance(metadata, dict):
@@ -1906,9 +1999,7 @@ class AopsAdapter(BasePlatformAdapter):
         message_type = normalized.get("messageType") or metadata.get("messageType")
         if message_type is not None:
             normalized["messageType"] = message_type
-        if isinstance(metadata.get("silent"), bool):
-            normalized["silent"] = bool(metadata["silent"])
-        elif isinstance(normalized.get("silent"), bool):
+        if isinstance(normalized.get("silent"), bool):
             normalized["silent"] = bool(normalized["silent"])
         return normalized
 
@@ -1997,13 +2088,7 @@ class AopsAdapter(BasePlatformAdapter):
             "attachments": message_data.get("attachments"),
             "messageType": message_data.get("messageType") or metadata.get("messageType"),
             "title": message_data.get("title") or message_data.get("conversationTitle") or metadata.get("title") or metadata.get("conversationTitle"),
-            "silent": (
-                bool(metadata["silent"])
-                if isinstance(metadata.get("silent"), bool)
-                else bool(message_data["silent"])
-                if isinstance(message_data.get("silent"), bool)
-                else None
-            ),
+            "silent": bool(message_data["silent"]) if isinstance(message_data.get("silent"), bool) else None,
         }
 
     def _build_message_event(self, data: dict[str, Any]) -> Optional[MessageEvent]:
@@ -2218,6 +2303,9 @@ class AopsAdapter(BasePlatformAdapter):
     ) -> SendResult:
         send_started = time.monotonic()
         reply_to_id = str(data.get("replyToId") or "").strip()
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else _metadata_dict(data.get("metadata"))
+        if "silent" not in data and isinstance(metadata.get("silent"), bool):
+            data = {**data, "silent": bool(metadata["silent"])}
         if "silent" not in data and reply_to_id:
             reply_flags = self._reply_flags_by_message_id.get(reply_to_id) or {}
             if isinstance(reply_flags.get("silent"), bool):
@@ -2280,10 +2368,13 @@ class AopsAdapter(BasePlatformAdapter):
             reply_flags = self._reply_flags_by_message_id.get(str(reply_to)) or {}
             if isinstance(reply_flags.get("silent"), bool):
                 inherited_silent = reply_flags["silent"]
+        explicit_silent = metadata.get("silent") if isinstance(metadata.get("silent"), bool) else None
+        outbound_silent = explicit_silent if explicit_silent is not None else inherited_silent
         message_id = str(metadata.get("message_id") or self.create_message_id())
         run_id = metadata.get("run_id")
         kind = str(metadata.get("kind") or "final")
-        message_type = _aops_message_type(metadata=metadata, inherited_silent=inherited_silent)
+        message_type_metadata = {**metadata, "silent": outbound_silent} if outbound_silent is not None else metadata
+        message_type = _aops_message_type(metadata=message_type_metadata, inherited_silent=None)
         outbound_extra = _aops_outbound_extra_fields(metadata, message_type=message_type)
         title = self._resolve_outbound_title(
             {
@@ -2292,6 +2383,8 @@ class AopsAdapter(BasePlatformAdapter):
                 "runId": run_id,
                 "sessionId": metadata.get("sessionId"),
                 "sessionKey": metadata.get("sessionKey"),
+                "messageType": message_type,
+                "silent": outbound_silent,
             }
         )
         start_payload = {
@@ -2311,8 +2404,8 @@ class AopsAdapter(BasePlatformAdapter):
             start_payload["replyToId"] = reply_to
         if run_id:
             start_payload["runId"] = run_id
-        if inherited_silent is not None:
-            start_payload["silent"] = inherited_silent
+        if outbound_silent is not None:
+            start_payload["silent"] = outbound_silent
         start = await self.send_reply_event(start_payload)
         if not start.success:
             return start
@@ -2334,8 +2427,8 @@ class AopsAdapter(BasePlatformAdapter):
             end_payload["replyToId"] = reply_to
         if run_id:
             end_payload["runId"] = run_id
-        if inherited_silent is not None:
-            end_payload["silent"] = inherited_silent
+        if outbound_silent is not None:
+            end_payload["silent"] = outbound_silent
         if metadata.get("content"):
             end_payload["content"] = metadata["content"]
         result = await self.send_reply_event(end_payload)
@@ -2376,6 +2469,8 @@ class AopsAdapter(BasePlatformAdapter):
             reply_flags = self._reply_flags_by_message_id.get(str(reply_to)) or {}
             if isinstance(reply_flags.get("silent"), bool):
                 inherited_silent = reply_flags["silent"]
+        explicit_silent = metadata.get("silent") if isinstance(metadata.get("silent"), bool) else None
+        outbound_silent = explicit_silent if explicit_silent is not None else inherited_silent
         command_preview = command[:500] + "..." if len(command) > 500 else command
         action_hint = "仅本次允许、始终允许同类操作，或拒绝执行" if allow_permanent else "仅本次允许、本会话允许，或拒绝执行"
         message = (
@@ -2393,7 +2488,10 @@ class AopsAdapter(BasePlatformAdapter):
             "text": "",
             "conversationEnded": True,
             "ts": _now_ms(),
-            "messageType": _aops_message_type(metadata=metadata, inherited_silent=inherited_silent),
+            "messageType": _aops_message_type(
+                metadata={**metadata, "silent": outbound_silent} if outbound_silent is not None else metadata,
+                inherited_silent=None,
+            ),
             "content": [{
                 "type": "approval",
                 "id": approval_id,
@@ -2412,8 +2510,8 @@ class AopsAdapter(BasePlatformAdapter):
             payload["replyToId"] = reply_to
         if metadata.get("run_id"):
             payload["runId"] = metadata["run_id"]
-        if inherited_silent is not None:
-            payload["silent"] = inherited_silent
+        if outbound_silent is not None:
+            payload["silent"] = outbound_silent
         result = await self.send_reply_event(payload)
         if result.success:
             result.message_id = message_id
@@ -2436,6 +2534,8 @@ class AopsAdapter(BasePlatformAdapter):
             reply_flags = self._reply_flags_by_message_id.get(str(reply_to)) or {}
             if isinstance(reply_flags.get("silent"), bool):
                 inherited_silent = reply_flags["silent"]
+        explicit_silent = metadata.get("silent") if isinstance(metadata.get("silent"), bool) else None
+        outbound_silent = explicit_silent if explicit_silent is not None else inherited_silent
         payload = {
             "messageId": message_id,
             "seq": 1,
@@ -2445,7 +2545,10 @@ class AopsAdapter(BasePlatformAdapter):
             "text": "",
             "conversationEnded": True,
             "ts": _now_ms(),
-            "messageType": _aops_message_type(metadata=metadata, inherited_silent=inherited_silent),
+            "messageType": _aops_message_type(
+                metadata={**metadata, "silent": outbound_silent} if outbound_silent is not None else metadata,
+                inherited_silent=None,
+            ),
             "content": [{
                 "type": "approval",
                 "id": confirm_id,
@@ -2466,8 +2569,8 @@ class AopsAdapter(BasePlatformAdapter):
             payload["replyToId"] = reply_to
         if metadata.get("run_id"):
             payload["runId"] = metadata["run_id"]
-        if inherited_silent is not None:
-            payload["silent"] = inherited_silent
+        if outbound_silent is not None:
+            payload["silent"] = outbound_silent
         result = await self.send_reply_event(payload)
         if result.success:
             result.message_id = message_id
