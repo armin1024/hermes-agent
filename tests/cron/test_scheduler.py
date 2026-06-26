@@ -476,8 +476,10 @@ class TestRoutingIntents:
 
     def test_all_token_case_insensitive(self, monkeypatch):
         """'ALL' / 'All' / 'all' are all recognized."""
-        from cron.scheduler import _resolve_delivery_targets
+        from cron.scheduler import _HOME_TARGET_ENV_VARS, _resolve_delivery_targets
 
+        for env_var in _HOME_TARGET_ENV_VARS.values():
+            monkeypatch.delenv(env_var, raising=False)
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
 
@@ -788,6 +790,52 @@ class TestDeliverResultWrapping:
         assert "MEDIA:" not in text_sent
         assert "Report" in text_sent
 
+    def test_live_adapter_sends_cron_channel_array_metadata(self):
+        """Cron delivery passes Tec01/Anyi routing channels to the live adapter."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.AOPS: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(MagicMock(success=True))
+            coro.close()
+            return future
+
+        job = {
+            "id": "multi-channel-job",
+            "deliver": "origin",
+            "origin": {"platform": "aops", "chat_id": "home"},
+            "channel": ["tec01", "anyi"],
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            _deliver_result(job, "Report", adapters={Platform.AOPS: adapter}, loop=loop)
+
+        adapter.send.assert_called_once()
+        assert adapter.send.call_args.args[0] == "home"
+        metadata = adapter.send.call_args.kwargs["metadata"]
+        assert metadata["message_type"] == "cron"
+        assert metadata["channel"] == ["tec01", "anyi"]
+        assert metadata["job_id"] == "multi-channel-job"
+        assert metadata["botReplyExtra"] == {
+            "messageType": "cron",
+            "channel": ["tec01", "anyi"],
+            "job_id": "multi-channel-job",
+        }
+
     def test_no_mirror_to_session_call(self):
         """Cron deliveries should NOT mirror into the gateway session."""
         from gateway.config import Platform
@@ -868,6 +916,74 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    def test_run_one_job_appends_immutable_history_snapshot(self, tmp_path, monkeypatch):
+        import cron.jobs as cron_jobs
+        from cron.scheduler import run_one_job
+
+        monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+        monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+        job = {
+            "id": "snapshot-job",
+            "name": "旧名称",
+            "prompt": "旧提示词",
+            "schedule": {"kind": "cron", "expr": "*/1 * * * *", "display": "*/1 * * * *"},
+            "schedule_display": "*/1 * * * *",
+            "deliver": "aops",
+            "origin": {"platform": "aops", "chat_id": "conv-old"},
+            "channel": ["tec01", "anyi"],
+            "skills": [],
+        }
+
+        with patch("cron.scheduler.run_job", return_value=(True, "完整输出", "最终回复", None)), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"):
+            assert run_one_job(job) is True
+
+        lines = cron_jobs.HISTORY_FILE.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry["job_name"] == "旧名称"
+        assert entry["job_description"] == "旧提示词"
+        assert entry["schedule_display"] == "*/1 * * * *"
+        assert entry["deliver"] == "aops"
+        assert entry["channelId"] == "conv-old"
+        assert entry["channel"] == ["tec01", "anyi"]
+        assert entry["response_preview"] == "最终回复"
+        assert entry["output_path"] == str(tmp_path / "out.md")
+
+    def test_run_one_job_history_records_post_run_next_run_at(self, tmp_path, monkeypatch):
+        import cron.jobs as cron_jobs
+        from cron.scheduler import run_one_job
+
+        monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+        monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+        job = cron_jobs.create_job(
+            prompt="生成日报",
+            schedule="*/5 * * * *",
+            name="日报",
+            deliver="local",
+        )
+
+        with patch("cron.scheduler.run_job", return_value=(True, "完整输出", "最终回复", None)), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None):
+            assert run_one_job(job) is True
+
+        persisted = cron_jobs.get_job(job["id"])
+        lines = cron_jobs.HISTORY_FILE.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry["job_name"] == "日报"
+        assert entry["prompt"] == "生成日报"
+        assert entry["schedule_display"] == "*/5 * * * *"
+        assert entry["next_run_at"] == persisted["next_run_at"]
+        assert entry["next_run_at_after"] == persisted["next_run_at"]
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",
@@ -2759,3 +2875,36 @@ class TestHomeTargetEnvVarRegistry:
         from cron.scheduler import _HOME_TARGET_ENV_VARS
 
         assert _HOME_TARGET_ENV_VARS.get("whatsapp") == "WHATSAPP_HOME_CHANNEL"
+
+    def test_aops_registered_for_cron_home_delivery(self, monkeypatch):
+        from cron.scheduler import _HOME_TARGET_ENV_VARS, _KNOWN_DELIVERY_PLATFORMS, _resolve_delivery_target
+
+        monkeypatch.setenv("AOPS_HOME_CHANNEL", "tec01-home-channel")
+
+        assert "aops" in _KNOWN_DELIVERY_PLATFORMS
+        assert _HOME_TARGET_ENV_VARS.get("aops") == "AOPS_HOME_CHANNEL"
+        assert _resolve_delivery_target({"id": "aops-job", "deliver": "aops"}) == {
+            "platform": "aops",
+            "chat_id": "tec01-home-channel",
+            "thread_id": None,
+        }
+
+    def test_aops_delivery_uses_config_home_channel_when_env_absent(self, monkeypatch):
+        from gateway.config import HomeChannel, Platform
+        from cron.scheduler import _resolve_delivery_target
+
+        monkeypatch.delenv("AOPS_HOME_CHANNEL", raising=False)
+        mock_cfg = MagicMock()
+        mock_cfg.get_home_channel.return_value = HomeChannel(
+            platform=Platform.AOPS,
+            chat_id="config-home-channel",
+            name="Home",
+            thread_id="config-thread",
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg):
+            assert _resolve_delivery_target({"id": "aops-job", "deliver": "aops"}) == {
+                "platform": "aops",
+                "chat_id": "config-home-channel",
+                "thread_id": "config-thread",
+            }

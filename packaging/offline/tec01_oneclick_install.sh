@@ -276,6 +276,14 @@ write_default_template() {
       "approvals": {"mode": "off"},
       "display": {"busy_input_mode": "queue"},
       "checkpoints": {"enabled": true},
+      "platforms": {
+        "aops": {
+          "enabled": true,
+          "extra": {
+            "base_url": "${env.AOPS_BOT_URL}"
+          }
+        }
+      },
       "platform_toolsets": {
         "cli": [
           "terminal",
@@ -689,68 +697,566 @@ remote_config_supports_profile() {
   run_as_target "'$INSTALL_DIR/venv/bin/python' -m hermes_cli.remote_config apply --help | grep -q -- '--profile'" >/dev/null 2>&1
 }
 
-ensure_gateway_service_installed() {
-  local action="$1"
-  local profile="$2"
+profile_arg_for() {
+  local profile="$1"
   local profile_arg=""
   if [[ "$profile" != "default" ]]; then
     profile_arg="-p $(shell_quote "$profile")"
   fi
+  printf '%s' "$profile_arg"
+}
+
+profile_home_for() {
+  local profile="$1"
+  if [[ "$profile" == "default" ]]; then
+    printf '%s' "$TARGET_HOME/.hermes"
+  else
+    printf '%s' "$TARGET_HOME/.hermes/profiles/$profile"
+  fi
+}
+
+ensure_gateway_lazy_installs_disabled_for_profile() {
+  local profile="$1"
+  if json_bool options.allowGatewayLazyInstalls false || json_bool options.allowLazyInstalls false; then
+    log "Leaving gateway lazy installs enabled for profile $profile because payload option requested it"
+    printf 'false\n'
+    return 0
+  fi
+
+  local profile_dir
+  profile_dir="$(profile_home_for "$profile")"
+  local py="$INSTALL_DIR/venv/bin/python"
+  [[ -x "$py" ]] || py="python3"
+
+  run_as_target "$(shell_quote "$py") - $(shell_quote "$profile_dir") <<'PY'
+import json
+import sys
+from pathlib import Path
+
+profile_dir = Path(sys.argv[1])
+config_path = profile_dir / 'config.yaml'
+changed = False
+
+try:
+    import yaml
+except Exception as exc:
+    print(json.dumps({
+        'changed': False,
+        'error': f'PyYAML unavailable; cannot disable gateway lazy installs: {exc}',
+    }, ensure_ascii=False))
+    raise SystemExit(0)
+
+try:
+    if config_path.exists():
+        loaded = yaml.safe_load(config_path.read_text(encoding='utf-8')) or {}
+        cfg = loaded if isinstance(loaded, dict) else {}
+    else:
+        cfg = {}
+except Exception:
+    cfg = {}
+
+security = cfg.get('security')
+if not isinstance(security, dict):
+    security = {}
+    cfg['security'] = security
+
+if security.get('allow_lazy_installs') is not False:
+    security['allow_lazy_installs'] = False
+    changed = True
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False),
+        encoding='utf-8',
+    )
+
+print(json.dumps({
+    'changed': changed,
+    'path': str(config_path),
+    'security.allow_lazy_installs': security.get('allow_lazy_installs'),
+}, ensure_ascii=False))
+PY"
+}
+
+append_restart_summary() {
+  local bucket="$1"
+  local profile="$2"
+  local message="$3"
+  [[ -n "${RESTART_SUMMARY_JSON:-}" ]] || return 0
+  python3 - "$RESTART_SUMMARY_JSON" "$bucket" "$profile" "$message" <<'PY' || true
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+bucket, profile, message = sys.argv[2:5]
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    data = {}
+for key in ("restartedProfiles", "skippedProfiles", "failedProfiles", "diagnostics"):
+    data.setdefault(key, [])
+entry = {"profile": profile, "message": message}
+if bucket == "diagnostics":
+    data["diagnostics"].append(entry)
+else:
+    data.setdefault(bucket, []).append(entry)
+path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+ensure_gateway_service_installed() {
+  local action="$1"
+  local profile="$2"
+  local profile_arg
+  profile_arg="$(profile_arg_for "$profile")"
   if json_bool options.installGatewayService true; then
     STAGE="gateway_install_service"
     log "Ensuring Hermes gateway service is installed for $TARGET_USER profile $profile"
     run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; hermes $profile_arg gateway install --force --no-start-now --start-on-login"
   fi
   STAGE="gateway_${action}"
-  run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; hermes $profile_arg gateway $action"
+  controlled_gateway_lifecycle "$profile" "$action" 240 true
 }
 
-restart_other_running_profiles_after_upgrade() {
-  [[ "${RUNTIME_CHANGED:-false}" == "true" ]] || return 0
-  json_bool options.restartOtherRunningProfilesAfterUpgrade true || return 0
+write_gateway_lifecycle_controller() {
+  local dst="$1"
+  cat > "$dst" <<'PY'
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
 
-  STAGE="gateway_restart_other_profiles"
-  log "Restarting other running Hermes profile gateways after runtime upgrade"
-  run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; CURRENT_PROFILE=$(shell_quote "$PROFILE_NAME") python3 - <<'PY'
+home = Path.home()
+profile = os.environ.get("PROFILE") or "default"
+action = os.environ.get("ACTION") or "restart"
+try:
+    max_wait = max(1, int(float(os.environ.get("MAX_WAIT") or "240")))
+except Exception:
+    max_wait = 240
+summary_json = os.environ.get("SUMMARY_JSON") or ""
+require_aops = str(os.environ.get("REQUIRE_AOPS") or "").strip().lower() in {"1", "true", "yes", "on"}
+os.environ["PATH"] = f"{home}/.local/bin:" + os.environ.get("PATH", "")
+os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={os.environ['XDG_RUNTIME_DIR']}/bus")
+root = home / ".hermes"
+profiles_root = root / "profiles"
+
+def service_name(profile: str) -> str:
+    return "hermes-gateway.service" if profile == "default" else f"hermes-gateway-{profile}.service"
+
+def profile_home(profile: str) -> Path:
+    if profile == "default":
+        return root
+    return profiles_root / profile
+
+unit = service_name(profile)
+profile_dir = profile_home(profile)
+profile_args = [] if profile == "default" else ["-p", profile]
+
+def append_summary(bucket: str, message: str) -> None:
+    if not summary_json:
+        return
+    try:
+        path = Path(summary_json)
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        for key in ("restartedProfiles", "skippedProfiles", "failedProfiles", "diagnostics"):
+            data.setdefault(key, [])
+        data[bucket].append({"profile": profile, "message": message})
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+def run(cmd, *, timeout=30, check=False, capture=False):
+    kwargs = {
+        "timeout": timeout,
+        "check": check,
+        "text": True,
+    }
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.STDOUT
+    return subprocess.run(cmd, **kwargs)
+
+def read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def state():
+    return read_json(profile_dir / "gateway_state.json")
+
+def pid_record():
+    return read_json(profile_dir / "gateway.pid")
+
+def pid_alive(pid) -> bool:
+    try:
+        pid = int(pid or 0)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+def current_pid():
+    record = pid_record()
+    pid = record.get("pid") or state().get("pid")
+    return int(pid or 0) if str(pid or "").isdigit() else 0
+
+def systemd_props():
+    try:
+        result = run(
+            ["systemctl", "--user", "show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "MainPID", "-p", "Result", "-p", "ExecMainStatus"],
+            timeout=8,
+            capture=True,
+        )
+        props = {}
+        for line in (result.stdout or "").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                props[k] = v
+        return props
+    except Exception:
+        return {}
+
+def systemd_main_pid(props=None) -> int:
+    props = props if props is not None else systemd_props()
+    raw = str(props.get("MainPID") or "")
+    return int(raw) if raw.isdigit() else 0
+
+def start_limited(props) -> bool:
+    return str(props.get("Result", "")).lower() == "start-limit-hit" or str(props.get("SubState", "")).lower() == "start-limit-hit"
+
+def process_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+        return raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+
+def child_pids(pid: int):
+    try:
+        children = Path(f"/proc/{int(pid)}/task/{int(pid)}/children").read_text(encoding="utf-8").split()
+        return [int(item) for item in children if item.isdigit()]
+    except Exception:
+        return []
+
+def process_tree_lines(pid: int, depth: int = 0, seen=None):
+    seen = seen or set()
+    try:
+        pid = int(pid)
+    except Exception:
+        return []
+    if pid <= 0 or pid in seen or not pid_alive(pid):
+        return []
+    seen.add(pid)
+    cmdline = process_cmdline(pid) or "(cmdline unavailable)"
+    lines = [f"{'  ' * depth}{pid}: {cmdline}"]
+    for child in child_pids(pid):
+        lines.extend(process_tree_lines(child, depth=depth + 1, seen=seen))
+    return lines
+
+def process_tree_text(pid: int) -> str:
+    lines = process_tree_lines(pid)
+    return "\n".join(lines) if lines else "(no live process tree)"
+
+def detect_startup_blocker(main_pid: int) -> str:
+    text = process_tree_text(main_pid)
+    lowered = text.lower()
+    if " pip install " in lowered or " uv pip install " in lowered or " ensurepip " in lowered:
+        return "startup is blocked by a lazy dependency install (pip/uv/ensurepip)"
+    if "discord.py" in lowered or "brotlicffi" in lowered:
+        return "startup is resolving Discord lazy dependencies"
+    return ""
+
+def aops_status(st: dict) -> tuple[str, str]:
+    platforms = st.get("platforms")
+    if not isinstance(platforms, dict):
+        return "missing", "gateway_state.json has no platforms map"
+    aops = platforms.get("aops")
+    if not isinstance(aops, dict):
+        return "missing", "AOPS platform is absent from gateway_state.json"
+    state = str(aops.get("state") or "").strip().lower()
+    error = str(aops.get("error_message") or aops.get("error_code") or "").strip()
+    return state or "unknown", error
+
+def print_file(label: str, path: Path) -> None:
+    print(f"--- {label}: {path} ---")
+    try:
+        print(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"(unavailable: {exc})")
+
+def diagnostics(reason: str) -> None:
+    append_summary("diagnostics", reason)
+    print(f"⚠ Gateway diagnostics for profile {profile}: {reason}", file=sys.stderr)
+    props = systemd_props()
+    main_pid = systemd_main_pid(props)
+    if main_pid:
+        blocker = detect_startup_blocker(main_pid)
+        print(f"--- process tree for systemd MainPID {main_pid} ---")
+        print(process_tree_text(main_pid))
+        if blocker:
+            print(f"⚠ Detected startup blocker: {blocker}", file=sys.stderr)
+    commands = [
+        ["hermes", *profile_args, "gateway", "status"],
+        ["systemctl", "--user", "status", unit, "--no-pager", "-l"],
+        ["systemctl", "--user", "show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "MainPID", "-p", "ExecMainStatus", "-p", "Result", "-p", "RestartUSec", "-p", "TimeoutStopUSec"],
+        ["systemctl", "--user", "cat", unit],
+        ["journalctl", "--user", "-u", unit, "-n", "100", "--no-pager", "-l"],
+    ]
+    for cmd in commands:
+        print(f"--- {' '.join(cmd)} ---")
+        try:
+            result = run(cmd, timeout=15, capture=True)
+            print(result.stdout or "")
+        except Exception as exc:
+            print(f"(failed: {exc})")
+    print_file("gateway_state", profile_dir / "gateway_state.json")
+    print_file("gateway_pid", profile_dir / "gateway.pid")
+
+def wait_ready() -> bool:
+    deadline = time.monotonic() + max_wait
+    next_progress = time.monotonic()
+    warned_60 = False
+    while time.monotonic() < deadline:
+        st = state()
+        pid = int(st.get("pid") or current_pid() or 0)
+        gateway_state = str(st.get("gateway_state") or "")
+        props = systemd_props()
+        active_state = str(props.get("ActiveState") or "").lower()
+        main_pid = systemd_main_pid(props)
+        main_pid_alive = pid_alive(main_pid)
+        if gateway_state == "running" and pid_alive(pid):
+            if not require_aops:
+                print(f"✓ Gateway profile {profile} runtime is running (PID {pid})")
+                append_summary("restartedProfiles", f"{action} completed; pid={pid}")
+                return True
+            aops_state, aops_detail = aops_status(st)
+            if aops_state == "connected":
+                print(f"✓ Gateway profile {profile} runtime is running with AOPS connected (PID {pid})")
+                append_summary("restartedProfiles", f"{action} completed; pid={pid}; aops=connected")
+                return True
+            if aops_state in {"missing", "error", "failed", "startup_failed", "fatal", "disconnected"}:
+                diagnostics(f"AOPS platform not connected after gateway runtime started: state={aops_state}; {aops_detail or 'no detail'}")
+                append_summary("failedProfiles", f"aops not connected: {aops_state}")
+                return False
+        if gateway_state == "startup_failed":
+            diagnostics(f"startup_failed: {st.get('exit_reason') or 'unknown'}")
+            append_summary("failedProfiles", "startup_failed")
+            return False
+        if start_limited(props):
+            diagnostics("systemd start-limit-hit")
+            append_summary("failedProfiles", "systemd start-limit-hit")
+            return False
+        if gateway_state in {"stopped", "unknown", ""} and active_state == "active" and main_pid_alive and main_pid != pid:
+            blocker = detect_startup_blocker(main_pid)
+            if blocker:
+                diagnostics(
+                    f"systemd is active with MainPID {main_pid}, but Hermes runtime state is stale "
+                    f"(state={gateway_state or 'unknown'} pid={pid or 'unknown'}); {blocker}"
+                )
+                append_summary("failedProfiles", "startup blocked by lazy dependency install")
+                return False
+        now = time.monotonic()
+        if not warned_60 and now > deadline - max_wait + 60:
+            warned_60 = True
+            print(
+                f"⚠ Gateway profile {profile} not ready after 60s; "
+                f"state={gateway_state or 'unknown'} pid={pid or 'unknown'} "
+                f"systemd={active_state or 'unknown'} mainPid={main_pid or 'unknown'}; "
+                f"continuing to wait up to {max_wait}s."
+            )
+        if now >= next_progress:
+            print(
+                f"⏳ Waiting for profile {profile}: state={gateway_state or 'unknown'} "
+                f"pid={pid or 'unknown'} systemd={active_state or 'unknown'} "
+                f"mainPid={main_pid or 'unknown'}"
+            )
+            next_progress = now + 30
+        time.sleep(2)
+    diagnostics(f"runtime did not become ready within {max_wait}s")
+    append_summary("failedProfiles", f"timeout after {max_wait}s")
+    return False
+
+def hard_systemd_restart() -> int:
+    run(["systemctl", "--user", "reset-failed", unit], timeout=15)
+    result = run(["systemctl", "--user", "restart", unit], timeout=90)
+    if result.returncode != 0:
+        print(f"⚠ systemctl restart {unit} returned {result.returncode}; falling back to hermes gateway start", file=sys.stderr)
+        result = run(["hermes", *profile_args, "gateway", "start"], timeout=90)
+    return result.returncode
+
+def systemd_start() -> int:
+    result = run(["systemctl", "--user", "start", unit], timeout=90)
+    if result.returncode != 0:
+        print(f"⚠ systemctl start {unit} returned {result.returncode}; falling back to hermes gateway start", file=sys.stderr)
+        result = run(["hermes", *profile_args, "gateway", "start"], timeout=90)
+    return result.returncode
+
+before = state()
+before_state = str(before.get("gateway_state") or "")
+before_pid = current_pid()
+print(f"[INFO] Gateway profile {profile}: action={action}, pre_state={before_state or 'unknown'}, pre_pid={before_pid or 'unknown'}")
+
+if action == "start":
+    rc = systemd_start()
+    if rc != 0:
+        diagnostics(f"start command failed with exit code {rc}")
+        append_summary("failedProfiles", f"start command failed: {rc}")
+        raise SystemExit(rc)
+    raise SystemExit(0 if wait_ready() else 1)
+
+if action != "restart":
+    diagnostics(f"unsupported lifecycle action: {action}")
+    append_summary("failedProfiles", f"unsupported lifecycle action: {action}")
+    raise SystemExit(2)
+
+if before_state in {"starting", "draining"}:
+    print(f"⚠ Profile {profile} is already {before_state}; skip SIGUSR1 restart and wait for current transition.")
+    append_summary("skippedProfiles", f"already {before_state}; waited instead of sending SIGUSR1")
+    raise SystemExit(0 if wait_ready() else 1)
+
+if before_state == "running" and pid_alive(before_pid):
+    print(f"⏳ Sending graceful SIGUSR1 restart to profile {profile} PID {before_pid}")
+    try:
+        os.kill(before_pid, signal.SIGUSR1)
+    except Exception as exc:
+        print(f"⚠ SIGUSR1 failed for PID {before_pid}: {exc}; using systemd restart", file=sys.stderr)
+        rc = hard_systemd_restart()
+        if rc != 0:
+            diagnostics(f"systemd restart failed with exit code {rc}")
+            append_summary("failedProfiles", f"systemd restart failed: {rc}")
+            raise SystemExit(rc)
+        raise SystemExit(0 if wait_ready() else 1)
+    drain_deadline = time.monotonic() + 185
+    while pid_alive(before_pid) and time.monotonic() < drain_deadline:
+        time.sleep(1)
+    if pid_alive(before_pid):
+        print(f"⚠ Graceful restart for profile {profile} did not exit within 185s; forcing systemd restart.")
+    else:
+        print(f"✓ Previous gateway PID {before_pid} exited; starting replacement.")
+    rc = hard_systemd_restart()
+    if rc != 0:
+        diagnostics(f"systemd restart failed with exit code {rc}")
+        append_summary("failedProfiles", f"systemd restart failed: {rc}")
+        raise SystemExit(rc)
+    raise SystemExit(0 if wait_ready() else 1)
+
+print(f"⚠ Profile {profile} is not running (state={before_state or 'unknown'}); using systemd restart without SIGUSR1.")
+rc = hard_systemd_restart()
+if rc != 0:
+    diagnostics(f"systemd restart failed with exit code {rc}")
+    append_summary("failedProfiles", f"systemd restart failed: {rc}")
+    raise SystemExit(rc)
+raise SystemExit(0 if wait_ready() else 1)
+PY
+  chmod 700 "$dst"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown "$TARGET_USER":"$TARGET_USER" "$dst"
+  fi
+}
+
+controlled_gateway_lifecycle() {
+  local profile="$1"
+  local action="$2"
+  local max_wait="$3"
+  local required="$4"
+  local summary_path="${RESTART_SUMMARY_JSON:-}"
+  local controller="$WORK_DIR/gateway-lifecycle.py"
+  write_gateway_lifecycle_controller "$controller"
+  if run_as_target "PROFILE=$(shell_quote "$profile") ACTION=$(shell_quote "$action") MAX_WAIT=$(shell_quote "$max_wait") SUMMARY_JSON=$(shell_quote "$summary_path") REQUIRE_AOPS=$(shell_quote "$required") python3 $(shell_quote "$controller")"; then
+    return 0
+  fi
+  if [[ "$required" == "true" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+write_gateway_profile_selector() {
+  local dst="$1"
+  cat > "$dst" <<'PY'
+import json
 import os
 import subprocess
 from pathlib import Path
 
 home = Path.home()
-current_profile = os.environ.get('CURRENT_PROFILE') or 'default'
-root = home / '.hermes'
-profiles_root = home / '.hermes' / 'profiles'
-
-def service_name(profile: str) -> str:
-    if profile == 'default':
-        return 'hermes-gateway.service'
-    return f'hermes-gateway-{profile}.service'
+current_profile = os.environ.get("CURRENT_PROFILE") or "default"
+summary_json = os.environ.get("SUMMARY_JSON") or ""
+os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={os.environ['XDG_RUNTIME_DIR']}/bus")
+root = home / ".hermes"
+profiles_root = root / "profiles"
 
 def profile_home(profile: str) -> Path:
-    if profile == 'default':
-        return root
-    return profiles_root / profile
+    return root if profile == "default" else profiles_root / profile
+
+def service_name(profile: str) -> str:
+    return "hermes-gateway.service" if profile == "default" else f"hermes-gateway-{profile}.service"
+
+def read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def append(bucket: str, profile: str, message: str) -> None:
+    if not summary_json:
+        return
+    try:
+        path = Path(summary_json)
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        for key in ("restartedProfiles", "skippedProfiles", "failedProfiles", "diagnostics"):
+            data.setdefault(key, [])
+        data[bucket].append({"profile": profile, "message": message})
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
 def service_exists(profile: str) -> bool:
-    unit_name = service_name(profile)
-    unit = home / '.config' / 'systemd' / 'user' / unit_name
-    if unit.exists():
-        return True
+    return (home / ".config" / "systemd" / "user" / service_name(profile)).exists()
+
+def pid_alive(pid: int) -> bool:
     try:
-        result = subprocess.run(
-            ['systemctl', '--user', 'is-enabled', unit_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-        return result.returncode == 0
+        pid = int(pid or 0)
     except Exception:
         return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
-attempted = []
-failed = []
+def systemd_props(profile: str) -> dict[str, str]:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", service_name(profile), "-p", "ActiveState", "-p", "SubState", "-p", "MainPID", "-p", "Result"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=8,
+        )
+        props = {}
+        for line in (result.stdout or "").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                props[k] = v
+        return props
+    except Exception:
+        return {}
 
-candidates = [('default', root)]
+candidates = [("default", root)]
 if profiles_root.is_dir():
     for child in sorted(profiles_root.iterdir()):
         if child.is_dir():
@@ -759,25 +1265,54 @@ if profiles_root.is_dir():
 for profile, directory in candidates:
     if profile == current_profile:
         continue
-    pid_file = directory / 'gateway.pid'
-    if not pid_file.exists() and not service_exists(profile):
-        continue
-    attempted.append(profile)
-    try:
-        cmd = ['hermes', 'gateway', 'restart']
-        if profile != 'default':
-            cmd = ['hermes', '-p', profile, 'gateway', 'restart']
-        result = subprocess.run(cmd, check=False, timeout=120)
-        if result.returncode != 0:
-            failed.append(profile)
-    except Exception:
-        failed.append(profile)
+    state = read_json(directory / "gateway_state.json")
+    gateway_state = str(state.get("gateway_state") or "")
+    props = systemd_props(profile)
+    main_pid_raw = str(props.get("MainPID") or "")
+    main_pid = int(main_pid_raw) if main_pid_raw.isdigit() else 0
+    active_state = str(props.get("ActiveState") or "").lower()
+    if gateway_state == "running":
+        print(profile)
+    elif active_state == "active" and pid_alive(main_pid):
+        append("diagnostics", profile, f"systemd active mainPid={main_pid}; runtime state={gateway_state or 'unknown'}; recovering with hard restart")
+        print(f"::recover::{profile}::systemd-active-runtime-{gateway_state or 'unknown'}")
+    elif service_exists(profile) or (directory / "gateway.pid").exists():
+        append("skippedProfiles", profile, f"state={gateway_state or 'unknown'}; not sending SIGUSR1")
+        print(f"::skip::{profile}::{gateway_state or 'unknown'}")
+PY
+  chmod 700 "$dst"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown "$TARGET_USER":"$TARGET_USER" "$dst"
+  fi
+}
 
-if attempted:
-    print('restarted profile gateways: ' + ', '.join(attempted))
-if failed:
-    print('warning: failed to restart profile gateways: ' + ', '.join(failed))
-PY"
+restart_other_running_profiles_after_upgrade() {
+  [[ "${RUNTIME_CHANGED:-false}" == "true" ]] || return 0
+  json_bool options.restartOtherRunningProfilesAfterUpgrade true || return 0
+
+  STAGE="gateway_restart_other_profiles"
+  log "Restarting other running Hermes profile gateways after runtime upgrade"
+  local selector="$WORK_DIR/select-running-profiles.py"
+  write_gateway_profile_selector "$selector"
+  run_as_target "CURRENT_PROFILE=$(shell_quote "$PROFILE_NAME") SUMMARY_JSON=$(shell_quote "${RESTART_SUMMARY_JSON:-}") python3 $(shell_quote "$selector")" | while IFS= read -r other_profile; do
+    [[ -n "$other_profile" ]] || continue
+    case "$other_profile" in
+      ::skip::*)
+        printf '[WARN] skipped profile gateway %s\n' "${other_profile#::skip::}"
+        continue
+        ;;
+      ::recover::*)
+        recovered="${other_profile#::recover::}"
+        other_profile="${recovered%%::*}"
+        log "Recovering Hermes gateway profile $other_profile from ${recovered#*::}"
+        ;;
+    esac
+    log "Restarting Hermes gateway profile $other_profile"
+    other_lazy_result="$WORK_DIR/gateway-lazy-installs-other.json"
+    ensure_gateway_lazy_installs_disabled_for_profile "$other_profile" > "$other_lazy_result" || true
+    record_lazy_installs_change_if_needed "$other_profile" "$other_lazy_result"
+    controlled_gateway_lifecycle "$other_profile" "restart" 120 false || true
+  done
 }
 
 install_skill_zips() {
@@ -792,6 +1327,7 @@ install_skill_zips() {
   STAGE="skills_zip"
   log "Installing skill zip(s) into profile $profile"
   python3 - "$SKILLS_FILE" "$profile_dir" "$WORK_DIR/skills-zip" "$(json_get options.overwriteSkills)" <<'PY'
+import json
 import os
 import shutil
 import sys
@@ -857,11 +1393,171 @@ for index, spec in enumerate(Path(skills_file).read_text(encoding="utf-8").split
         status = copy_skill_dir(skill_dir, rel)
         installed.append({"skill": str(rel), "status": status})
 
-print({"installed": installed})
+print(json.dumps({"installed": installed}, ensure_ascii=False))
 PY
   if [[ "$(id -u)" -eq 0 ]]; then
     chown -R "$TARGET_USER":"$TARGET_USER" "$profile_dir/skills"
   fi
+}
+
+json_file_has_runtime_relevant_changes() {
+  local path="$1"
+  python3 - "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    text = path.read_text(encoding="utf-8")
+    start = text.find("{")
+    end = text.rfind("}")
+    payload = json.loads(text[start:end + 1]) if start >= 0 and end >= start else {}
+except Exception:
+    payload = {}
+
+def nonempty_list(name):
+    value = payload.get(name)
+    return isinstance(value, list) and len(value) > 0
+
+changed = (
+    nonempty_list("envChanged")
+    or nonempty_list("configChanged")
+    or nonempty_list("skills")
+    or payload.get("userInstructions") is not None
+    or payload.get("soul") is not None
+    or payload.get("hindsight") is not None
+)
+print("true" if changed else "false")
+PY
+}
+
+skills_result_has_changes() {
+  local path="$1"
+  python3 - "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    text = path.read_text(encoding="utf-8")
+    start = text.find("{")
+    end = text.rfind("}")
+    payload = json.loads(text[start:end + 1]) if start >= 0 and end >= start else {}
+except Exception:
+    payload = {}
+items = payload.get("installed") if isinstance(payload, dict) else []
+changed = False
+if isinstance(items, list):
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status") or "").strip().lower() != "skipped":
+            changed = True
+            break
+print("true" if changed else "false")
+PY
+}
+
+json_file_changed_flag() {
+  local path="$1"
+  python3 - "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    text = path.read_text(encoding="utf-8")
+    start = text.find("{")
+    end = text.rfind("}")
+    payload = json.loads(text[start:end + 1]) if start >= 0 and end >= start else {}
+except Exception:
+    payload = {}
+print("true" if payload.get("changed") is True else "false")
+PY
+}
+
+record_lazy_installs_change_if_needed() {
+  local profile="$1"
+  local result_json="$2"
+  if [[ "$(json_file_changed_flag "$result_json")" == "true" ]]; then
+    append_restart_summary "diagnostics" "$profile" "set security.allow_lazy_installs=false to avoid startup-time pip installs in offline gateway"
+  fi
+}
+
+validate_aops_gateway_config_for_profile() {
+  local profile="$1"
+  local profile_dir
+  profile_dir="$(profile_home_for "$profile")"
+  local py="$INSTALL_DIR/venv/bin/python"
+  [[ -x "$py" ]] || py="python3"
+
+  run_as_target "$(shell_quote "$py") - $(shell_quote "$profile") $(shell_quote "$profile_dir") <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+profile = sys.argv[1]
+profile_dir = Path(sys.argv[2])
+os.environ['HERMES_HOME'] = str(profile_dir)
+
+result = {
+    'ok': False,
+    'profile': profile,
+    'hermesHome': str(profile_dir),
+    'envPath': str(profile_dir / '.env'),
+    'configPath': str(profile_dir / 'config.yaml'),
+    'envExists': (profile_dir / '.env').exists(),
+    'configExists': (profile_dir / 'config.yaml').exists(),
+    'connectedPlatforms': [],
+    'aops': {},
+    'error': None,
+}
+
+try:
+    from hermes_cli.env_loader import load_hermes_dotenv
+    load_hermes_dotenv(hermes_home=profile_dir)
+    from gateway.config import Platform, load_gateway_config
+
+    cfg = load_gateway_config()
+    result['connectedPlatforms'] = [p.value for p in cfg.get_connected_platforms()]
+    aops = cfg.platforms.get(Platform.AOPS)
+    if aops is not None:
+        result['aops'] = {
+            'present': True,
+            'enabled': bool(aops.enabled),
+            'hasToken': bool(str(aops.token or '').strip()),
+            'baseUrl': str((aops.extra or {}).get('base_url') or ''),
+        }
+    else:
+        result['aops'] = {'present': False}
+    result['ok'] = 'aops' in result['connectedPlatforms']
+except Exception as exc:
+    result['error'] = str(exc)
+
+print(json.dumps(result, ensure_ascii=False, indent=2))
+if not result['ok']:
+    raise SystemExit(42)
+PY"
+}
+
+print_restart_summary() {
+  [[ -n "${RESTART_SUMMARY_JSON:-}" && -f "$RESTART_SUMMARY_JSON" ]] || return 0
+  log "Gateway restart summary"
+  python3 - "$RESTART_SUMMARY_JSON" <<'PY' || true
+import json
+import sys
+from pathlib import Path
+
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    data = {}
+print(json.dumps(data, ensure_ascii=False, indent=2))
+PY
 }
 
 need_cmd python3
@@ -927,10 +1623,26 @@ ensure_target_private_dir "$WORK_DIR"
 
 PAYLOAD_IN_HOME="$WORK_DIR/tec01-payload.json"
 PROFILE_JSON="$WORK_DIR/profile.json"
+APPLY_RESULT_JSON="$WORK_DIR/remote-config-apply.json"
+SKILLS_RESULT_JSON="$WORK_DIR/skills-install-result.json"
+RESTART_SUMMARY_JSON="$WORK_DIR/restart-summary.json"
+python3 - "$RESTART_SUMMARY_JSON" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "restartedProfiles": [],
+    "skippedProfiles": [],
+    "failedProfiles": [],
+    "diagnostics": [],
+}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
 cp "$PAYLOAD_JSON" "$PAYLOAD_IN_HOME"
 chmod 600 "$PAYLOAD_IN_HOME"
 if [[ "$(id -u)" -eq 0 ]]; then
   chown "$TARGET_USER":"$TARGET_USER" "$PAYLOAD_IN_HOME"
+  chown "$TARGET_USER":"$TARGET_USER" "$RESTART_SUMMARY_JSON"
 fi
 PAYLOAD_JSON="$PAYLOAD_IN_HOME"
 
@@ -1017,13 +1729,35 @@ fi
 
 STAGE="apply_profile_config"
 mark_payload_mode "$([[ "$PROFILE_ACTION" == "update" ]] && echo true || echo false)"
-run_as_target "'$INSTALL_DIR/venv/bin/python' -m hermes_cli.remote_config apply --payload '$PAYLOAD_JSON' --profile '$PROFILE_NAME'"
+run_as_target "'$INSTALL_DIR/venv/bin/python' -m hermes_cli.remote_config apply --payload '$PAYLOAD_JSON' --profile '$PROFILE_NAME'" | tee "$APPLY_RESULT_JSON"
+APPLY_CHANGED="$(json_file_has_runtime_relevant_changes "$APPLY_RESULT_JSON")"
 
-install_skill_zips "$PROFILE_NAME"
+STAGE="validate_aops_gateway_config"
+log "Validating AOPS gateway config for profile $PROFILE_NAME"
+validate_aops_gateway_config_for_profile "$PROFILE_NAME" | tee "$WORK_DIR/aops-gateway-config-check.json"
+
+install_skill_zips "$PROFILE_NAME" | tee "$SKILLS_RESULT_JSON"
+SKILLS_CHANGED="$(skills_result_has_changes "$SKILLS_RESULT_JSON")"
+
+STAGE="disable_gateway_lazy_installs"
+LAZY_INSTALLS_RESULT_JSON="$WORK_DIR/gateway-lazy-installs.json"
+ensure_gateway_lazy_installs_disabled_for_profile "$PROFILE_NAME" | tee "$LAZY_INSTALLS_RESULT_JSON"
+LAZY_INSTALLS_CHANGED="$(json_file_changed_flag "$LAZY_INSTALLS_RESULT_JSON")"
+record_lazy_installs_change_if_needed "$PROFILE_NAME" "$LAZY_INSTALLS_RESULT_JSON"
 
 if [[ "$PROFILE_ACTION" == "update" ]]; then
-  if json_bool options.restartGatewayAfterUpgrade true; then
+  FORCE_GATEWAY_RESTART=false
+  if json_bool options.forceGatewayRestart false; then
+    FORCE_GATEWAY_RESTART=true
+  fi
+  if json_bool options.restartGatewayAfterUpgrade true && {
+    [[ "$RUNTIME_CHANGED" == true ]] || [[ "$APPLY_CHANGED" == true ]] || [[ "$SKILLS_CHANGED" == true ]] || [[ "$LAZY_INSTALLS_CHANGED" == true ]] || [[ "$FORCE_GATEWAY_RESTART" == true ]]
+  }; then
+    log "Gateway restart required: runtimeChanged=$RUNTIME_CHANGED applyChanged=$APPLY_CHANGED skillsChanged=$SKILLS_CHANGED lazyInstallsChanged=$LAZY_INSTALLS_CHANGED force=$FORCE_GATEWAY_RESTART"
     ensure_gateway_service_installed "restart" "$PROFILE_NAME"
+  else
+    log "Skipping gateway restart for profile $PROFILE_NAME: no runtime/config/env/skill changes detected"
+    append_restart_summary "skippedProfiles" "$PROFILE_NAME" "no runtime/config/env/skill changes detected"
   fi
 else
   if json_bool options.startGatewayAfterInstall true; then
@@ -1034,5 +1768,6 @@ fi
 restart_other_running_profiles_after_upgrade
 
 STAGE="complete"
+print_restart_summary
 report_result "success" "$STAGE" "Hermes profile $PROFILE_NAME $PROFILE_ACTION completed for $TARGET_USER"
 log "Hermes profile $PROFILE_NAME $PROFILE_ACTION completed for $TARGET_USER"

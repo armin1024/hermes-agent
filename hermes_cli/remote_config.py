@@ -413,6 +413,46 @@ def _apply_config_yaml(config_payload: dict[str, Any], options: dict[str, Any]) 
     if config_yaml:
         _deep_merge_config_yaml(cfg, config_yaml, options=options, changed=changed)
 
+    # AOPS is a gateway platform, not just a local-command config section.
+    # Fresh one-click installs may provide only config.env.AOPS_BOT_TOKEN and
+    # config.env.AOPS_BOT_URL; without a platform block the gateway can start as
+    # a perfectly healthy *non-AOPS* gateway, which looks like "no AOPS logs".
+    # Keep secrets in .env: config.yaml only pins the adapter enabled flag and
+    # non-secret base URL so load_gateway_config().get_connected_platforms()
+    # includes AOPS once .env is loaded.
+    raw_env = config_payload.get("env") or {}
+    raw_aops = config_payload.get("aops") or {}
+    if raw_env and not isinstance(raw_env, dict):
+        raise RemoteConfigError("config.env must be a JSON object")
+    if raw_aops and not isinstance(raw_aops, dict):
+        raise RemoteConfigError("config.aops must be a JSON object")
+    aops_token = (
+        _optional_env_string(raw_env.get("AOPS_BOT_TOKEN"), "config.env.AOPS_BOT_TOKEN")
+        or _optional_string(raw_aops.get("AOPS_BOT_TOKEN"), "config.aops.AOPS_BOT_TOKEN")
+    )
+    aops_url = (
+        _optional_env_string(raw_env.get("AOPS_BOT_URL"), "config.env.AOPS_BOT_URL")
+        or _optional_string(raw_aops.get("AOPS_BOT_URL"), "config.aops.AOPS_BOT_URL")
+    )
+    if aops_token or aops_url:
+        _deep_set_if_allowed(
+            cfg,
+            "platforms.aops.enabled",
+            True,
+            field="configYaml.platforms.aops.enabled",
+            options=options,
+            changed=changed,
+        )
+        if aops_url:
+            _deep_set_if_allowed(
+                cfg,
+                "platforms.aops.extra.base_url",
+                aops_url.rstrip("/"),
+                field="configYaml.platforms.aops.extra.base_url",
+                options=options,
+                changed=changed,
+            )
+
     model_gateway = config_payload.get("modelGateway") or {}
     if model_gateway and not isinstance(model_gateway, dict):
         raise RemoteConfigError("config.modelGateway must be a JSON object")

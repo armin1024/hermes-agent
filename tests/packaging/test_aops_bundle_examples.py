@@ -20,6 +20,9 @@ def test_aops_offline_installer_self_checks_cache_layout():
     assert 'home / "image_cache"' in script
     assert 'home / "audio_cache"' in script
     assert "legacy cache dirs were created" in script
+    assert "AIOHTTP_AVAILABLE" in script
+    assert "aops_aiohttp_available=" in script
+    assert "AOPS runtime dependency is missing: aiohttp is not importable" in script
     assert "Post-install self-check failed" in script
     assert "Venv Python: $VENV_DIR/bin/python" in script
 
@@ -38,6 +41,10 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
     assert 'cp "$SCRIPT_DIR/tec01_oneclick_install.sh" "$BUNDLE_DIR/tec01_oneclick_install.sh"' in build
     assert "aops-channel-interface.md" in build
+    assert "AOPS_WHEEL_REQUIREMENTS" in build
+    assert "aiohttp==3.13.4" in build
+    assert "ensure_aops_runtime_wheels" in build
+    assert "--platform manylinux2014_x86_64" in build
     assert "--set KEY=VALUE" in script
     assert "--template-url" in script
     assert "--template-file" in script
@@ -52,10 +59,29 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "restart_other_running_profiles_after_upgrade" in script
     assert "gateway.pid" in script
     assert "CURRENT_PROFILE=$(shell_quote \"$PROFILE_NAME\")" in script
-    assert "('default', root)" in script
+    assert '("default", root)' in script
     assert "hermes-gateway.service" in script
-    assert "'hermes', 'gateway', 'restart'" in script
-    assert "'hermes', '-p', profile, 'gateway', 'restart'" in script
+    assert "controlled_gateway_lifecycle" in script
+    assert "skip SIGUSR1 restart" in script
+    assert "runtime did not become ready within" in script
+    assert "startup is blocked by a lazy dependency install" in script
+    assert "systemd is active with MainPID" in script
+    assert "systemd-active-runtime" in script
+    assert "::recover::" in script
+    assert "Recovering Hermes gateway profile" in script
+    assert "restart-summary.json" in script
+    assert "allowGatewayLazyInstalls" in script
+    assert "security.allow_lazy_installs" in script
+    assert "set security.allow_lazy_installs=false" in script
+    assert "record_lazy_installs_change_if_needed" in script
+    assert "gateway-lazy-installs-other.json" in script
+    assert "validate_aops_gateway_config_for_profile" in script
+    assert "AOPS platform is absent from gateway_state.json" in script
+    assert "runtime is running with AOPS connected" in script
+    assert "REQUIRE_AOPS=$(shell_quote \"$required\")" in script
+    assert '"platforms": {' in script
+    assert '"aops": {' in script
+    assert '"base_url": "${env.AOPS_BOT_URL}"' in script
     assert "hermes-gateway-{profile}.service" in script
     assert ".aops_bundle_sha256" in script
     assert "RUNTIME_UPDATE_NEEDED" in script

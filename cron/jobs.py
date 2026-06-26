@@ -60,6 +60,16 @@ _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+CRON_CHANNELS = ("tec01", "anyi")
+DEFAULT_CRON_CHANNELS = ["tec01"]
+
+
+class InvalidCronChannel(ValueError):
+    """Raised when a cron channel selection cannot be normalized safely."""
+
+
+class CronJobAlreadyClaimed(RuntimeError):
+    """Raised when a manual trigger races an already-running fire."""
 
 
 def _jobs_lock_file() -> Path:
@@ -169,6 +179,71 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
     return normalized
 
 
+def normalize_channel_selection(value: Any = None, *, strict: bool = True) -> List[str]:
+    """Normalize cron delivery routing channels to a unique ordered list.
+
+    The channel field is an AOPS/Tec01 routing hint, not the Hermes platform name.
+    Storage and responses always use a non-empty list. Legacy string values are
+    accepted and normalized; missing/invalid legacy values can be coerced to the
+    Tec01 default by passing strict=False.
+    """
+    if value is None or value == "":
+        return list(DEFAULT_CRON_CHANNELS)
+
+    if isinstance(value, str):
+        raw_items: list[Any] = [value]
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        if strict:
+            raise InvalidCronChannel("Cron channel must be a non-empty list of tec01/anyi values.")
+        return list(DEFAULT_CRON_CHANNELS)
+
+    normalized: List[str] = []
+    invalid: list[str] = []
+    for item in raw_items:
+        text = str(item or "").strip().lower()
+        if not text:
+            continue
+        if text not in CRON_CHANNELS:
+            invalid.append(text)
+            continue
+        if text not in normalized:
+            normalized.append(text)
+
+    if invalid or not normalized:
+        if strict:
+            allowed = ", ".join(CRON_CHANNELS)
+            if invalid:
+                raise InvalidCronChannel(f"Invalid cron channel(s): {', '.join(invalid)}. Allowed: {allowed}.")
+            raise InvalidCronChannel(f"Cron channel must include at least one of: {allowed}.")
+        return list(DEFAULT_CRON_CHANNELS)
+
+    return normalized
+
+
+def _migrate_job_channel(job: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+    """Return a job with persisted channel shape plus whether it changed."""
+    migrated = dict(job)
+    before = migrated.get("channel", None)
+    after = normalize_channel_selection(before, strict=False)
+    migrated["channel"] = after
+    return migrated, before != after
+
+
+def _migrate_job_channels(jobs: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], bool]:
+    migrated_jobs: List[Dict[str, Any]] = []
+    changed = False
+    for job in jobs:
+        if not isinstance(job, dict):
+            migrated_jobs.append(job)
+            continue
+        migrated, item_changed = _migrate_job_channel(job)
+        migrated_jobs.append(migrated)
+        changed = changed or item_changed
+    return migrated_jobs, changed
+
+
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a job dict with canonical `skills` and legacy `skill` fields aligned."""
     normalized = dict(job)
@@ -256,6 +331,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     if not state:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
+    normalized["channel"] = normalize_channel_selection(normalized.get("channel"), strict=False)
 
     return normalized
 
@@ -557,15 +633,21 @@ def load_jobs() -> List[Dict[str, Any]]:
     # down the whole cron subsystem.
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
-        if _strict_retry and jobs:
-            # Hit control-character corruption — rewrite with proper escaping.
+        jobs, channel_changed = _migrate_job_channels(jobs)
+        if (_strict_retry or channel_changed) and jobs:
+            # Hit control-character corruption or legacy channel shape — rewrite
+            # with proper escaping and canonical Tec01/Anyi channel arrays.
             save_jobs(jobs)
-            logger.warning("Auto-repaired jobs.json (had invalid control characters)")
+            if _strict_retry:
+                logger.warning("Auto-repaired jobs.json (had invalid control characters)")
+            if channel_changed:
+                logger.info("Migrated cron job channel fields to Tec01/Anyi array format")
         return jobs
     if isinstance(data, list):
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
         # into the expected {"jobs": [...]} structure.
         if data:
+            data, _channel_changed = _migrate_job_channels(data)
             save_jobs(data)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
         return data
@@ -650,6 +732,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    channel: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -694,6 +777,7 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        channel: Tec01/Anyi routing channels. Defaults to ["tec01"].
 
     Returns:
         The created job dict
@@ -728,6 +812,7 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
+    normalized_channel = normalize_channel_selection(channel, strict=True)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -779,6 +864,7 @@ def create_job(
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
+        "channel": normalized_channel,
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
@@ -856,6 +942,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         raise ValueError(
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
+
+    updates = dict(updates or {})
+    if "channel" in updates:
+        updates["channel"] = normalize_channel_selection(updates.get("channel"), strict=True)
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -980,7 +1070,7 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     Mark a job as having been run.
     
@@ -1013,9 +1103,13 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     completed = job["repeat"]["completed"]
                     if times is not None and times > 0 and completed >= times:
                         # Remove the job (limit reached)
+                        terminal_job = copy.deepcopy(job)
+                        terminal_job["enabled"] = False
+                        terminal_job["state"] = "completed"
+                        terminal_job["next_run_at"] = None
                         jobs.pop(i)
                         save_jobs(jobs)
-                        return
+                        return terminal_job
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -1050,9 +1144,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return copy.deepcopy(job)
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return None
 
 
 def advance_next_run(job_id: str) -> bool:
@@ -1149,6 +1244,66 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
         return False
 
 
+def _fresh_fire_claim(job: Dict[str, Any], now: datetime, claim_ttl_seconds: int) -> bool:
+    existing = job.get("fire_claim")
+    if not existing:
+        return False
+    try:
+        claimed_at = _ensure_aware(datetime.fromisoformat(existing["at"]))
+        return (now - claimed_at).total_seconds() < claim_ttl_seconds
+    except Exception:
+        return False
+
+
+def claim_job_for_manual_trigger(ref: str, *, claim_ttl_seconds: int = 300) -> Optional[Dict[str, Any]]:
+    """Enable and claim a job for an immediate user-requested trigger.
+
+    Unlike ``trigger_job()``, this does not merely set ``next_run_at=now`` and
+    wait for the next scheduler tick. It stamps the same ``fire_claim`` used by
+    provider fires and returns the claimed job snapshot for immediate
+    ``run_one_job`` execution by the caller. Paused/disabled jobs are resumed to
+    preserve the historical ``/cron trigger`` semantics.
+    """
+    if not ref:
+        return None
+    with _jobs_lock():
+        jobs = load_jobs()
+        selected: Dict[str, Any] | None = None
+        for job in jobs:
+            if job.get("id") == ref:
+                selected = job
+                break
+        if selected is None:
+            ref_lower = ref.lower()
+            matches = [j for j in jobs if (j.get("name") or "").lower() == ref_lower]
+            if not matches:
+                return None
+            if len(matches) > 1:
+                raise AmbiguousJobReference(ref, [_normalize_job_record(j) for j in matches])
+            selected = matches[0]
+
+        now = _hermes_now()
+        if _fresh_fire_claim(selected, now, claim_ttl_seconds):
+            raise CronJobAlreadyClaimed(
+                f"Cron job `{selected.get('name') or selected.get('id')}` is already running or being triggered."
+            )
+
+        selected["enabled"] = True
+        selected["state"] = "scheduled"
+        selected["paused_at"] = None
+        selected["paused_reason"] = None
+        selected["fire_claim"] = {"at": now.isoformat(), "by": _machine_id(), "manual": True}
+        kind = selected.get("schedule", {}).get("kind")
+        if kind in {"cron", "interval"}:
+            nxt = compute_next_run(selected["schedule"], now.isoformat())
+            if nxt:
+                selected["next_run_at"] = nxt
+        else:
+            selected["next_run_at"] = now.isoformat()
+        save_jobs(jobs)
+        return _normalize_job_record(copy.deepcopy(selected))
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
@@ -1171,6 +1326,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 
     for job in jobs:
         if not job.get("enabled", True):
+            continue
+        if _fresh_fire_claim(job, now, 300):
             continue
 
         next_run = job.get("next_run_at")

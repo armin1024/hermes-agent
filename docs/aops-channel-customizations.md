@@ -12,7 +12,10 @@
 - 支持 AOPS 静默 SkillHub 后端命令：`/bash clawhub explore --json`、`install`、`uninstall`。
 - 支持 AOPS 入站附件下载并进入 Hermes 多模态链路，静默 SkillHub 命令会跳过附件处理。
 - 附件和媒体缓存统一写入 `~/.hermes/cache/{images,audio,videos,documents}`。
-- AOPS cron 投递支持 `AOPS_HOME_CHANNEL`，历史记录查询按时间倒序返回。
+- AOPS cron 投递支持创建会话 `origin`、可修改 `channelId`、`AOPS_HOME_CHANNEL` 或 gateway config `home_channel`，历史记录查询按时间倒序返回；cron 任务 `channel` 统一为数组，合法值为 `tec01`、`anyi`，存量任务迁移为 `["tec01"]`。AOPS slash command 在会话内创建的任务默认 `deliver="origin"` 并保存创建时的 `channelId`，`channel` 只作为 Tec01/Anyi 前端路由字段。
+- `/cron trigger <id|name>`、create/update payload 的 `triggerNow=true` 会在命令返回后立即后台执行一次，不再等待下一轮 60s scheduler tick。
+- AOPS 本地命令支持 `/soul`、`/user`、`/busy`：可读写当前 profile 的 `SOUL.md`、`memories/USER.md`，并可立即切换 `display.busy_input_mode`，无需重启 gateway。
+- AOPS 工具进度回传增强：`tool.completed` 中间帧包含 `data.tool.result.text/length/truncated`、`durationMs`、`isError`，默认最多 4K 字符；`AOPS_PUSH_TOOL_CALLS=false` 时不发送工具中间帧。
 - tec01 一键安装支持新装/更新、目标用户创建、配置下发、预装技能、Hindsight 和 USER.md 初始化。
 - 离线包安装后会执行自检，确认实际导入的 overlay 不会创建旧 `image_cache/audio_cache` 目录。
 
@@ -93,7 +96,7 @@ AOPS 支持两种入站消息形态：
 判定规则：
 
 - metadata 中显式 `message_type="cron"` 时，`messageType="cron"`。
-- 否则入站 `silent=true` 或 `metadata.silent=true` 时，整条回复链 `messageType="silent"`。
+- 否则入站顶层 `silent=true` 或 `messageType=silent` 时，整条回复链 `messageType="silent"`。
 - 其余为 `messageType="common"`。
 
 `silent` 字段仍保留，且仅透传本次入站消息的静默语义。
@@ -103,7 +106,7 @@ AOPS 支持两种入站消息形态：
 当入站消息满足以下条件时，不进入 LLM，也不走普通聊天流：
 
 - 文本以 `/bash clawhub ` 开头。
-- 入站 `silent=true`、`metadata.silent=true` 或 `messageType=silent`。
+- 入站顶层 `silent=true` 或 `messageType=silent`。
 
 支持命令：
 
@@ -153,10 +156,14 @@ CLAWHUB_REGISTRY=http://clawhub.internal
 AOPS 本地命令入口继续支持 `/skills`、`/skills list`、`/cron` 等结构化结果。
 
 - `/skills` 和 `/skills list` 会刷新 skill command 缓存后返回，避免新安装技能缺少 `command`。
+- `/skills uninstall <name>` / `/skills remove <name>` 先尝试 hub 卸载；若目标不是 hub-installed，则安全删除当前 profile 的本地技能目录。
+- `/soul get|set|append` 读写当前 profile 的 `SOUL.md`；`/user get|set|append` 读写当前 profile 的 `memories/USER.md`。写入入口使用 threat-pattern 扫描，命中注入/泄露模式会拒绝写入；成功写入后驱逐 idle agent cache，后续新 turn 立即加载新指令。
+- `/busy` 与 `/busy status` 返回当前 busy 输入策略；`/busy queue|steer|interrupt` 写入 `config.yaml display.busy_input_mode`，并立即同步 runner 与 adapter 内存态。
 - `/cron history <id>` 返回最新记录在前，默认最多 20 条。
 - `/cron history before <id> [tsMs]` 返回锚点之前的更老记录，仍保持最新在前。
 - `/cron history after <id> <tsMs>` 返回锚点之后的更新记录，仍保持最新在前。
-- cron 自动投递到 AOPS 时可使用 `AOPS_HOME_CHANNEL` 作为 home channel，不需要用户手动 `/sethome`。
+- cron 自动投递到 AOPS 时优先使用任务当前保存的 `origin.chat_id`，因此触发后的 `message_reply.data.channelId` 应等于任务的 `channelId`；旧会话归档后可用 `/cron update <id> {"channelId":"new_channel_id"}` 迁移。无 origin 时才使用 `AOPS_HOME_CHANNEL` 或 gateway config `home_channel`。投递的 `message_reply.data.channel` 和 `botReplyExtra.channel` 必须是用户选择的渠道数组，`message_reply.data.job_id` 和 `botReplyExtra.job_id` 必须是触发本次投递的定时任务 ID。设置 `channelId` 会默认切到 `deliver="origin"`，除非请求显式传 `deliver="local"`。
+- cron 每次运行都会写入历史快照，历史条目的名称、提示词、执行时间、`channelId`、`channel`、`deliver` 不随后续任务修改变化。`outputPath` 是 gateway 本地路径，Tec01/Anyi 对端不能直接读取本地文件，只能看到已推送的 `message_reply.data.text`。
 - `dangerous_commands` 仅标记命令危险状态，用于前端审批展示；是否禁止执行由 `blocked_commands` 控制。
 - 不支持的命令会返回 `Command /xxx is not supported on AOPS`。
 

@@ -48,6 +48,11 @@ config:
       busy_input_mode: queue
     checkpoints:
       enabled: true
+    platforms:
+      aops:
+        enabled: true
+        extra:
+          base_url: ${env.AOPS_BOT_URL}
     platform_toolsets:
       cli:
         - terminal

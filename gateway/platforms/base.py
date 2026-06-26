@@ -3420,6 +3420,32 @@ class BasePlatformAdapter(ABC):
             return response.text, int(ttl or 0)
         return response, 0
 
+    @staticmethod
+    def _extract_response_payload(response: Any):
+        """Return ``(text_response, metadata, content)`` for rich command replies.
+
+        Some gateway handlers return a string-compatible object with ``.text``
+        plus protocol metadata (for example AOPS local commands that need
+        ``title`` or ``silent`` on the outbound message).  The base adapter's
+        send pipeline otherwise treats those objects as plain strings and drops
+        the metadata at the final delivery boundary.
+        """
+        if hasattr(response, "text") and (hasattr(response, "metadata") or hasattr(response, "content")):
+            metadata = getattr(response, "metadata", None)
+            content = getattr(response, "content", None)
+            text = getattr(response, "text", "") or ""
+            return text, metadata if isinstance(metadata, dict) else None, content
+        return response, None, None
+
+    @staticmethod
+    def _merge_response_metadata(base_metadata: Any, response_metadata: Any, response_content: Any = None) -> dict:
+        merged = dict(base_metadata) if isinstance(base_metadata, dict) else {}
+        if isinstance(response_metadata, dict):
+            merged.update(response_metadata)
+        if response_content is not None:
+            merged["content"] = response_content
+        return merged
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -3996,13 +4022,19 @@ class BasePlatformAdapter(ABC):
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
+                    response, _response_metadata, _response_content = self._extract_response_payload(response)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     if _text:
+                        _send_metadata = self._merge_response_metadata(
+                            _mark_notify_metadata(_thread_meta),
+                            _response_metadata,
+                            _response_content,
+                        )
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
-                            metadata=_mark_notify_metadata(_thread_meta),
+                            metadata=_send_metadata,
                         )
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
@@ -4190,6 +4222,7 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
+            response, _response_metadata, _response_content = self._extract_response_payload(response)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -4279,7 +4312,11 @@ class BasePlatformAdapter(ABC):
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _final_thread_metadata = self._merge_response_metadata(
+                    _mark_notify_metadata(_thread_metadata),
+                    _response_metadata,
+                    _response_content,
+                )
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

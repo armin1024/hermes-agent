@@ -1,5 +1,10 @@
 """Regression tests for dashboard cron job profile routing."""
 
+import importlib
+import asyncio
+import sys
+from pathlib import Path
+
 import pytest
 from fastapi import HTTPException
 
@@ -48,6 +53,55 @@ def test_call_cron_for_profile_routes_storage_and_restores_globals(isolated_prof
     assert cron_jobs.CRON_DIR == old_cron_dir
     assert cron_jobs.JOBS_FILE == old_jobs_file
     assert cron_jobs.OUTPUT_DIR == old_output_dir
+
+
+def test_call_cron_for_profile_recovers_when_plugins_cron_shadows_core(
+    isolated_profiles, monkeypatch
+):
+    """Dashboard cron APIs must not import bundled plugins/cron as core cron.
+
+    Some installed runtimes expose ``site-packages/plugins`` on ``sys.path``.
+    In that ordering, a plain ``import cron`` can resolve to
+    ``plugins/cron/__init__.py`` instead of Hermes' core ``cron`` package.
+    """
+    from hermes_cli import web_server
+
+    plugin_root = str(web_server.PROJECT_ROOT / "plugins")
+    monkeypatch.syspath_prepend(plugin_root)
+    original_cron_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "cron" or name.startswith("cron.")
+    }
+    try:
+        for name in list(sys.modules):
+            if name == "cron" or name.startswith("cron."):
+                sys.modules.pop(name, None)
+
+        shadowed = importlib.import_module("cron")
+        assert Path(shadowed.__file__).resolve() == (
+            web_server.PROJECT_ROOT / "plugins" / "cron" / "__init__.py"
+        ).resolve()
+
+        job = web_server._call_cron_for_profile(
+            "default",
+            "create_job",
+            prompt="survives plugin cron shadow",
+            schedule="every 1h",
+            name="shadow-recovery",
+        )
+
+        core_cron = importlib.import_module("cron")
+        assert Path(core_cron.__file__).resolve() == (
+            web_server.PROJECT_ROOT / "cron" / "__init__.py"
+        ).resolve()
+        assert job["profile"] == "default"
+        assert job["name"] == "shadow-recovery"
+    finally:
+        for name in list(sys.modules):
+            if name == "cron" or name.startswith("cron."):
+                sys.modules.pop(name, None)
+        sys.modules.update(original_cron_modules)
 
 
 @pytest.mark.asyncio
@@ -129,6 +183,34 @@ async def test_cron_mutation_without_profile_finds_named_profile_job(isolated_pr
     assert len(worker_jobs) == 1
     assert worker_jobs[0]["id"] == worker_job["id"]
     assert worker_jobs[0]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_trigger_cron_job_accepts_immediate_background_fire(isolated_profiles, monkeypatch):
+    from hermes_cli import web_server
+
+    worker_job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="run immediately",
+        schedule="every 1h",
+        name="immediate-trigger",
+    )
+    calls = []
+
+    def fake_fire(profile: str, job_id: str, manual: bool = False):
+        calls.append((profile, job_id, manual))
+        return True
+
+    monkeypatch.setattr(web_server, "_fire_cron_job_for_profile", fake_fire)
+
+    result = await web_server.trigger_cron_job(worker_job["id"], profile="worker_alpha")
+    await asyncio.sleep(0.05)
+
+    assert result["id"] == worker_job["id"]
+    assert result["triggerAccepted"] is True
+    assert result["triggerMode"] == "immediate"
+    assert calls == [("worker_alpha", worker_job["id"], True)]
 
 
 @pytest.mark.asyncio

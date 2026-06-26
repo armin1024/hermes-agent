@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import dataclasses
 import inspect
+import importlib
 import json
 import logging
 import os
@@ -92,6 +93,33 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r")",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _ensure_project_root_import_precedence() -> None:
+    """Keep the bundled source tree ahead of plugin paths for top-level imports."""
+    root = str(Path(__file__).resolve().parents[1])
+    try:
+        while root in sys.path:
+            sys.path.remove(root)
+        sys.path.insert(0, root)
+    except Exception:
+        pass
+
+
+def _is_bundled_plugin_cron_module(module: Any) -> bool:
+    path = str(getattr(module, "__file__", "") or "")
+    return "/plugins/cron/" in path or path.endswith("/plugins/cron/__init__.py")
+
+
+def _import_core_cron_module(name: str):
+    """Import the Hermes core cron package, recovering from plugins/cron shadowing."""
+    _ensure_project_root_import_precedence()
+    cron_module = sys.modules.get("cron")
+    if _is_bundled_plugin_cron_module(cron_module):
+        for module_name in list(sys.modules):
+            if module_name == "cron" or module_name.startswith("cron."):
+                sys.modules.pop(module_name, None)
+    return importlib.import_module(f"cron.{name}")
 
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
@@ -1314,6 +1342,41 @@ def _profile_runtime_scope(profile_home: "Path"):
     finally:
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
+
+
+_CRON_PROFILE_STORAGE_LOCK = threading.RLock()
+
+
+@_contextmanager
+def _cron_profile_storage_scope(profile_home: "Path"):
+    """Temporarily route cron.jobs module globals to a profile's cron store.
+
+    ``cron.jobs`` resolves CRON_DIR/JOBS_FILE/HISTORY_FILE/OUTPUT_DIR at import
+    time. A multiplexed gateway is one process serving multiple profile homes,
+    so AOPS local commands must retarget these globals while they run. This
+    mirrors the dashboard cron profile routing and keeps create/list/remove/
+    trigger/history pointed at the same profile store.
+    """
+    home = Path(profile_home)
+    cron_jobs = _import_core_cron_module("jobs")
+    with _CRON_PROFILE_STORAGE_LOCK:
+        old_cron_dir = cron_jobs.CRON_DIR
+        old_jobs_file = cron_jobs.JOBS_FILE
+        old_history_file = getattr(cron_jobs, "HISTORY_FILE", None)
+        old_output_dir = cron_jobs.OUTPUT_DIR
+        cron_jobs.CRON_DIR = home / "cron"
+        cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
+        if hasattr(cron_jobs, "HISTORY_FILE"):
+            cron_jobs.HISTORY_FILE = cron_jobs.CRON_DIR / "history.jsonl"
+        cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
+        try:
+            yield cron_jobs
+        finally:
+            cron_jobs.CRON_DIR = old_cron_dir
+            cron_jobs.JOBS_FILE = old_jobs_file
+            if old_history_file is not None:
+                cron_jobs.HISTORY_FILE = old_history_file
+            cron_jobs.OUTPUT_DIR = old_output_dir
 
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
@@ -2980,6 +3043,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _run_aops_local_command(self, event: MessageEvent):
         from gateway import aops_commands as _aops_commands
 
+        source = getattr(event, "source", None)
+        if (
+            source is not None
+            and getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        ):
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                with _cron_profile_storage_scope(profile_home):
+                    return await asyncio.to_thread(_aops_commands.maybe_local_command, event)
         return await asyncio.to_thread(_aops_commands.maybe_local_command, event)
 
     def _aops_preference_key_for_event(self, event: MessageEvent) -> Optional[str]:
@@ -3019,19 +3091,237 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             data["sessionId"] = str(session_id)
         return data
 
+    @staticmethod
+    def _compact_aops_rule_title_part(value: Any, *, limit: int = 20) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        text = text.strip("。；;，,、 \t\r\n")
+        if len(text) > limit:
+            text = text[:limit].rstrip() + "…"
+        return text
+
+    def _aops_cron_create_rule_title(self, event: MessageEvent, local_reply) -> str:
+        if not event.source or event.source.platform != Platform.AOPS:
+            return ""
+        if (event.get_command() or "").strip().lower() != "cron":
+            return ""
+        raw_args = event.get_command_args().strip()
+        if not raw_args.lower().startswith("create"):
+            return ""
+        raw_payload = raw_args[len("create"):].strip()
+        try:
+            payload = json.loads(raw_payload)
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        label = self._compact_aops_rule_title_part(payload.get("name"))
+        if not label:
+            label = self._compact_aops_rule_title_part(payload.get("prompt"))
+        if not label:
+            try:
+                response = json.loads(getattr(local_reply, "text", "") or "{}")
+                task = response.get("task") if isinstance(response, dict) else {}
+                if isinstance(task, dict):
+                    label = self._compact_aops_rule_title_part(task.get("name") or task.get("prompt"))
+            except Exception:
+                label = ""
+        return f"定时任务：{label}" if label else ""
+
+    @staticmethod
+    def _aops_event_silent_flag(event: MessageEvent) -> bool:
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        return (
+            raw.get("silent") is True
+            or str(raw.get("messageType") or "").strip().lower() == "silent"
+        )
+
+    def _aops_infer_local_command_effects(self, event: MessageEvent, local_reply) -> dict[str, Any]:
+        if not event.source or event.source.platform != Platform.AOPS:
+            return {}
+        if (event.get_command() or "").strip().lower() != "cron":
+            return {}
+        try:
+            payload = json.loads(getattr(local_reply, "text", "") or "{}")
+        except Exception:
+            return {}
+        if not isinstance(payload, dict) or payload.get("ok") is False:
+            return {}
+        type_ = str(payload.get("type") or "").strip()
+        task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+        job_id = str(task.get("id") or "").strip()
+        if not job_id:
+            return {}
+        raw_args = event.get_command_args().strip()
+        action = raw_args.split(None, 1)[0].lower() if raw_args else ""
+        if type_ == "cron.triggered" or action == "trigger":
+            return {"triggerCronJobId": job_id}
+        if type_ in {"cron.created", "cron.updated"} and action in {"create", "update"}:
+            raw_payload = raw_args[len(action):].strip()
+            if action == "update":
+                parts = raw_payload.split(None, 1)
+                raw_payload = parts[1].strip() if len(parts) > 1 else ""
+            try:
+                request_payload = json.loads(raw_payload)
+            except Exception:
+                request_payload = {}
+            if (
+                isinstance(request_payload, dict)
+                and request_payload.get("triggerNow") is True
+                and task.get("enabled") is not False
+            ):
+                return {"triggerCronJobId": job_id}
+        return {}
+
+    def _apply_aops_local_command_effects(self, event: MessageEvent, local_reply) -> None:
+        metadata = getattr(local_reply, "metadata", None)
+        if not isinstance(metadata, dict):
+            return
+        effects = metadata.get("effects")
+        if not isinstance(effects, dict):
+            return
+        trigger_job_id = str(effects.get("triggerCronJobId") or "").strip()
+        if trigger_job_id:
+            try:
+                loop = asyncio.get_running_loop()
+                adapters = dict(getattr(self, "adapters", {}) or {})
+                profile_home = None
+                source = getattr(event, "source", None)
+                if (
+                    source is not None
+                    and getattr(getattr(self, "config", None), "multiplex_profiles", False)
+                ):
+                    profile_home = self._resolve_profile_home_for_source(source)
+                loop.create_task(
+                    self._trigger_aops_cron_job_now(
+                        trigger_job_id,
+                        adapters=adapters,
+                        loop=loop,
+                        profile_home=profile_home,
+                    )
+                )
+            except Exception as exc:
+                logger.warning("AOPS cron immediate trigger scheduling failed for %s: %s", trigger_job_id, exc)
+        mode = str(effects.get("busyInputMode") or "").strip().lower()
+        if mode in {"queue", "steer", "interrupt"}:
+            self._busy_input_mode = mode
+            os.environ["HERMES_GATEWAY_BUSY_INPUT_MODE"] = mode
+            try:
+                self._busy_text_mode = self._load_busy_text_mode()
+            except Exception:
+                self._busy_text_mode = "queue" if mode == "queue" else "interrupt"
+            for adapter in getattr(self, "adapters", {}).values():
+                try:
+                    adapter._busy_text_mode = self._busy_text_mode
+                except Exception:
+                    pass
+        if effects.get("invalidateAgentCache"):
+            keys: list[str] = []
+            cache = getattr(self, "_agent_cache", None)
+            lock = getattr(self, "_agent_cache_lock", None)
+            try:
+                if lock is not None:
+                    with lock:
+                        keys = list(cache.keys()) if cache is not None else []
+                elif cache is not None:
+                    keys = list(cache.keys())
+            except Exception:
+                keys = []
+            for key in keys:
+                try:
+                    self._evict_cached_agent(key)
+                except Exception as exc:
+                    logger.debug("AOPS local command cache eviction skipped for %s: %s", key, exc)
+
+    async def _trigger_aops_cron_job_now(
+        self,
+        job_id: str,
+        *,
+        adapters: dict,
+        loop: asyncio.AbstractEventLoop,
+        profile_home: Optional["Path"] = None,
+    ) -> None:
+        def _run() -> None:
+            cron_jobs = _import_core_cron_module("jobs")
+            scheduler = _import_core_cron_module("scheduler")
+
+            try:
+                job = cron_jobs.claim_job_for_manual_trigger(job_id)
+            except getattr(cron_jobs, "CronJobAlreadyClaimed") as exc:
+                logger.info("AOPS cron immediate trigger skipped for %s: %s", job_id, exc)
+                return
+            if not job:
+                logger.warning("AOPS cron immediate trigger skipped; job not found: %s", job_id)
+                return
+            try:
+                scheduler.run_one_job(job, adapters=adapters, loop=loop)
+            except Exception as exc:
+                logger.exception("AOPS cron immediate trigger failed for %s: %s", job_id, exc)
+
+        def _run_scoped() -> None:
+            if profile_home is not None:
+                with _cron_profile_storage_scope(profile_home):
+                    _run()
+                return
+            _run()
+
+        await asyncio.to_thread(_run_scoped)
+
     def _aops_local_command_result_with_session_title(self, event: MessageEvent, local_reply):
-        if not hasattr(local_reply, "metadata"):
-            return local_reply
         try:
             from gateway import aops_commands as _aops_commands
         except Exception:
             return local_reply
+        if not hasattr(local_reply, "metadata"):
+            candidate_reply = _aops_commands.LocalCommandResult(
+                text=str(local_reply) if local_reply else "",
+                metadata={},
+            )
+            inferred_effects = self._aops_infer_local_command_effects(event, candidate_reply)
+            if inferred_effects:
+                candidate_reply.metadata["effects"] = inferred_effects
+            needs_metadata = (
+                self._aops_event_silent_flag(event)
+                or bool(self._aops_cron_create_rule_title(event, candidate_reply))
+                or bool(inferred_effects)
+            )
+            if not needs_metadata:
+                return local_reply
+            local_reply = candidate_reply
+        else:
+            existing_meta = getattr(local_reply, "metadata", None)
+            if isinstance(existing_meta, dict) and not isinstance(existing_meta.get("effects"), dict):
+                inferred_effects = self._aops_infer_local_command_effects(event, local_reply)
+                if inferred_effects:
+                    local_reply = _aops_commands.LocalCommandResult(
+                        text=getattr(local_reply, "text", "") or "",
+                        content=getattr(local_reply, "content", None),
+                        metadata={**existing_meta, "effects": inferred_effects},
+                    )
+        self._apply_aops_local_command_effects(event, local_reply)
         existing_meta = getattr(local_reply, "metadata", None)
-        title_meta = self._aops_session_title_metadata_for_event(event)
         base_meta = existing_meta if isinstance(existing_meta, dict) else {}
+        if self._aops_event_silent_flag(event):
+            merged_meta = {**base_meta, "silent": True, "title": ""}
+            return _aops_commands.LocalCommandResult(
+                text=getattr(local_reply, "text", "") or "",
+                content=getattr(local_reply, "content", None),
+                metadata=merged_meta,
+            )
+        title_meta = self._aops_session_title_metadata_for_event(event)
         merged_meta = {**title_meta, **base_meta}
-        if not str(base_meta.get("title") or "").strip() and title_meta.get("title"):
-            merged_meta["title"] = title_meta["title"]
+        if not str(base_meta.get("title") or "").strip():
+            if title_meta.get("title"):
+                merged_meta["title"] = title_meta["title"]
+            else:
+                rule_title = self._aops_cron_create_rule_title(event, local_reply)
+                session_id = str(title_meta.get("sessionId") or "").strip()
+                if rule_title and session_id and self._session_db:
+                    try:
+                        self._session_db.create_session(session_id, source="aops")
+                        self._session_db.set_session_title(session_id, rule_title)
+                        merged_meta["title"] = rule_title
+                    except Exception as exc:
+                        logger.debug("AOPS cron create rule title set skipped: %s", exc)
         return _aops_commands.LocalCommandResult(
             text=getattr(local_reply, "text", "") or "",
             content=getattr(local_reply, "content", None),
@@ -3076,6 +3366,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     session_id = ""
         return self._aops_session_title_for_id(session_id)
+
+    def _maybe_generate_aops_common_title(
+        self,
+        *,
+        source: SessionSource,
+        session_id: str,
+        user_message: str,
+        final_response: str,
+        agent_history: list,
+        agent: Any,
+        native_reply_bridge: Any,
+    ) -> str:
+        if source.platform != Platform.AOPS or not self._session_db or not session_id:
+            return ""
+        if not str(user_message or "").strip() or not str(final_response or "").strip():
+            return ""
+        if str(user_message or "").lstrip().startswith("/"):
+            return ""
+        try:
+            if self._session_db.get_session_title(session_id):
+                return ""
+        except Exception:
+            return ""
+        prior_user_count = sum(1 for item in (agent_history or []) if isinstance(item, dict) and item.get("role") == "user")
+        if prior_user_count > 0:
+            return ""
+
+        def _title_failure_cb(task: str, exc: BaseException) -> None:
+            logger.debug(
+                "AOPS synchronous title generation failure suppressed: %s: %s",
+                task,
+                exc,
+            )
+
+        def _generate() -> str:
+            from agent.title_generator import generate_title
+
+            title = generate_title(
+                user_message,
+                final_response,
+                failure_callback=_title_failure_cb,
+                main_runtime={
+                    "model": getattr(agent, "model", None),
+                    "provider": getattr(agent, "provider", None),
+                    "base_url": getattr(agent, "base_url", None),
+                    "api_key": getattr(agent, "api_key", None),
+                    "api_mode": getattr(agent, "api_mode", None),
+                } if agent else None,
+            )
+            return str(title or "").strip()
+
+        try:
+            title = _generate()
+        except Exception as exc:
+            logger.debug("AOPS synchronous title generation failed: %s", exc)
+            return ""
+        if not title:
+            return ""
+        try:
+            self._session_db.create_session(session_id, source="aops")
+            self._session_db.set_session_title(session_id, title)
+        except Exception as exc:
+            logger.debug("AOPS synchronous title set failed: %s", exc)
+            return ""
+        if native_reply_bridge is not None:
+            try:
+                native_reply_bridge.update_title(title)
+            except Exception:
+                pass
+        return title
 
     def _load_aops_model_preference_for_event(self, event: MessageEvent, session_key: str) -> None:
         if not hasattr(self, "_aops_model_preferences_loaded"):
@@ -5584,6 +5944,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+            if platform == Platform.AOPS and hasattr(adapter, "set_title_resolver"):
+                adapter.set_title_resolver(self._aops_outbound_title_for_payload)
             adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
@@ -6351,6 +6713,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+                    if platform == Platform.AOPS and hasattr(adapter, "set_title_resolver"):
+                        adapter.set_title_resolver(self._aops_outbound_title_for_payload)
                     adapter._busy_text_mode = self._busy_text_mode
 
                     success = await self._connect_adapter_with_timeout(adapter, platform)
@@ -7011,6 +7375,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+            if platform == Platform.AOPS and hasattr(adapter, "set_title_resolver"):
+                adapter.set_title_resolver(self._aops_outbound_title_for_payload)
             adapter._busy_text_mode = self._busy_text_mode
 
             try:
@@ -8446,6 +8812,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result = plugin_handler(user_args)
                     if asyncio.iscoroutine(result):
                         result = await result
+                    if source.platform == Platform.AOPS:
+                        if not result:
+                            return None
+                        return self._aops_local_command_result_with_session_title(
+                            event,
+                            result,
+                        )
                     return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
@@ -14629,11 +15002,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         native_reply_bridge = None
         native_reply_task = None
+        aops_push_tool_calls = True
         if source.platform == Platform.AOPS:
             try:
                 from gateway.platforms.aops import AopsLiveReplyBridge
                 _aops_adapter = self.adapters.get(source.platform)
                 if _aops_adapter is not None:
+                    aops_push_tool_calls = bool(getattr(_aops_adapter, "push_tool_calls", True))
                     native_reply_bridge = AopsLiveReplyBridge(
                         _aops_adapter,
                         chat_id=source.chat_id,
@@ -14674,6 +15049,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             """Callback invoked by agent on tool lifecycle events."""
             if native_reply_bridge is not None:
                 if not _run_still_current():
+                    return
+                if not aops_push_tool_calls and str(event_type or "").startswith("tool."):
                     return
                 try:
                     native_reply_bridge.on_tool_progress(
@@ -16224,8 +16601,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
             
+            if final_response and self._session_db and source.platform == Platform.AOPS:
+                try:
+                    self._maybe_generate_aops_common_title(
+                        source=source,
+                        session_id=effective_session_id,
+                        user_message=message,
+                        final_response=final_response,
+                        agent_history=agent_history,
+                        agent=agent,
+                        native_reply_bridge=native_reply_bridge,
+                    )
+                except Exception:
+                    pass
+
             # Auto-generate session title after first exchange (non-blocking)
-            if final_response and self._session_db:
+            if final_response and self._session_db and source.platform != Platform.AOPS:
                 try:
                     from agent.title_generator import maybe_auto_title
                     all_msgs = result_holder[0].get("messages", []) if result_holder[0] else []

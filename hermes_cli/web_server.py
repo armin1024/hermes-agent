@@ -17,6 +17,7 @@ import binascii
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hmac
+import importlib
 import importlib.util
 import json
 import logging
@@ -40,8 +41,58 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def _ensure_project_root_import_precedence() -> None:
+    """Keep Hermes core packages ahead of bundled plugin package roots.
+
+    Installed environments may have ``.../site-packages/plugins`` on
+    ``sys.path``. If that entry wins import resolution, ``import cron`` resolves
+    to ``plugins/cron/__init__.py`` (the cron provider discovery plugin package)
+    instead of Hermes' core ``cron`` package. Dashboard cron APIs import cron
+    lazily and can otherwise fail repeatedly with:
+
+        ImportError: cannot import name 'jobs' from 'cron'
+    """
+    root = str(PROJECT_ROOT)
+    sys.path[:] = [entry for entry in sys.path if entry != root]
+    sys.path.insert(0, root)
+
+
+def _module_file_path(module: Any) -> Optional[Path]:
+    raw = getattr(module, "__file__", None)
+    if not raw:
+        return None
+    try:
+        return Path(raw).resolve()
+    except OSError:
+        return None
+
+
+def _is_bundled_plugin_cron_module(module: Any) -> bool:
+    path = _module_file_path(module)
+    if path is None:
+        return False
+    plugin_cron_dir = (PROJECT_ROOT / "plugins" / "cron").resolve()
+    return path == plugin_cron_dir / "__init__.py" or plugin_cron_dir in path.parents
+
+
+def _ensure_core_cron_importable() -> None:
+    """Recover if the top-level ``cron`` module was poisoned by plugins/cron."""
+    _ensure_project_root_import_precedence()
+    cron_module = sys.modules.get("cron")
+    if _is_bundled_plugin_cron_module(cron_module):
+        for name in list(sys.modules):
+            if name == "cron" or name.startswith("cron."):
+                sys.modules.pop(name, None)
+
+
+def _import_core_cron_module(name: str):
+    _ensure_core_cron_importable()
+    return importlib.import_module(f"cron.{name}")
+
+
+_ensure_project_root_import_precedence()
 
 from hermes_cli import __version__, __release_date__
 from hermes_cli.config import (
@@ -133,7 +184,7 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     real gateway on the same HERMES_HOME — whichever process grabs the lock
     first wins the tick.
     """
-    from cron.scheduler_provider import resolve_cron_scheduler
+    resolve_cron_scheduler = _import_core_cron_module("scheduler_provider").resolve_cron_scheduler
 
     provider = resolve_cron_scheduler()
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
@@ -7573,26 +7624,32 @@ def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[st
 def _call_cron_for_profile(profile: Optional[str], func_name: str, *args, **kwargs):
     """Run cron.jobs helpers against the selected profile's cron directory.
 
-    cron.jobs keeps CRON_DIR/JOBS_FILE/OUTPUT_DIR as module globals resolved
-    from the process HERMES_HOME at import time. The dashboard is a single
-    process that can inspect many profiles, so temporarily retarget those
-    globals while holding a lock and restore them immediately after the call.
+    cron.jobs keeps CRON_DIR/JOBS_FILE/HISTORY_FILE/OUTPUT_DIR as module
+    globals resolved from the process HERMES_HOME at import time. The dashboard
+    is a single process that can inspect many profiles, so temporarily retarget
+    those globals while holding a lock and restore them immediately after the
+    call.
     """
     profile_name, home = _cron_profile_home(profile)
     with _CRON_PROFILE_LOCK:
-        from cron import jobs as cron_jobs
+        cron_jobs = _import_core_cron_module("jobs")
 
         old_cron_dir = cron_jobs.CRON_DIR
         old_jobs_file = cron_jobs.JOBS_FILE
+        old_history_file = getattr(cron_jobs, "HISTORY_FILE", None)
         old_output_dir = cron_jobs.OUTPUT_DIR
         cron_jobs.CRON_DIR = home / "cron"
         cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
+        if hasattr(cron_jobs, "HISTORY_FILE"):
+            cron_jobs.HISTORY_FILE = cron_jobs.CRON_DIR / "history.jsonl"
         cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
         try:
             result = getattr(cron_jobs, func_name)(*args, **kwargs)
         finally:
             cron_jobs.CRON_DIR = old_cron_dir
             cron_jobs.JOBS_FILE = old_jobs_file
+            if old_history_file is not None:
+                cron_jobs.HISTORY_FILE = old_history_file
             cron_jobs.OUTPUT_DIR = old_output_dir
 
     if isinstance(result, list):
@@ -7636,7 +7693,7 @@ async def get_cron_job(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "get_job", job_id)
+    job = _call_cron_for_profile(selected, "resolve_job_ref", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -7725,7 +7782,7 @@ async def get_cron_delivery_targets():
         }
     ]
     try:
-        from cron.scheduler import cron_delivery_targets
+        cron_delivery_targets = _import_core_cron_module("scheduler").cron_delivery_targets
 
         targets.extend(cron_delivery_targets())
     except Exception:
@@ -7774,10 +7831,13 @@ async def trigger_cron_job(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "trigger_job", job_id)
+    job = _call_cron_for_profile(selected, "get_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    asyncio.create_task(
+        asyncio.to_thread(_fire_cron_job_for_profile, selected, str(job["id"]), True)
+    )
+    return {**job, "triggerAccepted": True, "triggerMode": "immediate"}
 
 
 @app.delete("/api/cron/jobs/{job_id}")
@@ -7794,7 +7854,7 @@ async def delete_cron_job(job_id: str, profile: Optional[str] = None):
     return {"ok": True}
 
 
-def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
+def _fire_cron_job_for_profile(profile: str, job_id: str, manual: bool = False) -> bool:
     """Run ONE due cron job end-to-end for ``profile`` via the resolved
     scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
 
@@ -7807,21 +7867,35 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     """
     _profile_name, home = _cron_profile_home(profile)
     with _CRON_PROFILE_LOCK:
-        from cron import jobs as cron_jobs
-        from cron.scheduler_provider import resolve_cron_scheduler
+        cron_jobs = _import_core_cron_module("jobs")
+        resolve_cron_scheduler = _import_core_cron_module("scheduler_provider").resolve_cron_scheduler
 
         old_cron_dir = cron_jobs.CRON_DIR
         old_jobs_file = cron_jobs.JOBS_FILE
+        old_history_file = getattr(cron_jobs, "HISTORY_FILE", None)
         old_output_dir = cron_jobs.OUTPUT_DIR
         cron_jobs.CRON_DIR = home / "cron"
         cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
+        if hasattr(cron_jobs, "HISTORY_FILE"):
+            cron_jobs.HISTORY_FILE = cron_jobs.CRON_DIR / "history.jsonl"
         cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
         try:
+            if manual:
+                try:
+                    job = cron_jobs.claim_job_for_manual_trigger(job_id)
+                except getattr(cron_jobs, "CronJobAlreadyClaimed"):
+                    return False
+                if not job:
+                    return False
+                scheduler = _import_core_cron_module("scheduler")
+                return bool(scheduler.run_one_job(job, adapters=None, loop=None))
             provider = resolve_cron_scheduler()
             return bool(provider.fire_due(job_id, adapters=None, loop=None))
         finally:
             cron_jobs.CRON_DIR = old_cron_dir
             cron_jobs.JOBS_FILE = old_jobs_file
+            if old_history_file is not None:
+                cron_jobs.HISTORY_FILE = old_history_file
             cron_jobs.OUTPUT_DIR = old_output_dir
 
 
@@ -7900,11 +7974,13 @@ async def list_cron_blueprints():
     form never offers a platform that isn't connected.
     """
     try:
-        from cron.blueprint_catalog import CATALOG, blueprint_catalog_entry
+        blueprint_catalog = _import_core_cron_module("blueprint_catalog")
+        CATALOG = blueprint_catalog.CATALOG
+        blueprint_catalog_entry = blueprint_catalog.blueprint_catalog_entry
 
         deliver_options = None
         try:
-            from cron.scheduler import cron_delivery_targets
+            cron_delivery_targets = _import_core_cron_module("scheduler").cron_delivery_targets
 
             platforms = [t["id"] for t in cron_delivery_targets() if t.get("id")]
             deliver_options = ["origin", "local", *platforms]
@@ -7929,7 +8005,10 @@ async def list_cron_blueprints():
 async def instantiate_blueprint(body: AutomationBlueprintInstantiate, profile: str = "default"):
     """Fill a blueprint's slots and create the cron job (form-submit path)."""
     try:
-        from cron.blueprint_catalog import fill_blueprint, get_blueprint, BlueprintFillError
+        blueprint_catalog = _import_core_cron_module("blueprint_catalog")
+        fill_blueprint = blueprint_catalog.fill_blueprint
+        get_blueprint = blueprint_catalog.get_blueprint
+        BlueprintFillError = blueprint_catalog.BlueprintFillError
 
         blueprint = get_blueprint(body.blueprint)
         if blueprint is None:

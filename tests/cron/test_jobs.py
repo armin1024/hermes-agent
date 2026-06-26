@@ -21,6 +21,7 @@ from cron.jobs import (
     advance_next_run,
     get_due_jobs,
     save_job_output,
+    claim_job_for_manual_trigger,
 )
 
 
@@ -991,3 +992,20 @@ class TestSaveJobOutput:
         with pytest.raises(ValueError, match="output path"):
             save_job_output(str(tmp_cron_dir / "outside"), "# Results")
         assert not (tmp_cron_dir / "outside").exists()
+
+
+class TestManualTriggerClaim:
+    def test_manual_trigger_claim_enables_and_skips_scheduler_duplicate(self, tmp_cron_dir):
+        job = create_job(prompt="Run now", schedule="30m", name="Manual now")
+        paused = pause_job(job["id"])
+        assert paused is not None
+        assert paused["enabled"] is False
+
+        claimed = claim_job_for_manual_trigger(job["id"])
+
+        assert claimed is not None
+        assert claimed["id"] == job["id"]
+        assert claimed["enabled"] is True
+        assert claimed["state"] == "scheduled"
+        assert claimed["fire_claim"]["manual"] is True
+        assert get_due_jobs() == []

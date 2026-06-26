@@ -44,6 +44,23 @@ from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+_CRON_ROUTE_CHANNELS = ("tec01", "anyi")
+
+
+def _cron_route_channels(job: dict) -> list[str]:
+    raw = job.get("channel")
+    if isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        items = ["tec01"]
+    normalized: list[str] = []
+    for item in items:
+        text = str(item or "").strip().lower()
+        if text in _CRON_ROUTE_CHANNELS and text not in normalized:
+            normalized.append(text)
+    return normalized or ["tec01"]
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -97,6 +114,76 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     if len(cleaned) > 180:
         cleaned = cleaned[:177].rstrip() + "..."
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
+
+
+def _cron_history_preview(text: str | None, *, limit: int = 300) -> str | None:
+    preview = " ".join(str(text or "").split()).strip()
+    if not preview:
+        return None
+    if len(preview) <= limit:
+        return preview
+    return preview[: limit - 1].rstrip() + "…"
+
+
+def _cron_history_job_snapshot(job: dict, post_run_job: dict | None = None) -> dict:
+    schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+    origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+    channel_id = str(origin.get("chat_id") or "").strip() or None
+    next_run_at = None
+    if isinstance(post_run_job, dict):
+        next_run_at = post_run_job.get("next_run_at")
+    elif "next_run_at" in job:
+        next_run_at = job.get("next_run_at")
+    return {
+        "job_id": job.get("id"),
+        "job_name": job.get("name"),
+        "job_description": job.get("prompt") or job.get("name") or job.get("id"),
+        "prompt": job.get("prompt"),
+        "schedule": schedule,
+        "schedule_display": job.get("schedule_display") or schedule.get("display"),
+        "deliver": job.get("deliver"),
+        "origin": job.get("origin"),
+        "channelId": channel_id,
+        "channel": _cron_route_channels(job),
+        "next_run_at": next_run_at,
+        "next_run_at_after": next_run_at,
+        "skills": job.get("skills") or [],
+        "workdir": job.get("workdir"),
+        "model": job.get("model"),
+        "provider": job.get("provider"),
+    }
+
+
+def _record_cron_history(
+    job: dict,
+    *,
+    status: str,
+    started_at: str | None,
+    finished_at: str | None,
+    output_path: str | None = None,
+    output: str | None = None,
+    final_response: str | None = None,
+    error: str | None = None,
+    delivery_error: str | None = None,
+    silent: bool = False,
+    post_run_job: dict | None = None,
+) -> None:
+    entry = {
+        **_cron_history_job_snapshot(job, post_run_job=post_run_job),
+        "status": status,
+        "error": error,
+        "delivery_error": delivery_error,
+        "silent": silent,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "timestamp": finished_at or started_at or _hermes_now().isoformat(),
+        "output_path": output_path,
+        "response_preview": _cron_history_preview(final_response) or _cron_history_preview(output),
+    }
+    try:
+        append_cron_history(entry)
+    except Exception as exc:
+        logger.debug("Job '%s': failed to append cron history: %s", job.get("id", "?"), exc)
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -171,7 +258,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "qqbot", "yuanbao",
+    "qqbot", "yuanbao", "aops",
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -193,6 +280,7 @@ _HOME_TARGET_ENV_VARS = {
     "qqbot": "QQBOT_HOME_CHANNEL",
     "whatsapp": "WHATSAPP_HOME_CHANNEL",
     "whatsapp_cloud": "WHATSAPP_CLOUD_HOME_CHANNEL",
+    "aops": "AOPS_HOME_CHANNEL",
 }
 
 # Legacy env var names kept for back-compat.  Each entry is the current
@@ -203,7 +291,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import append_cron_history, get_due_jobs, mark_job_run, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -380,16 +468,33 @@ def _resolve_home_env_var(platform_name: str) -> str:
     return _plugin_cron_env_var(name)
 
 
+def _get_config_home_target(platform_name: str) -> tuple[str, Optional[str]]:
+    """Return home chat/thread from gateway config when env vars are absent."""
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        platform = Platform(platform_name.lower())
+        home = load_gateway_config().get_home_channel(platform)
+        if not home or not home.chat_id:
+            return "", None
+        return str(home.chat_id), home.thread_id
+    except Exception:
+        return "", None
+
+
 def _get_home_target_chat_id(platform_name: str) -> str:
     """Return the configured home target chat/room ID for a delivery platform."""
     env_var = _resolve_home_env_var(platform_name)
     if not env_var:
-        return ""
+        chat_id, _thread_id = _get_config_home_target(platform_name)
+        return chat_id
     value = os.getenv(env_var, "")
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
             value = os.getenv(legacy, "")
+    if not value:
+        value, _thread_id = _get_config_home_target(platform_name)
     return value
 
 
@@ -416,6 +521,8 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
             value = os.getenv(f"{legacy}_THREAD_ID", "").strip()
+    if not value:
+        _chat_id, value = _get_config_home_target(platform_name)
     return value or None
 
 
@@ -811,7 +918,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
-            send_metadata = {"thread_id": thread_id} if thread_id else None
+            send_metadata = {}
+            if platform_name.lower() == "aops":
+                route_channels = _cron_route_channels(job)
+                job_id = str(job.get("id") or "").strip()
+                send_metadata.update(
+                    {
+                        "message_type": "cron",
+                        "channel": route_channels,
+                        "job_id": job_id,
+                        "botReplyExtra": {"messageType": "cron", "channel": route_channels, "job_id": job_id},
+                    }
+                )
+            if thread_id:
+                send_metadata["thread_id"] = thread_id
+            if not send_metadata:
+                send_metadata = None
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
@@ -2052,6 +2174,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    started_at = _hermes_now().isoformat()
+    output_file = None
+    output = ""
+    final_response = ""
+    error = None
+    delivery_error = None
+    silent = False
     try:
         success, output, final_response, error = run_job(job)
 
@@ -2070,8 +2199,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
             logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
             should_deliver = False
+            silent = True
 
-        delivery_error = None
         if should_deliver:
             try:
                 delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
@@ -2086,12 +2215,38 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        post_run_job = mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        _record_cron_history(
+            job,
+            status="ok" if success else "error",
+            started_at=started_at,
+            finished_at=_hermes_now().isoformat(),
+            output_path=str(output_file) if output_file else None,
+            output=output,
+            final_response=final_response,
+            error=error if not success else None,
+            delivery_error=delivery_error,
+            silent=silent,
+            post_run_job=post_run_job,
+        )
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        mark_job_run(job["id"], False, str(e))
+        post_run_job = mark_job_run(job["id"], False, str(e))
+        _record_cron_history(
+            job,
+            status="error",
+            started_at=started_at,
+            finished_at=_hermes_now().isoformat(),
+            output_path=str(output_file) if output_file else None,
+            output=output,
+            final_response=final_response,
+            error=str(e),
+            delivery_error=delivery_error,
+            silent=silent,
+            post_run_job=post_run_job,
+        )
         return False
 
 

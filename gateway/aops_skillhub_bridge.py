@@ -308,6 +308,10 @@ def _install_skill(slug: str) -> tuple[bool, dict[str, Any]]:
 
 
 def _uninstall_skill(slug: str) -> tuple[bool, dict[str, Any]]:
+    from gateway.aops_skill_uninstall import (
+        is_not_hub_installed_message,
+        uninstall_local_skill_fallback,
+    )
     from hermes_cli.skills_hub import do_uninstall
 
     _configure_clawhub_source_base_url()
@@ -319,10 +323,25 @@ def _uninstall_skill(slug: str) -> tuple[bool, dict[str, Any]]:
     )
     if _message_indicates_failure(message):
         ok = False
+    source = "hub"
+    removed_path = None
+    if not ok and is_not_hub_installed_message(message):
+        local = uninstall_local_skill_fallback(slug)
+        if local.get("ok"):
+            ok = True
+            source = "local"
+            removed_path = local.get("removedPath")
+            local_message = str(local.get("message") or "").strip()
+            message = local_message or f"Uninstalled local skill '{slug}'."
+        else:
+            err = local.get("error") if isinstance(local.get("error"), dict) else {}
+            message = str(err.get("message") or message or f"Failed to uninstall '{slug}'.")
     payload = {
         "ok": ok,
         "action": "uninstall",
         "slug": slug,
+        "source": source,
+        "removedPath": removed_path,
         "message": message,
     }
     if not ok:
