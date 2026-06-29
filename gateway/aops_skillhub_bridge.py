@@ -5,7 +5,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shlex
+from contextlib import contextmanager
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
@@ -193,6 +195,32 @@ def _configure_clawhub_source_base_url() -> str:
     return base_url
 
 
+@contextmanager
+def _clawhub_only_source_router():
+    """Force hermes_cli.skills_hub install resolution to ClawHub only.
+
+    `/bash clawhub ...` is an AOPS backend bridge for Tec01's configured
+    SkillHub/ClawHub registry. The generic CLI installer searches HermesIndex,
+    GitHub, skills.sh, official, marketplace, etc. when no --source is provided;
+    that is both slow and undesirable in closed intranet deployments. Keep this
+    override scoped to the bridge call so normal `hermes skills install` retains
+    its full-source behavior.
+    """
+    import tools.skills_hub as skills_hub
+
+    original = skills_hub.create_source_router
+
+    def _create_clawhub_sources(auth=None):  # noqa: ARG001 - signature mirrors original
+        _configure_clawhub_source_base_url()
+        return [skills_hub.ClawHubSource()]
+
+    skills_hub.create_source_router = _create_clawhub_sources
+    try:
+        yield
+    finally:
+        skills_hub.create_source_router = original
+
+
 def _market_item_from_raw(item: dict[str, Any]) -> dict[str, Any] | None:
     slug = item.get("slug")
     if not isinstance(slug, str) or not slug:
@@ -267,6 +295,21 @@ def _message_indicates_failure(message: str) -> bool:
     return any(marker in lowered for marker in failure_markers)
 
 
+def _scan_policy_summary_from_message(message: str) -> dict[str, Any]:
+    match = re.search(
+        r"Scan policy ignored for trusted AOPS install:\s*verdict=([^\s]+)\s+findings=(\d+)",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return {}
+    return {
+        "scanIgnored": True,
+        "scanVerdict": match.group(1),
+        "scanFindingsCount": int(match.group(2)),
+    }
+
+
 def _installed_path(slug: str) -> str | None:
     from tools.skills_hub import HubLockFile
 
@@ -277,17 +320,35 @@ def _installed_path(slug: str) -> str | None:
     return str(path) if path else None
 
 
+def _refresh_skill_runtime() -> None:
+    """Best-effort refresh so SkillHub changes are visible to the next turn."""
+    try:
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+    except Exception:
+        pass
+    try:
+        from agent.skill_commands import reload_skills
+
+        reload_skills()
+    except Exception:
+        pass
+
+
 def _install_skill(slug: str) -> tuple[bool, dict[str, Any]]:
     from hermes_cli.skills_hub import do_install
 
     _configure_clawhub_source_base_url()
-    ok, message = _capture_cli_call(
-        do_install,
-        slug,
-        force=True,
-        skip_confirm=True,
-        invalidate_cache=True,
-    )
+    with _clawhub_only_source_router():
+        ok, message = _capture_cli_call(
+            do_install,
+            slug,
+            force=True,
+            skip_confirm=True,
+            invalidate_cache=True,
+            ignore_scan_policy=True,
+        )
     installed_path = _installed_path(slug)
     if _message_indicates_failure(message) or not installed_path:
         ok = False
@@ -298,12 +359,15 @@ def _install_skill(slug: str) -> tuple[bool, dict[str, Any]]:
         "message": message,
         "installedPath": installed_path,
     }
+    payload.update(_scan_policy_summary_from_message(message))
     if not ok:
         payload["error"] = {
             "code": "INSTALL_FAILED",
             "message": message or f"Failed to install '{slug}'.",
             "details": {},
         }
+    else:
+        _refresh_skill_runtime()
     return ok, payload
 
 
@@ -350,6 +414,8 @@ def _uninstall_skill(slug: str) -> tuple[bool, dict[str, Any]]:
             "message": message or f"Failed to uninstall '{slug}'.",
             "details": {},
         }
+    else:
+        _refresh_skill_runtime()
     return ok, payload
 
 

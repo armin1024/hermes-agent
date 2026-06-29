@@ -72,6 +72,148 @@ class CronJobAlreadyClaimed(RuntimeError):
     """Raised when a manual trigger races an already-running fire."""
 
 
+class CronSelfMutationBlocked(RuntimeError):
+    """Raised when a cron-run agent tries to mutate the cron control plane."""
+
+
+_cron_self_mutation_state = threading.local()
+
+
+def _env_truthy(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _context_value(name: str) -> Any:
+    try:
+        from gateway.session_context import _UNSET, _VAR_MAP
+
+        var = _VAR_MAP.get(name)
+        if var is None:
+            return None
+        value = var.get()
+        if value is _UNSET:
+            return None
+        return value
+    except Exception:
+        return None
+
+
+def _context_truthy(name: str) -> bool:
+    return str(_context_value(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _session_value(name: str) -> str:
+    value = _context_value(name)
+    if value is not None:
+        return str(value)
+    return str(os.environ.get(name, "") or "")
+
+
+def _aops_script_cron_allowed() -> bool:
+    return _env_truthy("HERMES_AOPS_ALLOW_SCRIPT_CRON")
+
+
+def _guard_aops_script_cron(*, script: Any = None, no_agent: Any = None) -> None:
+    """Block script/no-agent cron jobs created from AOPS sessions by default.
+
+    AOPS/Tec01 users create scheduled LLM tasks through `/cron create`. The
+    agent-facing `cronjob` tool also supports lower-level script/no_agent jobs
+    for local operators, but in AOPS this led to "self-check" instructions being
+    materialized as shell-script cron jobs. Keep that power tool available
+    outside AOPS, and allow an explicit escape hatch for deployments that really
+    need it.
+    """
+    platform = _session_value("HERMES_SESSION_PLATFORM").strip().lower()
+    if platform != "aops" or _aops_script_cron_allowed():
+        return
+    has_script = isinstance(script, str) and bool(script.strip())
+    wants_no_agent = bool(no_agent)
+    if not has_script and not wants_no_agent:
+        return
+    raise ValueError(
+        "AOPS cron commands do not create script/no_agent cron jobs by default. "
+        "Create a normal prompt-based cron task, or set HERMES_AOPS_ALLOW_SCRIPT_CRON=true "
+        "for this profile if script cron jobs are explicitly required."
+    )
+
+
+def _cron_self_mutation_guard_active() -> bool:
+    """Return True only for the active cron execution context.
+
+    ``HERMES_CRON_SESSION`` historically stays set process-wide after the first
+    scheduler run, so it is too broad for a hard mutation block: it would also
+    catch normal AOPS ``/cron`` commands handled by the same gateway process.
+
+    The scheduler now sets a short-lived ContextVar-backed
+    ``HERMES_CRON_MUTATION_GUARD`` while a job is actually executing and also
+    marks the current thread. Terminal subprocesses launched from that cron run
+    inherit the guard through the terminal environment bridge and are blocked
+    too; unrelated gateway tasks/threads are not.
+    """
+    if _env_truthy("HERMES_CRON_ALLOW_SELF_MUTATION"):
+        return False
+    if getattr(_cron_self_mutation_state, "active", False):
+        return True
+    if _context_truthy("HERMES_CRON_MUTATION_GUARD"):
+        return True
+    if not _env_truthy("HERMES_CRON_MUTATION_GUARD"):
+        return False
+    owner_pid = str(os.environ.get("HERMES_CRON_MUTATION_GUARD_OWNER_PID") or "").strip()
+    if owner_pid:
+        try:
+            # In the gateway owner process, only the marked cron thread should
+            # be blocked. In child processes (pid differs), the inherited env
+            # guard means the process was launched by the cron run.
+            return int(owner_pid) != os.getpid()
+        except ValueError:
+            return True
+    return True
+
+
+def cron_self_mutation_guard_active() -> bool:
+    """Public predicate for tool/schema gates."""
+    return _cron_self_mutation_guard_active()
+
+
+@contextlib.contextmanager
+def cron_self_mutation_guard():
+    """Mark the current execution context as a cron run for mutation blocking."""
+    previous_active = getattr(_cron_self_mutation_state, "active", False)
+    context_tokens: list[tuple[Any, Any]] = []
+    _cron_self_mutation_state.active = True
+    try:
+        from gateway.session_context import _VAR_MAP
+
+        for name, value in (
+            ("HERMES_CRON_MUTATION_GUARD", "1"),
+            ("HERMES_CRON_MUTATION_GUARD_OWNER_PID", str(os.getpid())),
+        ):
+            var = _VAR_MAP.get(name)
+            if var is not None:
+                context_tokens.append((var, var.set(value)))
+    except Exception:
+        context_tokens = []
+    try:
+        yield
+    finally:
+        _cron_self_mutation_state.active = previous_active
+        for var, token in reversed(context_tokens):
+            try:
+                var.reset(token)
+            except Exception:
+                pass
+
+
+def _guard_not_cron_self_mutation(action: str) -> None:
+    if not _cron_self_mutation_guard_active():
+        return
+    raise CronSelfMutationBlocked(
+        "Cron jobs cannot create, update, pause, resume, trigger, or remove "
+        "scheduled jobs while they are running. Return the current job result "
+        "only; ask the user to manage schedules with /cron outside the job."
+    )
+
+
 def _jobs_lock_file() -> Path:
     """Return the advisory lock path for the current cron directory."""
     return CRON_DIR / ".jobs.lock"
@@ -782,6 +924,8 @@ def create_job(
     Returns:
         The created job dict
     """
+    _guard_not_cron_self_mutation("create")
+    _guard_aops_script_cron(script=script, no_agent=no_agent)
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
@@ -934,6 +1078,11 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    _guard_not_cron_self_mutation("update")
+    _guard_aops_script_cron(
+        script=(updates or {}).get("script") if "script" in (updates or {}) else None,
+        no_agent=(updates or {}).get("no_agent") if "no_agent" in (updates or {}) else False,
+    )
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -996,6 +1145,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
+    _guard_not_cron_self_mutation("pause")
     job = resolve_job_ref(job_id)
     if not job:
         return None
@@ -1012,6 +1162,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
 
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Resume a paused job and compute the next future run from now. Accepts a job ID or name."""
+    _guard_not_cron_self_mutation("resume")
     job = resolve_job_ref(job_id)
     if not job:
         return None
@@ -1031,6 +1182,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Schedule a job to run on the next scheduler tick. Accepts a job ID or name."""
+    _guard_not_cron_self_mutation("trigger")
     job = resolve_job_ref(job_id)
     if not job:
         return None
@@ -1048,6 +1200,7 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID or name."""
+    _guard_not_cron_self_mutation("remove")
     job = resolve_job_ref(job_id)
     if not job:
         return False
@@ -1085,6 +1238,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
+                fire_claim = job.get("fire_claim") if isinstance(job.get("fire_claim"), dict) else {}
+                manual_original = fire_claim.get("original") if fire_claim.get("manual") is True and isinstance(fire_claim.get("original"), dict) else None
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
@@ -1093,6 +1248,13 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
+
+                if manual_original is not None:
+                    for key in ("enabled", "state", "paused_at", "paused_reason", "next_run_at", "repeat"):
+                        if key in manual_original:
+                            job[key] = copy.deepcopy(manual_original.get(key))
+                    save_jobs(jobs)
+                    return copy.deepcopy(job)
                 
                 # Increment completed count
                 if job.get("repeat"):
@@ -1256,13 +1418,14 @@ def _fresh_fire_claim(job: Dict[str, Any], now: datetime, claim_ttl_seconds: int
 
 
 def claim_job_for_manual_trigger(ref: str, *, claim_ttl_seconds: int = 300) -> Optional[Dict[str, Any]]:
-    """Enable and claim a job for an immediate user-requested trigger.
+    """Claim a job for an immediate user-requested one-off trigger.
 
     Unlike ``trigger_job()``, this does not merely set ``next_run_at=now`` and
     wait for the next scheduler tick. It stamps the same ``fire_claim`` used by
     provider fires and returns the claimed job snapshot for immediate
-    ``run_one_job`` execution by the caller. Paused/disabled jobs are resumed to
-    preserve the historical ``/cron trigger`` semantics.
+    ``run_one_job`` execution by the caller. Paused/disabled jobs are allowed to
+    run once, but their enabled/state/next_run_at fields are restored by
+    ``mark_job_run`` when the manual run completes.
     """
     if not ref:
         return None
@@ -1288,18 +1451,19 @@ def claim_job_for_manual_trigger(ref: str, *, claim_ttl_seconds: int = 300) -> O
                 f"Cron job `{selected.get('name') or selected.get('id')}` is already running or being triggered."
             )
 
-        selected["enabled"] = True
-        selected["state"] = "scheduled"
-        selected["paused_at"] = None
-        selected["paused_reason"] = None
-        selected["fire_claim"] = {"at": now.isoformat(), "by": _machine_id(), "manual": True}
-        kind = selected.get("schedule", {}).get("kind")
-        if kind in {"cron", "interval"}:
-            nxt = compute_next_run(selected["schedule"], now.isoformat())
-            if nxt:
-                selected["next_run_at"] = nxt
-        else:
-            selected["next_run_at"] = now.isoformat()
+        selected["fire_claim"] = {
+            "at": now.isoformat(),
+            "by": _machine_id(),
+            "manual": True,
+            "original": {
+                "enabled": selected.get("enabled", True),
+                "state": selected.get("state"),
+                "paused_at": selected.get("paused_at"),
+                "paused_reason": selected.get("paused_reason"),
+                "next_run_at": selected.get("next_run_at"),
+                "repeat": copy.deepcopy(selected.get("repeat")),
+            },
+        }
         save_jobs(jobs)
         return _normalize_job_record(copy.deepcopy(selected))
 

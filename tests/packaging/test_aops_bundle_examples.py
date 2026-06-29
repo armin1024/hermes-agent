@@ -11,8 +11,15 @@ def test_aops_offline_installer_self_checks_cache_layout():
     script = Path("packaging/offline/install_aops_offline.sh").read_text(encoding="utf-8")
     assert "run_post_install_self_check" in script
     assert 'HERMES_HOME="$tmp_home/.hermes" "$VENV_DIR/bin/python"' in script
+    assert "AOPS_SELF_CHECK_TIMEOUT_SECS" in script
+    assert "selfcheck_stage=timeout" in script
+    assert "Post-install self-check timed out after" in script
+    assert "continuing because runtime files were already installed" in script
+    assert "selfcheck_mode=aops-overlay-light" in script
     assert "from hermes_cli.config import ensure_hermes_home" in script
     assert "hermes_cli.config=" in script
+    assert "import cron.jobs as cron_jobs_mod" in script
+    assert "import cron.scheduler as cron_scheduler_mod" in script
     assert 'home / "cache" / "images"' in script
     assert 'home / "cache" / "audio"' in script
     assert 'home / "cache" / "videos"' in script
@@ -23,6 +30,10 @@ def test_aops_offline_installer_self_checks_cache_layout():
     assert "AIOHTTP_AVAILABLE" in script
     assert "aops_aiohttp_available=" in script
     assert "AOPS runtime dependency is missing: aiohttp is not importable" in script
+    assert "AOPS env mapping failed" in script
+    assert "load_gateway_config" not in script
+    assert "discover_plugins" not in script
+    assert "get_connected_platforms" not in script
     assert "Post-install self-check failed" in script
     assert "Venv Python: $VENV_DIR/bin/python" in script
 

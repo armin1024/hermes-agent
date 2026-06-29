@@ -749,7 +749,13 @@ async def test_aops_send_includes_cron_channel_array_metadata():
             "message_type": "cron",
             "channel": ["tec01", "anyi"],
             "job_id": "job_multi_001",
-            "botReplyExtra": {"messageType": "cron", "channel": ["tec01", "anyi"], "job_id": "job_multi_001"},
+            "name": "全渠道日报",
+            "botReplyExtra": {
+                "messageType": "cron",
+                "channel": ["tec01", "anyi"],
+                "job_id": "job_multi_001",
+                "name": "全渠道日报",
+            },
         },
     )
 
@@ -762,10 +768,14 @@ async def test_aops_send_includes_cron_channel_array_metadata():
     assert end["channel"] == ["tec01", "anyi"]
     assert start["job_id"] == "job_multi_001"
     assert end["job_id"] == "job_multi_001"
+    assert start["name"] == "全渠道日报"
+    assert end["name"] == "全渠道日报"
     assert start["botReplyExtra"]["channel"] == ["tec01", "anyi"]
     assert end["botReplyExtra"]["channel"] == ["tec01", "anyi"]
     assert start["botReplyExtra"]["job_id"] == "job_multi_001"
     assert end["botReplyExtra"]["job_id"] == "job_multi_001"
+    assert start["botReplyExtra"]["name"] == "全渠道日报"
+    assert end["botReplyExtra"]["name"] == "全渠道日报"
 
 
 @pytest.mark.asyncio
@@ -3211,6 +3221,71 @@ async def test_aops_toolsets_ui_disabled_is_configurable(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_aops_toolsets_ui_disabled_reads_active_config_file_for_context_engine(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - context_engine\n"
+        "    - terminal\n"
+        "aops:\n"
+        "  toolsets:\n"
+        "    disabled:\n"
+        "      - context_engine\n",
+        encoding="utf-8",
+    )
+
+    import hermes_cli.config as hermes_config
+
+    original_load_config = hermes_config.load_config
+    calls = {"n": 0}
+
+    def flaky_cached_load_config():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "platform_toolsets": {"cli": ["context_engine", "terminal"]},
+                "aops": {"toolsets": {"disabled": []}},
+            }
+        return original_load_config()
+
+    monkeypatch.setattr(hermes_config, "load_config", flaky_cached_load_config)
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/toolsets list"))
+
+    payload = json.loads(result)
+    items_by_name = {item["name"]: item for item in payload["items"]}
+    assert items_by_name["context_engine"]["enabled"] is True
+    assert items_by_name["context_engine"]["disabled"] is True
+    assert items_by_name["context_engine"]["configurable"] is False
+
+
+@pytest.mark.asyncio
+async def test_aops_toolsets_ui_disabled_reads_platform_scoped_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - context_engine\n"
+        "    - terminal\n"
+        "platforms:\n"
+        "  aops:\n"
+        "    toolsets:\n"
+        "      disabled:\n"
+        "        - context-engine\n",
+        encoding="utf-8",
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_silent_aops_event("/toolsets list"))
+
+    payload = json.loads(result)
+    items_by_name = {item["name"]: item for item in payload["items"]}
+    assert items_by_name["context_engine"]["disabled"] is True
+
+
+@pytest.mark.asyncio
 async def test_aops_toolsets_list_falls_back_to_legacy_aops_config(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import hermes_cli.config as hermes_config
@@ -4317,6 +4392,32 @@ def test_aops_cron_trigger_returns_immediate_effect(monkeypatch, tmp_path):
     assert result.metadata == {"effects": {"triggerCronJobId": job["id"]}}
     # The command itself should not merely mark the job due for the next tick.
     assert cron_jobs.get_job(job["id"])["next_run_at"] == job["next_run_at"]
+
+
+def test_aops_cron_trigger_disabled_job_does_not_enable(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+    from gateway import aops_commands
+    from gateway.aops_commands import LocalCommandResult
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Run once", schedule="*/5 * * * *", name="Run once")
+    paused = cron_jobs.pause_job(job["id"])
+    assert paused is not None
+    assert paused["enabled"] is False
+
+    result = aops_commands.maybe_local_command(_make_aops_event(f"/cron trigger {job['id']}"))
+
+    assert isinstance(result, LocalCommandResult)
+    payload = json.loads(result.text)
+    assert payload["type"] == "cron.triggered"
+    assert payload["ok"] is True
+    assert payload["task"]["enabled"] is False
+    stored = cron_jobs.get_job(job["id"])
+    assert stored["enabled"] is False
+    assert stored["state"] == "paused"
 
 
 @pytest.mark.asyncio
@@ -5566,13 +5667,36 @@ async def test_aops_silent_skillhub_install_returns_result_and_done(monkeypatch)
     assert done_payload["done"] is True
 
 
+def test_aops_silent_skillhub_commands_use_longer_exec_timeout(monkeypatch):
+    event = _make_silent_aops_event("/bash clawhub install comment-context")
+    monkeypatch.delenv("AOPS_LOCAL_COMMAND_EXEC_TIMEOUT", raising=False)
+    monkeypatch.delenv("AOPS_SKILLHUB_COMMAND_TIMEOUT", raising=False)
+
+    assert aops_mod._aops_local_command_exec_timeout_for_event(event) == 120.0
+
+    monkeypatch.setenv("AOPS_SKILLHUB_COMMAND_TIMEOUT", "45")
+    assert aops_mod._aops_local_command_exec_timeout_for_event(event) == 45.0
+
+
+def test_aops_non_skillhub_silent_commands_keep_short_exec_timeout(monkeypatch):
+    event = _make_silent_aops_event("/cron list")
+    monkeypatch.setenv("AOPS_LOCAL_COMMAND_EXEC_TIMEOUT", "4")
+    monkeypatch.setenv("AOPS_SKILLHUB_COMMAND_TIMEOUT", "45")
+
+    assert aops_mod._aops_local_command_exec_timeout_for_event(event) == 4.0
+
+
 def test_aops_skillhub_install_uses_cli_short_name_and_detects_cli_error(monkeypatch):
     from gateway import aops_skillhub_bridge
 
     calls = []
 
     def fake_install(identifier, **kwargs):
+        from tools.skills_hub import create_source_router
+
         calls.append((identifier, kwargs))
+        sources = create_source_router(None)
+        calls.append(("sources", [src.source_id() for src in sources]))
         kwargs["console"].print("[bold red]Error:[/] No skill named 'machine-access-review' found in any source.")
 
     monkeypatch.setattr(aops_skillhub_bridge, "_configure_clawhub_source_base_url", lambda: "http://clawhub.internal/api/v1")
@@ -5584,19 +5708,26 @@ def test_aops_skillhub_install_uses_cli_short_name_and_detects_cli_error(monkeyp
     assert ok is False
     assert payload["ok"] is False
     assert calls[0][0] == "machine-access-review"
+    assert calls[1] == ("sources", ["clawhub"])
     assert calls[0][1]["force"] is True
     assert calls[0][1]["skip_confirm"] is True
+    assert calls[0][1]["ignore_scan_policy"] is True
     assert payload["error"]["code"] == "INSTALL_FAILED"
 
 
 def test_aops_skillhub_install_succeeds_when_cli_installs_short_name(monkeypatch):
     from gateway import aops_skillhub_bridge
 
+    refreshed = []
+    calls = []
+
     def fake_install(identifier, **kwargs):
+        calls.append((identifier, kwargs))
         kwargs["console"].print("[bold green]Installed:[/] machine-access-review")
 
     monkeypatch.setattr(aops_skillhub_bridge, "_configure_clawhub_source_base_url", lambda: "http://clawhub.internal/api/v1")
     monkeypatch.setattr(aops_skillhub_bridge, "_installed_path", lambda slug: "machine-access-review")
+    monkeypatch.setattr(aops_skillhub_bridge, "_refresh_skill_runtime", lambda: refreshed.append(True))
     monkeypatch.setattr("hermes_cli.skills_hub.do_install", fake_install)
 
     ok, payload = aops_skillhub_bridge._install_skill("machine-access-review")
@@ -5604,6 +5735,31 @@ def test_aops_skillhub_install_succeeds_when_cli_installs_short_name(monkeypatch
     assert ok is True
     assert payload["ok"] is True
     assert payload["installedPath"] == "machine-access-review"
+    assert calls[0][1]["ignore_scan_policy"] is True
+    assert refreshed == [True]
+
+
+def test_aops_skillhub_install_reports_ignored_scan_policy(monkeypatch):
+    from gateway import aops_skillhub_bridge
+
+    def fake_install(identifier, **kwargs):
+        kwargs["console"].print(
+            "Scan policy ignored for trusted AOPS install: verdict=dangerous findings=2"
+        )
+        kwargs["console"].print("[bold green]Installed:[/] machine-access-review")
+
+    monkeypatch.setattr(aops_skillhub_bridge, "_configure_clawhub_source_base_url", lambda: "http://clawhub.internal/api/v1")
+    monkeypatch.setattr(aops_skillhub_bridge, "_installed_path", lambda slug: "machine-access-review")
+    monkeypatch.setattr(aops_skillhub_bridge, "_refresh_skill_runtime", lambda: None)
+    monkeypatch.setattr("hermes_cli.skills_hub.do_install", fake_install)
+
+    ok, payload = aops_skillhub_bridge._install_skill("machine-access-review")
+
+    assert ok is True
+    assert payload["ok"] is True
+    assert payload["scanIgnored"] is True
+    assert payload["scanVerdict"] == "dangerous"
+    assert payload["scanFindingsCount"] == 2
 
 
 @pytest.mark.asyncio

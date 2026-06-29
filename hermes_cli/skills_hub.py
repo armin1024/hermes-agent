@@ -478,7 +478,8 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
 def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True,
-               name_override: str = "") -> None:
+               name_override: str = "",
+               ignore_scan_policy: bool = False) -> None:
     """Fetch, quarantine, scan, confirm, and install a skill.
 
     ``name_override`` lets non-interactive callers (slash commands, gateway,
@@ -487,6 +488,11 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     triggers a prompt instead; ``skip_confirm=True`` means "non-interactive"
     (so pair it with ``name_override`` when installing from a URL that has
     no frontmatter).
+
+    ``ignore_scan_policy`` is an internal escape hatch for trusted, managed
+    install surfaces. The scan still runs and is printed, but a dangerous
+    verdict does not block installation. Keep the default ``False`` so the
+    public CLI security policy is unchanged.
     """
     from tools.skills_hub import (
         GitHubAuth, create_source_router, ensure_hub_dirs,
@@ -630,14 +636,20 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     # Check install policy
     allowed, reason = should_allow_install(result, force=force)
     if not allowed:
-        c.print(f"\n[bold red]Installation blocked:[/] {reason}")
-        # Clean up quarantine
-        shutil.rmtree(q_path, ignore_errors=True)
-        from tools.skills_hub import append_audit_log
-        append_audit_log("BLOCKED", bundle.name, bundle.source,
-                         bundle.trust_level, result.verdict,
-                         f"{len(result.findings)}_findings")
-        return
+        if ignore_scan_policy:
+            c.print(
+                "\n[yellow]Scan policy ignored for trusted AOPS install:[/] "
+                f"verdict={result.verdict} findings={len(result.findings)}"
+            )
+        else:
+            c.print(f"\n[bold red]Installation blocked:[/] {reason}")
+            # Clean up quarantine
+            shutil.rmtree(q_path, ignore_errors=True)
+            from tools.skills_hub import append_audit_log
+            append_audit_log("BLOCKED", bundle.name, bundle.source,
+                             bundle.trust_level, result.verdict,
+                             f"{len(result.findings)}_findings")
+            return
 
     if extra_metadata:
         metadata_lines = _format_extra_metadata_lines(extra_metadata)

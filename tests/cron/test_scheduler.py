@@ -814,6 +814,7 @@ class TestDeliverResultWrapping:
 
         job = {
             "id": "multi-channel-job",
+            "name": "全渠道日报",
             "deliver": "origin",
             "origin": {"platform": "aops", "chat_id": "home"},
             "channel": ["tec01", "anyi"],
@@ -830,11 +831,47 @@ class TestDeliverResultWrapping:
         assert metadata["message_type"] == "cron"
         assert metadata["channel"] == ["tec01", "anyi"]
         assert metadata["job_id"] == "multi-channel-job"
+        assert metadata["name"] == "全渠道日报"
         assert metadata["botReplyExtra"] == {
             "messageType": "cron",
             "channel": ["tec01", "anyi"],
             "job_id": "multi-channel-job",
+            "name": "全渠道日报",
         }
+
+    def test_aops_delivery_name_falls_back_to_job_id(self):
+        from concurrent.futures import Future
+        from cron.scheduler import _deliver_result
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.AOPS: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(MagicMock(success=True))
+            coro.close()
+            return future
+
+        job = {
+            "id": "unnamed-job",
+            "deliver": "origin",
+            "origin": {"platform": "aops", "chat_id": "home"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            _deliver_result(job, "Report", adapters={Platform.AOPS: adapter}, loop=loop)
+
+        metadata = adapter.send.call_args.kwargs["metadata"]
+        assert metadata["name"] == "unnamed-job"
+        assert metadata["botReplyExtra"]["name"] == "unnamed-job"
 
     def test_no_mirror_to_session_call(self):
         """Cron deliveries should NOT mirror into the gateway session."""

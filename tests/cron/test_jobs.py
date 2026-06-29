@@ -995,17 +995,42 @@ class TestSaveJobOutput:
 
 
 class TestManualTriggerClaim:
-    def test_manual_trigger_claim_enables_and_skips_scheduler_duplicate(self, tmp_cron_dir):
+    def test_manual_trigger_claim_preserves_disabled_state_and_skips_scheduler_duplicate(self, tmp_cron_dir):
         job = create_job(prompt="Run now", schedule="30m", name="Manual now")
         paused = pause_job(job["id"])
         assert paused is not None
         assert paused["enabled"] is False
+        original_next_run_at = paused.get("next_run_at")
 
         claimed = claim_job_for_manual_trigger(job["id"])
 
         assert claimed is not None
         assert claimed["id"] == job["id"]
-        assert claimed["enabled"] is True
-        assert claimed["state"] == "scheduled"
+        assert claimed["enabled"] is False
+        assert claimed["state"] == "paused"
         assert claimed["fire_claim"]["manual"] is True
         assert get_due_jobs() == []
+
+        marked = mark_job_run(job["id"], success=True)
+        assert marked is not None
+        assert marked["enabled"] is False
+        assert marked["state"] == "paused"
+        assert marked.get("next_run_at") == original_next_run_at
+        assert marked.get("fire_claim") is None
+
+    def test_manual_trigger_claim_preserves_enabled_job_next_run(self, tmp_cron_dir):
+        job = create_job(prompt="Run now", schedule="30m", name="Manual enabled")
+        original_next_run_at = job.get("next_run_at")
+
+        claimed = claim_job_for_manual_trigger(job["id"])
+
+        assert claimed is not None
+        assert claimed["enabled"] is True
+        assert claimed["state"] == "scheduled"
+        assert claimed.get("next_run_at") == original_next_run_at
+
+        marked = mark_job_run(job["id"], success=True)
+        assert marked is not None
+        assert marked["enabled"] is True
+        assert marked["state"] == "scheduled"
+        assert marked.get("next_run_at") == original_next_run_at
