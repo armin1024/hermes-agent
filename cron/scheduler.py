@@ -1835,12 +1835,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             if platform_name.lower() == "aops":
                 route_channels = _cron_route_channels(job)
                 job_id = str(job.get("id") or "").strip()
+                job_name = str(job.get("name") or job_id).strip() or job_id
                 route_metadata.update(
                     {
                         "message_type": "cron",
                         "channel": route_channels,
                         "job_id": job_id,
-                        "botReplyExtra": {"messageType": "cron", "channel": route_channels, "job_id": job_id},
+                        "name": job_name,
+                        "botReplyExtra": {
+                            "messageType": "cron",
+                            "channel": route_channels,
+                            "job_id": job_id,
+                            "name": job_name,
+                        },
                     }
                 )
             try:
@@ -2571,7 +2578,12 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "SILENT: If there is genuinely nothing new to report, respond "
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
+        "findings normally, or say [SILENT] and nothing more. "
+        "CONTROL PLANE: Do not create, update, pause, resume, trigger, "
+        "or remove scheduled jobs from inside this run. This cron job's "
+        "only responsibility is to produce the result for the current "
+        "scheduled execution. If the schedule should change, say so in "
+        "the final response and let the user manage it with /cron.]\n\n"
     )
     prompt = cron_hint + prompt
     if skills is None:
@@ -3135,6 +3147,7 @@ def run_job(
     else:
         _terminal_cwd_lock.acquire_read()
 
+    _cron_mutation_guard_cm = None
     # Everything after the acquire MUST live inside this try, so the finally
     # below always releases the lock even if the env override or any later
     # statement raises.  A leaked writer would deadlock the whole scheduler
@@ -3144,6 +3157,10 @@ def run_job(
         if _job_workdir:
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
+        from cron.jobs import cron_self_mutation_guard
+
+        _cron_mutation_guard_cm = cron_self_mutation_guard()
+        _cron_mutation_guard_cm.__enter__()
 
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart. Route through
@@ -3734,6 +3751,8 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        if _cron_mutation_guard_cm is not None:
+            _cron_mutation_guard_cm.__exit__(None, None, None)
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.

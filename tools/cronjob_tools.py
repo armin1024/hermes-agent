@@ -7,6 +7,7 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -22,7 +23,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from cron.jobs import (
     AmbiguousJobReference,
     claim_job_for_fire,
+    CronSelfMutationBlocked,
     create_job,
+    cron_self_mutation_guard_active,
     get_job,
     list_jobs,
     mark_job_run,
@@ -33,6 +36,43 @@ from cron.jobs import (
     resume_job,
     update_job,
 )
+
+_CRON_MUTATION_ACTIONS = {"create", "update", "pause", "resume", "remove", "run", "run_now", "trigger"}
+
+
+def _cron_self_mutation_error() -> str:
+    return tool_error(
+        "Cron jobs cannot create, update, pause, resume, trigger, or remove "
+        "scheduled jobs while they are running. Return the current job result "
+        "only; ask the user to manage schedules with /cron outside the job.",
+        success=False,
+    )
+
+
+def _session_env(name: str) -> str:
+    try:
+        from gateway.session_context import get_session_env
+
+        return str(get_session_env(name, "") or "")
+    except Exception:
+        return str(os.environ.get(name, "") or "")
+
+
+def _aops_script_cron_requested(*, script: Optional[str] = None, no_agent: Optional[bool] = None) -> bool:
+    if str(os.environ.get("HERMES_AOPS_ALLOW_SCRIPT_CRON", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return False
+    if _session_env("HERMES_SESSION_PLATFORM").strip().lower() != "aops":
+        return False
+    return bool((isinstance(script, str) and script.strip()) or no_agent is True)
+
+
+def _aops_script_cron_error() -> str:
+    return tool_error(
+        "AOPS cron commands do not create script/no_agent cron jobs by default. "
+        "Create a normal prompt-based cron task, or set HERMES_AOPS_ALLOW_SCRIPT_CRON=true "
+        "for this profile if script cron jobs are explicitly required.",
+        success=False,
+    )
 
 
 def _notify_provider_jobs_changed_safe() -> None:
@@ -684,8 +724,12 @@ def cronjob(
 
     try:
         normalized = (action or "").strip().lower()
+        if normalized in _CRON_MUTATION_ACTIONS and cron_self_mutation_guard_active():
+            return _cron_self_mutation_error()
 
         if normalized == "create":
+            if _aops_script_cron_requested(script=script, no_agent=no_agent):
+                return _aops_script_cron_error()
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
@@ -856,6 +900,8 @@ def cronjob(
 
         if normalized == "update":
             updates: Dict[str, Any] = {}
+            if _aops_script_cron_requested(script=script, no_agent=no_agent):
+                return _aops_script_cron_error()
             if prompt is not None:
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
@@ -962,6 +1008,8 @@ def cronjob(
 
         return tool_error(f"Unknown cron action '{action}'", success=False)
 
+    except CronSelfMutationBlocked:
+        return _cron_self_mutation_error()
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -1105,6 +1153,9 @@ def check_cronjob_requirements() -> bool:
     every consumer of these flags agrees on the truthy set.
     """
     from utils import env_var_enabled
+
+    if cron_self_mutation_guard_active():
+        return False
 
     return (
         env_var_enabled("HERMES_INTERACTIVE")

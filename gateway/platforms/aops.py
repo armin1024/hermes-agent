@@ -741,6 +741,30 @@ def _aops_local_command_exec_timeout() -> float:
     return value if value > 0 else 3.0
 
 
+def _aops_skillhub_command_exec_timeout() -> float:
+    raw = os.getenv("AOPS_SKILLHUB_COMMAND_TIMEOUT", "120").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 120.0
+    return value if value > 0 else 120.0
+
+
+def _aops_is_skillhub_silent_command(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    return (
+        lowered == "/bash clawhub explore --json"
+        or lowered.startswith("/bash clawhub install ")
+        or lowered.startswith("/bash clawhub uninstall ")
+    )
+
+
+def _aops_local_command_exec_timeout_for_event(event: MessageEvent) -> float:
+    if _aops_is_skillhub_silent_command(getattr(event, "text", "") or ""):
+        return _aops_skillhub_command_exec_timeout()
+    return _aops_local_command_exec_timeout()
+
+
 def _quote_aops_log_value(value: Any, *, limit: int = 500) -> str:
     text = _compact_log_text(value, limit=limit)
     return json.dumps(text or "-", ensure_ascii=False)
@@ -1884,6 +1908,7 @@ class AopsAdapter(BasePlatformAdapter):
     async def _dispatch_silent_event(self, event: MessageEvent) -> None:
         started = time.monotonic()
         response: Any = None
+        exec_timeout = _aops_local_command_exec_timeout_for_event(event)
         try:
             from gateway import aops_commands as _aops_commands
 
@@ -1899,12 +1924,12 @@ class AopsAdapter(BasePlatformAdapter):
             elif self._message_handler is not None:
                 response = await asyncio.wait_for(
                     self._message_handler(event),
-                    timeout=_aops_local_command_exec_timeout(),
+                    timeout=exec_timeout,
                 )
             else:
                 response = await asyncio.wait_for(
                     asyncio.to_thread(_aops_commands.maybe_local_command, event),
-                    timeout=_aops_local_command_exec_timeout(),
+                    timeout=exec_timeout,
                 )
 
         except asyncio.TimeoutError:
@@ -1914,7 +1939,10 @@ class AopsAdapter(BasePlatformAdapter):
                     "type": "silent.error",
                     "ok": False,
                     "command": event.text,
-                    "error": {"code": "SILENT_COMMAND_TIMEOUT", "message": "Silent local command timed out."},
+                    "error": {
+                        "code": "SILENT_COMMAND_TIMEOUT",
+                        "message": f"Silent local command timed out after {exec_timeout:.0f}s.",
+                    },
                 },
                 ensure_ascii=False,
                 indent=2,

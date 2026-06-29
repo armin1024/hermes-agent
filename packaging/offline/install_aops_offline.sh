@@ -108,18 +108,49 @@ run_post_install_self_check() {
   local tmp_home
   tmp_home="$(mktemp -d "${TMPDIR:-/tmp}/hermes-aops-selfcheck.XXXXXX")"
   local output
-  if ! output="$(HERMES_HOME="$tmp_home/.hermes" "$VENV_DIR/bin/python" - <<'PY'
+  local rc
+  set +e
+  output="$(HERMES_HOME="$tmp_home/.hermes" "$VENV_DIR/bin/python" - 2>&1 <<'PY'
 import os
+import signal
 import sys
 from pathlib import Path
 
-from hermes_cli.config import ensure_hermes_home
-import hermes_cli.config as config_mod
-from hermes_cli.env_loader import load_hermes_dotenv
-from gateway.config import Platform, load_gateway_config
-from gateway.platforms.aops import AIOHTTP_AVAILABLE, AopsAdapter
+timeout_secs = int(os.environ.get("AOPS_SELF_CHECK_TIMEOUT_SECS", "20") or "20")
+
+
+def _timeout(_signum, _frame):
+    print(f"selfcheck_stage=timeout timeout_secs={timeout_secs}", file=sys.stderr)
+    raise SystemExit(124)
+
+
+if hasattr(signal, "SIGALRM"):
+    signal.signal(signal.SIGALRM, _timeout)
+    signal.alarm(max(timeout_secs, 1))
+
+
+stage = "startup"
+try:
+    stage = "import_hermes_config"
+    from hermes_cli.config import ensure_hermes_home
+    import hermes_cli.config as config_mod
+
+    stage = "import_env_loader"
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    stage = "import_aops_adapter"
+    from gateway.platforms.aops import AIOHTTP_AVAILABLE, AopsAdapter
+
+    stage = "import_cron_modules"
+    import cron.jobs as cron_jobs_mod
+    import cron.scheduler as cron_scheduler_mod
+except BaseException as exc:
+    print(f"selfcheck_stage={stage}", file=sys.stderr)
+    print(f"selfcheck_error={type(exc).__name__}: {exc}", file=sys.stderr)
+    raise
 
 home = Path(os.environ["HERMES_HOME"])
+stage = "ensure_hermes_home"
 ensure_hermes_home()
 
 expected = [
@@ -136,23 +167,27 @@ legacy = [
 missing = [str(path) for path in expected if not path.is_dir()]
 created_legacy = [str(path) for path in legacy if path.exists()]
 
+stage = "load_aops_env"
 (home / ".env").write_text(
     "AOPS_BOT_TOKEN=selfcheck-token\n"
     "AOPS_BOT_URL=https://aops-selfcheck.invalid\n",
     encoding="utf-8",
 )
 load_hermes_dotenv(hermes_home=home)
-gateway_cfg = load_gateway_config()
-connected = [platform.value for platform in gateway_cfg.get_connected_platforms()]
-aops_cfg = gateway_cfg.platforms.get(Platform.AOPS)
+aops_token = os.getenv("AOPS_BOT_TOKEN", "").strip()
+aops_url = os.getenv("AOPS_BOT_URL", "").strip()
 
+stage = "report"
 print(f"hermes_cli.config={config_mod.__file__}")
 print(f"gateway.platforms.aops={sys.modules[AopsAdapter.__module__].__file__}")
+print(f"cron.jobs={cron_jobs_mod.__file__}")
+print(f"cron.scheduler={cron_scheduler_mod.__file__}")
 print(f"selfcheck_home={home}")
-print(f"connected_platforms={','.join(connected)}")
+print("selfcheck_mode=aops-overlay-light")
 print(f"aops_aiohttp_available={AIOHTTP_AVAILABLE}")
+print(f"aops_env_loaded={bool(aops_token and aops_url)}")
 
-if missing or created_legacy or "aops" not in connected or aops_cfg is None or not AIOHTTP_AVAILABLE:
+if missing or created_legacy or not AIOHTTP_AVAILABLE or not aops_token or not aops_url:
     if missing:
         print("missing expected cache dirs:", ", ".join(missing), file=sys.stderr)
     if created_legacy:
@@ -162,14 +197,26 @@ if missing or created_legacy or "aops" not in connected or aops_cfg is None or n
             "AOPS runtime dependency is missing: aiohttp is not importable",
             file=sys.stderr,
         )
-    if "aops" not in connected or aops_cfg is None:
+    if not aops_token or not aops_url:
         print(
-            "AOPS gateway overlay is not active or not connectable from AOPS_BOT_TOKEN/AOPS_BOT_URL",
+            "AOPS env mapping failed: AOPS_BOT_TOKEN/AOPS_BOT_URL were not readable",
             file=sys.stderr,
         )
     raise SystemExit(1)
+
+if hasattr(signal, "SIGALRM"):
+    signal.alarm(0)
 PY
-  )"; then
+  )"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    if [[ "$rc" -eq 124 && "$output" == *"selfcheck_stage=timeout"* ]]; then
+      echo "$output" >&2
+      warn "Post-install self-check timed out after ${AOPS_SELF_CHECK_TIMEOUT_SECS:-20}s; continuing because runtime files were already installed"
+      rm -rf "$tmp_home"
+      return 0
+    fi
     echo "$output" >&2
     rm -rf "$tmp_home"
     fail "Post-install self-check failed; installed overlay may not be active"

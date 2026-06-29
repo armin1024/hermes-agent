@@ -1662,15 +1662,62 @@ def _toolset_context(event: MessageEvent) -> dict[str, Any]:
     }
 
 
+def _normalize_toolset_name(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _merge_toolset_ui_config(target: dict[str, Any], source: Any) -> None:
+    if not isinstance(source, dict):
+        return
+    toolsets_cfg = source.get("toolsets")
+    if isinstance(toolsets_cfg, dict):
+        for key in ("disabled", "unsupportedReasons", "unsupported_reasons"):
+            if key in toolsets_cfg:
+                target[key] = toolsets_cfg[key]
+
+
+def _raw_aops_toolset_ui_config() -> dict[str, Any]:
+    """Read AOPS toolset UI config directly from the active profile file.
+
+    `/toolsets` uses `load_config()` for effective runtime toolset state, but
+    the UI-disabled list is a small AOPS/Tec01 presentation setting. Reading it
+    directly avoids stale merged-config cache edge cases after one-click updates
+    or manual config edits, and lets us support the common platform-scoped
+    shapes used by templates.
+    """
+    from hermes_constants import get_hermes_home
+
+    path = get_hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    merged: dict[str, Any] = {}
+    _merge_toolset_ui_config(merged, raw.get("aops"))
+    platforms = raw.get("platforms")
+    aops_platform = platforms.get("aops") if isinstance(platforms, dict) else {}
+    _merge_toolset_ui_config(merged, aops_platform)
+    if isinstance(aops_platform, dict):
+        extra = aops_platform.get("extra")
+        _merge_toolset_ui_config(merged, extra)
+    return merged
+
+
 def _configured_toolset_ui_state(cfg: dict[str, Any]) -> tuple[set[str], dict[str, str]]:
+    toolsets_cfg: dict[str, Any] = {}
     aops_cfg = cfg.get("aops") if isinstance(cfg, dict) else {}
-    toolsets_cfg = aops_cfg.get("toolsets") if isinstance(aops_cfg, dict) else {}
-    if not isinstance(toolsets_cfg, dict):
-        toolsets_cfg = {}
+    if isinstance(aops_cfg, dict) and isinstance(aops_cfg.get("toolsets"), dict):
+        toolsets_cfg.update(aops_cfg["toolsets"])
+    toolsets_cfg.update(_raw_aops_toolset_ui_config())
 
     raw_disabled = toolsets_cfg.get("disabled")
     if isinstance(raw_disabled, list):
-        ui_disabled = {str(item).strip() for item in raw_disabled if str(item).strip()}
+        ui_disabled = {_normalize_toolset_name(item) for item in raw_disabled if _normalize_toolset_name(item)}
         reasons: dict[str, str] = {}
     else:
         ui_disabled = set(_LINUX_TERMINAL_UNSUPPORTED_REASONS)
@@ -1680,7 +1727,7 @@ def _configured_toolset_ui_state(cfg: dict[str, Any]) -> tuple[set[str], dict[st
         raw_reasons = toolsets_cfg.get("unsupported_reasons")
     if isinstance(raw_reasons, dict):
         for raw_name, raw_reason in raw_reasons.items():
-            name = str(raw_name).strip()
+            name = _normalize_toolset_name(raw_name)
             if not name:
                 continue
             reason = str(raw_reason or "").strip()

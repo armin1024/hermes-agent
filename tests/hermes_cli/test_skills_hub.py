@@ -485,6 +485,97 @@ def test_url_install_uses_name_override_on_non_interactive_surface(monkeypatch, 
     assert installs == [{"name": "my-url-skill", "category": ""}]
 
 
+def test_install_scan_policy_blocks_by_default(monkeypatch, tmp_path, hub_env):
+    import tools.skills_guard as guard
+
+    installs = _install_mocks(
+        monkeypatch,
+        tmp_path,
+        _make_url_bundle_fetcher(name="risky-skill", awaiting_name=False),
+    )
+    monkeypatch.setattr(
+        guard,
+        "scan_skill",
+        lambda skill_path, source="community": guard.ScanResult(
+            skill_name="risky-skill",
+            source=source,
+            trust_level="community",
+            verdict="dangerous",
+            findings=[
+                guard.Finding(
+                    pattern_id="hardcoded_token",
+                    severity="critical",
+                    category="exfiltration",
+                    file="SKILL.md",
+                    line=1,
+                    match="token",
+                    description="hard-coded token",
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (False, "dangerous"))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/risky-skill/SKILL.md",
+        console=console,
+        skip_confirm=True,
+        force=True,
+    )
+
+    assert installs == []
+    assert "Installation blocked" in sink.getvalue()
+
+
+def test_install_ignore_scan_policy_installs_dangerous_skill(monkeypatch, tmp_path, hub_env):
+    import tools.skills_guard as guard
+
+    installs = _install_mocks(
+        monkeypatch,
+        tmp_path,
+        _make_url_bundle_fetcher(name="risky-skill", awaiting_name=False),
+    )
+    monkeypatch.setattr(
+        guard,
+        "scan_skill",
+        lambda skill_path, source="community": guard.ScanResult(
+            skill_name="risky-skill",
+            source=source,
+            trust_level="community",
+            verdict="dangerous",
+            findings=[
+                guard.Finding(
+                    pattern_id="hardcoded_token",
+                    severity="critical",
+                    category="exfiltration",
+                    file="SKILL.md",
+                    line=1,
+                    match="token",
+                    description="hard-coded token",
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (False, "dangerous"))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/risky-skill/SKILL.md",
+        console=console,
+        skip_confirm=True,
+        force=True,
+        ignore_scan_policy=True,
+    )
+
+    assert installs == [{"name": "risky-skill", "category": ""}]
+    out = sink.getvalue()
+    assert "Scan policy ignored for trusted AOPS install" in out
+    assert "verdict=dangerous findings=1" in out
+
+
 def test_url_install_rejects_invalid_name_override(monkeypatch, tmp_path, hub_env):
     installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
 
@@ -780,4 +871,3 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     assert payload[0]["source"] == "browse-sh"
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
-

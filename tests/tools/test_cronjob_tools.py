@@ -1,6 +1,8 @@
 """Tests for tools/cronjob_tools.py — prompt scanning, schedule/list/remove dispatchers."""
 
 import json
+import contextvars
+import threading
 import pytest
 
 from tools.cronjob_tools import (
@@ -203,6 +205,18 @@ class TestCronjobRequirements:
 
         assert check_cronjob_requirements() is True
 
+    def test_rejects_inside_active_cron_mutation_guard(self, monkeypatch):
+        from cron.jobs import cron_self_mutation_guard
+
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+
+        with cron_self_mutation_guard():
+            assert check_cronjob_requirements() is False
+
+        assert check_cronjob_requirements() is True
+
     def test_accepts_exec_ask(self, monkeypatch):
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
@@ -263,6 +277,130 @@ class TestUnifiedCronjobTool:
         assert listing["count"] == 1
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
+
+    def test_create_blocked_inside_active_cron_mutation_guard(self):
+        from cron.jobs import cron_self_mutation_guard
+
+        with cron_self_mutation_guard():
+            created = json.loads(
+                cronjob(
+                    action="create",
+                    prompt="Create another reminder",
+                    schedule="every 1h",
+                    name="Recursive Reminder",
+                )
+            )
+
+        assert created["success"] is False
+        assert "Cron jobs cannot create" in created["error"]
+
+        listing = json.loads(cronjob(action="list"))
+        assert listing["success"] is True
+        assert listing["count"] == 0
+
+    def test_aops_session_rejects_script_cron_create(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "aops")
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                schedule="every 1h",
+                script="selfcheck.sh",
+                no_agent=True,
+            )
+        )
+
+        assert created["success"] is False
+        assert "script/no_agent cron jobs" in created["error"]
+        assert json.loads(cronjob(action="list"))["count"] == 0
+
+    def test_aops_script_cron_guard_allows_explicit_escape_hatch(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "aops")
+        monkeypatch.setenv("HERMES_AOPS_ALLOW_SCRIPT_CRON", "true")
+        scripts_dir = tmp_path / ".hermes" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "selfcheck.sh").write_text("echo ok\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                schedule="every 1h",
+                script="selfcheck.sh",
+                no_agent=True,
+            )
+        )
+
+        assert created["success"] is True
+        assert created["job"]["no_agent"] is True
+
+    def test_guard_does_not_block_unrelated_gateway_thread(self):
+        from cron.jobs import cron_self_mutation_guard
+
+        result_holder = {}
+
+        def create_from_other_thread():
+            result_holder["created"] = json.loads(
+                cronjob(
+                    action="create",
+                    prompt="Normal AOPS management command",
+                    schedule="every 1h",
+                    name="User Created",
+                )
+            )
+
+        with cron_self_mutation_guard():
+            thread = threading.Thread(target=create_from_other_thread)
+            thread.start()
+            thread.join(timeout=5)
+
+        assert thread.is_alive() is False
+        assert result_holder["created"]["success"] is True
+
+        listing = json.loads(cronjob(action="list"))
+        assert listing["count"] == 1
+        assert listing["jobs"][0]["name"] == "User Created"
+
+    def test_guard_blocks_copied_cron_context_worker_thread(self):
+        from cron.jobs import cron_self_mutation_guard
+
+        result_holder = {}
+
+        def create_from_copied_context():
+            result_holder["created"] = json.loads(
+                cronjob(
+                    action="create",
+                    prompt="Worker thread should still be cron context",
+                    schedule="every 1h",
+                    name="Copied Context",
+                )
+            )
+
+        with cron_self_mutation_guard():
+            ctx = contextvars.copy_context()
+            thread = threading.Thread(target=lambda: ctx.run(create_from_copied_context))
+            thread.start()
+            thread.join(timeout=5)
+
+        assert thread.is_alive() is False
+        assert result_holder["created"]["success"] is False
+        assert "Cron jobs cannot create" in result_holder["created"]["error"]
+
+    def test_child_process_env_guard_blocks_mutation(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_MUTATION_GUARD", "1")
+        monkeypatch.setenv("HERMES_CRON_MUTATION_GUARD_OWNER_PID", "1")
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Child process should be blocked",
+                schedule="every 1h",
+                name="Child Process",
+            )
+        )
+
+        assert created["success"] is False
+        assert "Cron jobs cannot create" in created["error"]
 
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
