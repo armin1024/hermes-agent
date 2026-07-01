@@ -238,7 +238,78 @@ AOPS 上游统一通过 `send_message` 静默消息调用本地命令：
 - `/security`：返回当前审批策略。
 - `/security set <off|manual|smart>`：修改审批策略；`off` 会关闭破坏性 slash 二次确认。
 - `/reasoning`、`/reasoning status`、`/reasoning set ...`：读取或修改 reasoning 配置。
-- `/bash clawhub explore --json`、`/bash clawhub install <slug>`、`/bash clawhub uninstall <slug>`：静默 SkillHub/ClawHub 对接命令；`uninstall` 同样兼容本地技能 fallback。
+- `/bash clawhub explore --json`、`/bash clawhub install <slug>`、`/bash clawhub uninstall <slug>`：静默 SkillHub/ClawHub 对接命令；AOPS 安装路径只使用 `CLAWHUB_REGISTRY` 指向的内网 ClawHub/SkillHub 源，安装时优先使用 SkillHub `resolve/downloadUrl` 兼容接口并 fallback 到历史 download 端点；`install` 会忽略安全扫描阻断但保留扫描摘要，`uninstall` 同样兼容本地技能 fallback。
+
+### SkillHub / ClawHub 静默命令响应
+
+SkillHub 桥接响应统一使用：
+
+```json
+{
+  "schemaVersion": "aops.skillhub.result.v1",
+  "type": "commandResult",
+  "ok": true,
+  "command": "clawhub install aops-cli-explain",
+  "context": {
+    "parentMessageId": "1154867325",
+    "botId": null,
+    "agentId": "main",
+    "model": null,
+    "silent": true
+  },
+  "action": "install",
+  "slug": "aops-cli-explain",
+  "message": "Fetching: aops-cli-explain\nInstalled: aops-cli-explain",
+  "installedPath": "/home/oma/.hermes/skills/aops-cli-explain",
+  "scanIgnored": true,
+  "scanVerdict": "DANGEROUS",
+  "scanFindingsCount": 3
+}
+```
+
+字段说明：
+
+- `context.silent` 继承入站 `silent=true`；静默响应不回填会话标题。
+- `installedPath` 为 gateway 本机路径，只用于后台诊断，Tec01/Anyi UI 不应假设可直接访问。
+- `scanIgnored=true` 表示 AOPS 可信内网源安装时安全扫描告警不阻断安装；UI 可展示扫描结果，但不需要用户确认。
+- `/bash clawhub explore --json` 返回 `items[]`，每项至少包含 `slug`、`displayName`、`summary`、`tags`、`stats`、`updatedAt`、`latestVersion`。
+- `/bash clawhub uninstall <slug>` 返回 `action="uninstall"`；若目标不是 hub-installed 技能，会 fallback 到当前 profile 本地技能安全卸载，成功时 `source="local"`。
+
+常见错误响应：
+
+```json
+{
+  "schemaVersion": "aops.skillhub.result.v1",
+  "type": "commandResult",
+  "ok": false,
+  "command": "clawhub install aops-cli-explain",
+  "context": {
+    "parentMessageId": "3836521159",
+    "botId": null,
+    "agentId": "main",
+    "model": null,
+    "silent": true
+  },
+  "action": "install",
+  "slug": "aops-cli-explain",
+  "message": "Fetching: aops-cli-explain\nError: Could not fetch 'aops-cli-explain' from any source.\nClawHub: ClawHub rate limited request: 429 Too Many Requests url=http://skillhub.internal/api/v1/resolve/aops-cli-explain",
+  "installedPath": null,
+  "error": {
+    "code": "SKILLHUB_RATE_LIMITED",
+    "message": "SkillHub rate limited the install request; please retry later.",
+    "details": {
+      "slug": "aops-cli-explain"
+    }
+  }
+}
+```
+
+错误码：
+
+- `SKILLHUB_RATE_LIMITED`：内网 SkillHub 返回 HTTP 429。UI 应提示稍后重试，批量安装时建议排队限速；若后台配置了认证 token，可提高服务端限额。
+- `INSTALL_FAILED`：下载失败、包损坏、接口返回非 200、bundle 缺少 `SKILL.md` 或写入失败。`message` 会包含 ClawHub 底层状态码/URL/原因，供后台排查。
+- `UNINSTALL_FAILED`：hub 卸载失败且不能 fallback 本地卸载，或本地安全删除失败。
+- `EXPLORE_FAILED`：列表/浏览失败。
 
 ## 模型接口
 

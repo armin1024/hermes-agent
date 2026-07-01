@@ -118,9 +118,10 @@ AOPS 支持两种入站消息形态：
 
 行为说明：
 
-- `explore --json` 直接请求 ClawHub 列表接口，返回顶层 `items` 数组。
-- `install` 调用 Hermes Skills Hub 内部安装逻辑，等价强制、非交互安装。
-- `uninstall` 调用 Hermes Skills Hub 内部卸载逻辑，非交互执行。
+- `explore --json` 直接请求 ClawHub 列表接口，返回顶层 `items` 数组；gateway 内部使用短 TTL 缓存，降低高频列表请求触发 SkillHub 429 的概率。
+- `install` 调用 Hermes Skills Hub 内部安装逻辑，等价强制、非交互安装；AOPS 路径只使用 `CLAWHUB_REGISTRY` 指向的内网 ClawHub/SkillHub 源，优先通过 SkillHub `resolve/downloadUrl` 获取包地址，并兼容旧 `/download` 端点。
+- AOPS 内网源视为可信：扫描报告保留在 `message`、`scanIgnored`、`scanVerdict`、`scanFindingsCount` 中，但 `DANGEROUS/HIGH` 告警不会阻断安装。
+- `uninstall` 调用 Hermes Skills Hub 内部卸载逻辑，非交互执行；如果确认目标不是 hub-installed skill，会 fallback 到当前 profile 的本地技能安全卸载。
 - `install` 和 `uninstall` 会额外返回一条 `done: true` 的静默结果。
 - 其他 `/bash ...` 或不支持的 `clawhub` 子命令返回结构化错误。
 
@@ -147,7 +148,61 @@ CLAWHUB_REGISTRY=http://clawhub.internal
     "model": null,
     "silent": true
   },
-  "items": []
+ "items": []
+}
+```
+
+安装成功示例：
+
+```json
+{
+  "schemaVersion": "aops.skillhub.result.v1",
+  "type": "commandResult",
+  "ok": true,
+  "command": "clawhub install aops-cli-explain",
+  "context": {
+    "parentMessageId": "2106450358",
+    "botId": null,
+    "agentId": "main",
+    "model": null,
+    "silent": true
+  },
+  "action": "install",
+  "slug": "aops-cli-explain",
+  "message": "Fetching: aops-cli-explain\nInstalled: aops-cli-explain",
+  "installedPath": "/home/oma/.hermes/skills/aops-cli-explain",
+  "scanIgnored": true,
+  "scanVerdict": "SAFE",
+  "scanFindingsCount": 0
+}
+```
+
+限流失败示例：
+
+```json
+{
+  "schemaVersion": "aops.skillhub.result.v1",
+  "type": "commandResult",
+  "ok": false,
+  "command": "clawhub install aops-cli-explain",
+  "context": {
+    "parentMessageId": "2106450359",
+    "botId": null,
+    "agentId": "main",
+    "model": null,
+    "silent": true
+  },
+  "action": "install",
+  "slug": "aops-cli-explain",
+  "message": "Fetching: aops-cli-explain\nError: Could not fetch 'aops-cli-explain' from any source.\nClawHub: ClawHub rate limited request: 429 Too Many Requests url=http://skillhub.internal/api/v1/resolve/aops-cli-explain",
+  "installedPath": null,
+  "error": {
+    "code": "SKILLHUB_RATE_LIMITED",
+    "message": "SkillHub rate limited the install request; please retry later.",
+    "details": {
+      "slug": "aops-cli-explain"
+    }
+  }
 }
 ```
 
@@ -255,7 +310,7 @@ curl -fsSL "http://tec01.internal/hermes/install-oneclick.sh" | sudo bash -s -- 
 - `bundleUrl` / `bundleSha256`: tec01 管理的离线包地址和校验值。
 - `config.modelGateway`: 模型网关地址、模型名、API key。
 - `config.aops`: `AOPS_BOT_TOKEN`、`AOPS_BOT_URL`、`AOPS_HOME_CHANNEL`、`CLAWHUB_REGISTRY`、`AOPS_API_KEY`、`AOPS_CONNECT_TIMEOUT` 等。
-- `config.preinstallSkills`: 从 `CLAWHUB_REGISTRY` 预装的技能 slug 列表。
+- `config.preinstallSkills` / `skills.preinstall`: 从 `CLAWHUB_REGISTRY` 预装的技能 slug 列表。语义是 ensure-installed：新 profile 会安装，已存在 profile 缺失时补装；已安装技能默认不强制升级到最新版本。
 - `config.approvals.mode`: 使用官方 `approvals.mode` 取值，不自定义新值。
 - `config.display.busy_input_mode`: 使用官方 `display.busy_input_mode` 取值，不自定义新值。
 - `config.userInstructions.content`: 完整 Markdown，写入 `~/.hermes/memories/USER.md`。
@@ -300,6 +355,23 @@ curl "$CLAWHUB_REGISTRY/api/v1/skills?limit=1"
 ```
 
 如果 gateway 进程由 systemd 启动，确保 `CLAWHUB_REGISTRY` 在服务环境中可见，或写入运行用户的 `.bashrc` / `.profile`。
+
+### SkillHub 安装返回 `SKILLHUB_RATE_LIMITED`
+
+这是内网 SkillHub 返回 HTTP 429。常见触发方式是连续执行 `/bash clawhub install ...` 或一键安装预装多个技能，因为一次安装会经过 metadata、resolve、download 等多个接口；匿名请求通常比认证请求限额更低。
+
+处理建议：
+
+- Tec01 UI 批量安装时排队限速，避免 1 秒左右连续触发多次 install。
+- 优先给 gateway 配置内网 SkillHub 认证 token（如果 SkillHub 已支持），让请求走认证限额。
+- 保持 `CLAWHUB_REGISTRY` 指向内网 SkillHub，不要让安装回退到公网或其他源。
+- 如果要从根本上提高吞吐，需要在 SkillHub 服务端把 `skills`、`resolve`、`download` 的 `@RateLimit` 阈值改成可配置，或调高内网环境默认值。
+
+Hermes 侧已做的保护：
+
+- `/bash clawhub explore --json` 使用短 TTL 缓存，降低列表接口压力。
+- AOPS install 只走 `CLAWHUB_REGISTRY` 源，并优先使用 `resolve/downloadUrl`，减少接口不兼容导致的泛化失败。
+- 429 会返回 `error.code="SKILLHUB_RATE_LIMITED"`，不再只显示 `Could not fetch from any source`。
 
 ### 一个小时前的缓存文件没有被清理
 
