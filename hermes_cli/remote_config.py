@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import io
 import json
 import os
 import re
-import subprocess
 import sys
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -702,47 +703,69 @@ def _apply_hindsight_config(config_payload: dict[str, Any], options: dict[str, A
     return {"path": str(path), "backup": backup}
 
 
-def _skill_slugs(config_payload: dict[str, Any]) -> list[str]:
-    skills = config_payload.get("skills") or {}
+def _skill_slugs(payload: dict[str, Any]) -> list[str]:
+    config_payload = payload.get("config") or {}
+    skills = config_payload.get("skills")
+    if skills is None:
+        skills = payload.get("skills")
+    skills = skills or {}
     if skills and not isinstance(skills, dict):
-        raise RemoteConfigError("config.skills must be a JSON object")
+        raise RemoteConfigError("skills must be a JSON object")
     raw = skills.get("preinstall") or []
     if raw is None:
         return []
     if not isinstance(raw, list):
-        raise RemoteConfigError("config.skills.preinstall must be a list")
+        raise RemoteConfigError("skills.preinstall must be a list")
     slugs: list[str] = []
     for idx, item in enumerate(raw):
-        slug = _require_string(item, f"config.skills.preinstall[{idx}]")
+        slug = _require_string(item, f"skills.preinstall[{idx}]")
         slugs.append(slug)
     return slugs
 
 
 def _install_skill(slug: str) -> dict[str, Any]:
-    cmd = [
-        sys.executable,
-        "-m",
-        "hermes_cli.main",
-        "skills",
-        "install",
-        slug,
-        "--source",
-        "clawhub",
-        "--force",
-        "--yes",
-    ]
-    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    output = (proc.stdout or "").strip()
+    from rich.console import Console
+
+    from hermes_cli.skills_hub import do_install
+
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False, color_system=None, width=120)
+    return_code = 0
+    try:
+        with redirect_stdout(stream), redirect_stderr(stream):
+            do_install(
+                slug,
+                source="clawhub",
+                force=True,
+                skip_confirm=True,
+                invalidate_cache=True,
+                ignore_scan_policy=True,
+                console=console,
+            )
+    except Exception as exc:
+        return_code = 1
+        stream.write(f"\nError: {exc}")
+    output = stream.getvalue().strip()
+    failure_markers = (
+        "error:",
+        "installation blocked:",
+        "could not fetch",
+        "no skill named",
+        "cannot install",
+        "cancelled.",
+    )
+    failed = return_code != 0 or any(marker in output.lower() for marker in failure_markers)
     return {
         "slug": slug,
-        "status": "success" if proc.returncode == 0 else "failed",
-        "returnCode": proc.returncode,
+        "status": "failed" if failed else "success",
+        "returnCode": 1 if failed else 0,
+        "source": "clawhub",
         "output": output[-4000:],
     }
 
 
-def _install_skills(config_payload: dict[str, Any]) -> list[dict[str, Any]]:
-    return [_install_skill(slug) for slug in _skill_slugs(config_payload)]
+def _install_skills(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [_install_skill(slug) for slug in _skill_slugs(payload)]
 
 
 def schema() -> dict[str, Any]:
@@ -811,7 +834,7 @@ def apply_payload(path: str, *, skip_skills: bool = False) -> dict[str, Any]:
         user_instructions_result = _apply_user_instructions(config_payload, options)
         soul_result = _apply_soul(config_payload, options)
         hindsight_result = _apply_hindsight_config(config_payload, options)
-        skill_results = [] if skip_skills else _install_skills(config_payload)
+        skill_results = [] if skip_skills else _install_skills(payload)
     except Exception:
         _restore_file(env_path, env_backup)
         _restore_file(config_path, config_backup)

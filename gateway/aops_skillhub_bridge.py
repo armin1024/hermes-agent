@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import time
 from contextlib import contextmanager
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -18,6 +19,20 @@ import httpx
 from rich.console import Console
 
 from gateway.platforms.base import MessageEvent
+
+
+_MARKET_LIST_CACHE_TTL_SECONDS = 60.0
+_MARKET_LIST_CACHE: dict[str, Any] = {
+    "base_url": None,
+    "items": None,
+    "expires_at": 0.0,
+}
+
+
+class SkillHubRateLimitedError(RuntimeError):
+    def __init__(self, message: str, *, retry_after_seconds: int | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass(frozen=True)
@@ -238,18 +253,47 @@ def _market_item_from_raw(item: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _retry_after_seconds(resp: Any) -> int | None:
+    try:
+        raw = resp.headers.get("retry-after")
+    except Exception:
+        raw = None
+    try:
+        if raw is None or str(raw).strip() == "":
+            return None
+        return max(0, int(float(str(raw).strip())))
+    except (TypeError, ValueError):
+        return None
+
+
 def _list_market_items() -> list[dict[str, Any]]:
     base_url = _configure_clawhub_source_base_url()
+    now = time.monotonic()
+    if (
+        _MARKET_LIST_CACHE.get("base_url") == base_url
+        and isinstance(_MARKET_LIST_CACHE.get("items"), list)
+        and float(_MARKET_LIST_CACHE.get("expires_at") or 0.0) > now
+    ):
+        return list(_MARKET_LIST_CACHE["items"])
+
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     cursor: str | None = None
-    max_pages = 50
+    max_pages = 5
 
     for _ in range(max_pages):
-        params: dict[str, Any] = {"limit": 200}
+        params: dict[str, Any] = {"limit": 50}
         if cursor:
             params["cursor"] = cursor
         resp = httpx.get(f"{base_url}/skills", params=params, timeout=30)
+        if getattr(resp, "status_code", 200) == 429:
+            cached_items = _MARKET_LIST_CACHE.get("items")
+            if _MARKET_LIST_CACHE.get("base_url") == base_url and isinstance(cached_items, list):
+                return list(cached_items)
+            raise SkillHubRateLimitedError(
+                "SkillHub rate limited the skills listing request.",
+                retry_after_seconds=_retry_after_seconds(resp),
+            )
         resp.raise_for_status()
         data = resp.json()
         raw_items = data.get("items", data) if isinstance(data, dict) else data
@@ -267,6 +311,11 @@ def _list_market_items() -> list[dict[str, Any]]:
         if not isinstance(cursor, str) or not cursor:
             break
 
+    _MARKET_LIST_CACHE.update({
+        "base_url": base_url,
+        "items": list(items),
+        "expires_at": now + _MARKET_LIST_CACHE_TTL_SECONDS,
+    })
     return items
 
 
@@ -293,6 +342,16 @@ def _message_indicates_failure(message: str) -> bool:
         "not a hub-installed skill",
     )
     return any(marker in lowered for marker in failure_markers)
+
+
+def _message_indicates_rate_limit(message: str) -> bool:
+    lowered = message.lower()
+    return (
+        "429" in lowered
+        or "too many requests" in lowered
+        or "rate limit" in lowered
+        or "rate-limited" in lowered
+    )
 
 
 def _scan_policy_summary_from_message(message: str) -> dict[str, Any]:
@@ -348,6 +407,7 @@ def _install_skill(slug: str) -> tuple[bool, dict[str, Any]]:
             skip_confirm=True,
             invalidate_cache=True,
             ignore_scan_policy=True,
+            source="clawhub",
         )
     installed_path = _installed_path(slug)
     if _message_indicates_failure(message) or not installed_path:
@@ -361,10 +421,15 @@ def _install_skill(slug: str) -> tuple[bool, dict[str, Any]]:
     }
     payload.update(_scan_policy_summary_from_message(message))
     if not ok:
+        rate_limited = _message_indicates_rate_limit(message)
         payload["error"] = {
-            "code": "INSTALL_FAILED",
-            "message": message or f"Failed to install '{slug}'.",
-            "details": {},
+            "code": "SKILLHUB_RATE_LIMITED" if rate_limited else "INSTALL_FAILED",
+            "message": (
+                "SkillHub rate limited the install request; please retry later."
+                if rate_limited
+                else (message or f"Failed to install '{slug}'.")
+            ),
+            "details": {"slug": slug},
         }
     else:
         _refresh_skill_runtime()
@@ -448,6 +513,14 @@ def execute_silent_skillhub_command(event: MessageEvent) -> list[SkillHubBridgeR
                     },
                 )
             ]
+        except SkillHubRateLimitedError as exc:
+            return [_error_payload(
+                event,
+                command,
+                "SKILLHUB_RATE_LIMITED",
+                "SkillHub rate limited the skills listing request; please retry later.",
+                details={"retryAfterSeconds": exc.retry_after_seconds},
+            )]
         except Exception as exc:
             return [_error_payload(event, command, "EXPLORE_FAILED", str(exc))]
 

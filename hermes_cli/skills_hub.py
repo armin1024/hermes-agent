@@ -11,6 +11,7 @@ handler are thin wrappers that parse args and delegate.
 """
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -32,7 +33,21 @@ _console = Console()
 # Shared do_* functions
 # ---------------------------------------------------------------------------
 
-def _resolve_short_name(name: str, sources, console: Console) -> str:
+def _effective_source(source: str = "all", *, prefer_clawhub: bool = True) -> str:
+    source = str(source or "all").strip() or "all"
+    if prefer_clawhub and source == "all" and os.environ.get("CLAWHUB_REGISTRY", "").strip():
+        return "clawhub"
+    return source
+
+
+def _filter_sources(sources, source: str = "all", *, prefer_clawhub: bool = True):
+    source = _effective_source(source, prefer_clawhub=prefer_clawhub)
+    if source == "all":
+        return list(sources)
+    return [src for src in sources if src.source_id() == source]
+
+
+def _resolve_short_name(name: str, sources, console: Console, source_filter: str = "all") -> str:
     """
     Resolve a short skill name (e.g. 'pptx') to a full identifier by searching
     all sources. If exactly one match is found, returns its identifier. If multiple
@@ -44,7 +59,8 @@ def _resolve_short_name(name: str, sources, console: Console) -> str:
     c = console or _console
     c.print(f"[dim]Resolving '{name}'...[/]")
 
-    results = unified_search(name, sources, source_filter="all", limit=20)
+    source_filter = _effective_source(source_filter)
+    results = unified_search(name, sources, source_filter=source_filter, limit=20)
 
     # Filter to exact name matches (case-insensitive)
     exact = [r for r in results if r.name.lower() == name.lower()]
@@ -77,7 +93,8 @@ def _resolve_short_name(name: str, sources, console: Console) -> str:
         c.print()
         return ""
 
-    c.print(f"[bold red]Error:[/] No skill named '{name}' found in any source.\n")
+    source_label = "any source" if source_filter == "all" else f"{source_filter}"
+    c.print(f"[bold red]Error:[/] No skill named '{name}' found in {source_label}.\n")
     return ""
 
 
@@ -125,7 +142,8 @@ def _resolve_source_meta_and_bundle(identifier: str, sources):
                 meta = None
         try:
             bundle = src.fetch(identifier)
-        except Exception:
+        except Exception as exc:
+            setattr(src, "last_fetch_error", exc)
             bundle = None
         if bundle:
             matched_source = src
@@ -258,6 +276,7 @@ def do_search(query: str, source: str = "all", limit: int = 10,
     from tools.skills_hub import GitHubAuth, create_source_router, unified_search
 
     c = console or _console
+    source = _effective_source(source)
 
     auth = GitHubAuth()
     sources = create_source_router(auth)
@@ -328,6 +347,7 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
     page_size = max(1, min(page_size, 100))
 
     c = console or _console
+    source = _effective_source(source)
 
     auth = GitHubAuth()
     sources = create_source_router(auth)
@@ -479,7 +499,8 @@ def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True,
                name_override: str = "",
-               ignore_scan_policy: bool = False) -> None:
+               ignore_scan_policy: bool = False,
+               source: str = "all") -> None:
     """Fetch, quarantine, scan, confirm, and install a skill.
 
     ``name_override`` lets non-interactive callers (slash commands, gateway,
@@ -501,15 +522,22 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
 
     c = console or _console
+    identifier_is_short_slug = "/" not in identifier and not identifier.startswith(("http://", "https://"))
+    source = _effective_source(source, prefer_clawhub=identifier_is_short_slug)
     ensure_hub_dirs()
 
     # Resolve which source adapter handles this identifier
     auth = GitHubAuth()
-    sources = create_source_router(auth)
+    sources = _filter_sources(create_source_router(auth), source, prefer_clawhub=False)
+    if not sources:
+        c.print(f"[bold red]Error:[/] Unknown skill source: {source}\n")
+        return
 
-    # If identifier looks like a short name (no slashes), resolve it via search
-    if "/" not in identifier:
-        identifier = _resolve_short_name(identifier, sources, c)
+    # If identifier looks like a short name (no slashes), resolve it via search.
+    # ClawHub accepts the slug directly, so avoid an expensive catalog search
+    # for managed inner-net installs.
+    if identifier_is_short_slug and source != "clawhub":
+        identifier = _resolve_short_name(identifier, sources, c, source_filter=source)
         if not identifier:
             return
 
@@ -524,7 +552,19 @@ def do_install(identifier: str, category: str = "", force: bool = False,
             or getattr(getattr(src, "github", None), "is_rate_limited", False)
             for src in sources
         )
+        fetch_errors = [
+            getattr(src, "last_fetch_error", None)
+            for src in sources
+            if getattr(src, "last_fetch_error", None) is not None
+        ]
+        clawhub_rate_limited = any(
+            exc.__class__.__name__ == "ClawHubRateLimitError"
+            for exc in fetch_errors
+        )
         c.print(f"[bold red]Error:[/] Could not fetch '{identifier}' from any source.")
+        for exc in fetch_errors:
+            if exc.__class__.__name__.startswith("ClawHub"):
+                c.print(f"[yellow]ClawHub:[/] {exc}")
         if rate_limited:
             c.print(
                 "[yellow]Hint:[/] GitHub API rate limit exhausted "
@@ -533,6 +573,8 @@ def do_install(identifier: str, category: str = "", force: bool = False,
                 "[bold]gh[/] CLI and run [bold]gh auth login[/] "
                 "to raise the limit to 5,000/hr.\n"
             )
+        elif clawhub_rate_limited:
+            c.print("[yellow]Hint:[/] SkillHub/ClawHub returned HTTP 429; retry after the registry limit window resets.\n")
         else:
             c.print()
         return
@@ -1683,7 +1725,8 @@ def skills_command(args) -> None:
     elif action == "install":
         do_install(args.identifier, category=args.category, force=args.force,
                    skip_confirm=getattr(args, "yes", False),
-                   name_override=getattr(args, "name", "") or "")
+                   name_override=getattr(args, "name", "") or "",
+                   source=getattr(args, "source", "all") or "all")
     elif action == "inspect":
         do_inspect(args.identifier)
     elif action == "list":
@@ -1842,6 +1885,7 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         identifier = args[0]
         category = ""
         name_override = ""
+        source = "all"
         # Slash commands run inside prompt_toolkit where input() hangs.
         # Always skip confirmation — the user typing the command is implicit consent.
         skip_confirm = True
@@ -1854,9 +1898,11 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
                 category = args[i + 1]
             elif a == "--name" and i + 1 < len(args):
                 name_override = args[i + 1]
+            elif a == "--source" and i + 1 < len(args):
+                source = args[i + 1]
         do_install(identifier, category=category, force=force,
                    skip_confirm=skip_confirm, invalidate_cache=invalidate_cache,
-                   name_override=name_override, console=c)
+                   name_override=name_override, source=source, console=c)
 
     elif action == "inspect":
         if not args:

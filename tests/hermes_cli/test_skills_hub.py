@@ -576,6 +576,60 @@ def test_install_ignore_scan_policy_installs_dangerous_skill(monkeypatch, tmp_pa
     assert "verdict=dangerous findings=1" in out
 
 
+def test_search_defaults_to_clawhub_when_registry_configured(monkeypatch):
+    import hermes_cli.skills_hub as skills_hub
+
+    seen = {}
+
+    def fake_unified_search(query, sources, source_filter="all", limit=10):
+        seen["source_filter"] = source_filter
+        return []
+
+    monkeypatch.setenv("CLAWHUB_REGISTRY", "http://tec01.internal/clawhub")
+    monkeypatch.setattr("tools.skills_hub.create_source_router", lambda auth: [])
+    monkeypatch.setattr("tools.skills_hub.unified_search", fake_unified_search)
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    skills_hub.do_search("ops", console=console)
+
+    assert seen["source_filter"] == "clawhub"
+
+
+def test_install_clawhub_slug_does_not_resolve_all_sources(monkeypatch, tmp_path, hub_env):
+    class _ClawHubSource:
+        def source_id(self):
+            return "clawhub"
+
+        def inspect(self, identifier):
+            return type("Meta", (), {
+                "extra": {},
+                "identifier": identifier,
+            })()
+
+        def fetch(self, identifier):
+            return type("Bundle", (), {
+                "name": identifier,
+                "files": {"SKILL.md": "# body\n"},
+                "source": "clawhub",
+                "identifier": identifier,
+                "trust_level": "community",
+                "metadata": {},
+            })()
+
+    installs = _install_mocks(monkeypatch, tmp_path, lambda: _ClawHubSource())
+    monkeypatch.setattr(
+        "hermes_cli.skills_hub._resolve_short_name",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("short-name resolver should not run")),
+    )
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install("tec01-review", source="clawhub", console=console, skip_confirm=True, force=True)
+
+    assert installs == [{"name": "tec01-review", "category": ""}]
+
+
 def test_url_install_rejects_invalid_name_override(monkeypatch, tmp_path, hub_env):
     installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
 
@@ -871,3 +925,106 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     assert payload[0]["source"] == "browse-sh"
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
+
+
+def test_clawhub_get_json_raises_rate_limit(monkeypatch):
+    import tools.skills_hub as hub
+
+    class _Resp:
+        status_code = 429
+        headers = {"retry-after": "9"}
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(hub.httpx, "get", lambda *args, **kwargs: _Resp())
+
+    source = hub.ClawHubSource()
+    with pytest.raises(hub.ClawHubRateLimitError) as exc:
+        source._get_json("http://clawhub.internal/api/v1/skills/demo")
+
+    assert "429 Too Many Requests" in str(exc.value)
+    assert exc.value.retry_after == "9"
+
+
+def test_clawhub_fetch_uses_resolve_download_url_when_detail_missing(monkeypatch):
+    import io
+    import zipfile
+
+    import tools.skills_hub as hub
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as zf:
+        zf.writestr("SKILL.md", "# Demo\n")
+
+    calls = []
+
+    class _Resp:
+        def __init__(self, url, status_code=200, data=None, content=b"", text=""):
+            self.url = url
+            self.status_code = status_code
+            self._data = data
+            self.content = content
+            self.text = text
+            self.headers = {}
+
+        def json(self):
+            return self._data
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith("/skills/demo"):
+            return _Resp(url, status_code=404, text="not found")
+        if url.endswith("/resolve/demo"):
+            return _Resp(
+                url,
+                data={
+                    "match": {"version": "1.0.0"},
+                    "downloadUrl": "/api/v1/skills/global/demo/versions/1.0.0/download",
+                },
+            )
+        if url == "http://skillhub.internal/api/v1/skills/global/demo/versions/1.0.0/download":
+            return _Resp(url, content=zip_buffer.getvalue())
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setenv("CLAWHUB_REGISTRY", "http://skillhub.internal")
+    monkeypatch.setattr(hub.httpx, "get", fake_get)
+
+    bundle = hub.ClawHubSource().fetch("demo")
+
+    assert bundle is not None
+    assert bundle.files["SKILL.md"] == "# Demo\n"
+    assert bundle.identifier == "demo"
+    assert any(call[0].endswith("/resolve/demo") for call in calls)
+
+
+def test_do_install_prints_clawhub_fetch_error_details(monkeypatch, tmp_path, hub_env):
+    import tools.skills_hub as hub
+
+    class _ClawHubSource:
+        def source_id(self):
+            return "clawhub"
+
+        def inspect(self, identifier):
+            return None
+
+        def fetch(self, identifier):
+            raise hub.ClawHubFetchError(
+                "http://skillhub.internal/api/v1/download/demo",
+                status_code=403,
+                reason="download endpoint returned non-200",
+                body="forbidden",
+            )
+
+    installs = _install_mocks(monkeypatch, tmp_path, lambda: _ClawHubSource())
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install("demo", source="clawhub", console=console, skip_confirm=True, force=True)
+
+    out = sink.getvalue()
+    assert installs == []
+    assert "Could not fetch 'demo' from any source" in out
+    assert "ClawHub:" in out
+    assert "status=403" in out
+    assert "forbidden" in out

@@ -92,6 +92,59 @@ def test_remote_config_applies_allowed_fields(tmp_path, monkeypatch):
     assert hindsight_cfg["timeout"] == 120
 
 
+def test_remote_config_installs_top_level_preinstall_skills(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    calls = []
+
+    def fake_do_install(slug, **kwargs):
+        calls.append((slug, kwargs))
+        kwargs["console"].print("installed")
+
+    monkeypatch.setattr("hermes_cli.skills_hub.do_install", fake_do_install)
+    path = tmp_path / "task.json"
+    path.write_text(
+        json.dumps({"skills": {"preinstall": ["tec01-review", "tec01-ops"]}}),
+        encoding="utf-8",
+    )
+
+    from hermes_cli.remote_config import apply_payload
+
+    result = apply_payload(str(path))
+
+    assert result["skills"] == [
+        {"slug": "tec01-review", "status": "success", "returnCode": 0, "source": "clawhub", "output": "installed"},
+        {"slug": "tec01-ops", "status": "success", "returnCode": 0, "source": "clawhub", "output": "installed"},
+    ]
+    assert [slug for slug, _kwargs in calls] == ["tec01-review", "tec01-ops"]
+    assert all(kwargs["source"] == "clawhub" for _slug, kwargs in calls)
+    assert all(kwargs["ignore_scan_policy"] is True for _slug, kwargs in calls)
+
+
+def test_remote_config_installs_config_preinstall_skills(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    calls = []
+
+    def fake_do_install(slug, **kwargs):
+        calls.append((slug, kwargs))
+        kwargs["console"].print("installed")
+
+    monkeypatch.setattr("hermes_cli.skills_hub.do_install", fake_do_install)
+    path = tmp_path / "task.json"
+    path.write_text(
+        json.dumps({"config": {"skills": {"preinstall": ["tec01-review"]}}}),
+        encoding="utf-8",
+    )
+
+    from hermes_cli.remote_config import apply_payload
+
+    result = apply_payload(str(path))
+
+    assert result["skills"][0]["slug"] == "tec01-review"
+    assert len(calls) == 1
+
+
 def test_remote_config_rejects_invalid_official_enum(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     path = tmp_path / "task.json"

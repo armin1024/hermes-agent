@@ -65,6 +65,12 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "json.dumps(sys.argv[2:]" in script
     assert "set_items = json.loads" in script
     assert "decode_markdown_escapes" in script
+    assert "top_level_skills = payload.get(\"skills\")" in script
+    assert "config_block[\"skills\"] = deepcopy(top_level_skills)" in script
+    assert "install_preinstall_skills" in script
+    assert "--skip-skills" in script
+    assert "skills-preinstall-result.json" in script
+    assert "hub.create_source_router = lambda auth=None: [ClawHubSource()]" in script
     assert 'name = "default"' in script
     assert "restartOtherRunningProfilesAfterUpgrade" in script
     assert "restart_other_running_profiles_after_upgrade" in script
@@ -110,6 +116,35 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert '"terminal"' in script
     assert '"browser"' in script
     assert "--config-payload" not in script
+
+
+def test_tec01_oneclick_aops_validation_is_lightweight():
+    script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
+    start = script.index("validate_aops_gateway_config_for_profile()")
+    end = script.index("print_restart_summary()", start)
+    validation = script[start:end]
+    python_body = validation.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+
+    assert "from gateway.config import" not in validation
+    assert "load_gateway_config" not in validation
+    assert "discover_plugins" not in validation
+    assert "get_connected_platforms" not in validation
+    assert "${" not in python_body
+    assert '"' not in python_body
+    assert "chr(34)" in python_body
+    assert "chr(36) + chr(123)" in python_body
+    assert "yaml.safe_load" in validation
+    assert "AOPS_BOT_TOKEN" in validation
+    assert "AOPS_BOT_URL" in validation
+    assert "AOPS_BASE_URL" in validation
+    assert "connectedPlatforms" in validation
+
+
+def test_dist_oneclick_aops_validation_matches_source_script():
+    source = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
+    dist = Path("dist-aops-latest/install-oneclick.sh").read_text(encoding="utf-8")
+
+    assert dist == source
 
 
 def test_aops_profile_template_defaults_to_terminal_linux_toolsets():

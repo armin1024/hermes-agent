@@ -552,6 +552,15 @@ def render(node):
 
 payload = render(payload)
 
+# Backward-compatible skill preinstall placement:
+# older runtimes only read config.skills.preinstall, while templates used by
+# Tec01 may place the user-facing block at top-level skills.preinstall.
+top_level_skills = payload.get("skills")
+if isinstance(top_level_skills, dict):
+    config_block = payload.setdefault("config", {})
+    if isinstance(config_block, dict) and "skills" not in config_block:
+        config_block["skills"] = deepcopy(top_level_skills)
+
 # Apply overrides into their runtime destinations, even when the built-in
 # template did not explicitly reference that key.
 for key, value in overrides.items():
@@ -1400,6 +1409,100 @@ PY
   fi
 }
 
+install_preinstall_skills() {
+  local profile="$1"
+  local profile_dir
+  profile_dir="$(profile_home_for "$profile")"
+  STAGE="skills_preinstall"
+  log "Installing preinstall skill(s) into profile $profile"
+  run_as_target "$(shell_quote "$INSTALL_DIR/venv/bin/python") - $(shell_quote "$PAYLOAD_JSON") $(shell_quote "$profile_dir") <<'PY'
+import inspect
+import io
+import json
+import os
+import sys
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+payload_path = Path(sys.argv[1])
+profile_dir = Path(sys.argv[2])
+os.environ['HERMES_HOME'] = str(profile_dir)
+
+try:
+    from hermes_cli.env_loader import load_hermes_dotenv
+    load_hermes_dotenv(hermes_home=profile_dir)
+except Exception:
+    pass
+
+payload = json.loads(payload_path.read_text(encoding='utf-8'))
+
+def _dict(value):
+    return value if isinstance(value, dict) else {}
+
+config_skills = _dict(_dict(payload.get('config')).get('skills'))
+top_skills = _dict(payload.get('skills'))
+skills = config_skills or top_skills
+raw = skills.get('preinstall') if isinstance(skills, dict) else []
+if raw is None:
+    raw = []
+if not isinstance(raw, list):
+    raise SystemExit('skills.preinstall must be a list')
+slugs = [str(item).strip() for item in raw if str(item or '').strip()]
+
+installed = []
+if slugs:
+    from rich.console import Console
+    from hermes_cli.skills_hub import do_install
+    import tools.skills_hub as hub
+    from tools.skills_hub import ClawHubSource
+
+    original_router = hub.create_source_router
+    hub.create_source_router = lambda auth=None: [ClawHubSource()]
+    try:
+        params = inspect.signature(do_install).parameters
+        for slug in slugs:
+            stream = io.StringIO()
+            console = Console(file=stream, force_terminal=False, color_system=None, width=120)
+            status = 'success'
+            try:
+                kwargs = {
+                    'force': True,
+                    'skip_confirm': True,
+                    'console': console,
+                }
+                if 'invalidate_cache' in params:
+                    kwargs['invalidate_cache'] = True
+                if 'ignore_scan_policy' in params:
+                    kwargs['ignore_scan_policy'] = True
+                if 'source' in params:
+                    kwargs['source'] = 'clawhub'
+                with redirect_stdout(stream), redirect_stderr(stream):
+                    do_install(slug, **kwargs)
+            except Exception as exc:
+                status = 'failed'
+                stream.write(chr(10) + 'Error: ' + str(exc))
+            output = stream.getvalue().strip()
+            lowered = output.lower()
+            for marker in ('error:', 'installation blocked:', 'could not fetch', 'no skill named', 'cannot install', 'cancelled.'):
+                if marker in lowered:
+                    status = 'failed'
+                    break
+            installed.append({
+                'skill': slug,
+                'status': status,
+                'source': 'clawhub',
+                'output': output[-4000:],
+            })
+    finally:
+        hub.create_source_router = original_router
+
+print(json.dumps({'installed': installed}, ensure_ascii=False))
+PY"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown -R "$TARGET_USER":"$TARGET_USER" "$profile_dir/skills" 2>/dev/null || true
+  fi
+}
+
 json_file_has_runtime_relevant_changes() {
   local path="$1"
   python3 - "$path" <<'PY'
@@ -1518,23 +1621,125 @@ result = {
 }
 
 try:
-    from hermes_cli.env_loader import load_hermes_dotenv
-    load_hermes_dotenv(hermes_home=profile_dir)
-    from gateway.config import Platform, load_gateway_config
+    env_path = profile_dir / '.env'
 
-    cfg = load_gateway_config()
-    result['connectedPlatforms'] = [p.value for p in cfg.get_connected_platforms()]
-    aops = cfg.platforms.get(Platform.AOPS)
-    if aops is not None:
-        result['aops'] = {
-            'present': True,
-            'enabled': bool(aops.enabled),
-            'hasToken': bool(str(aops.token or '').strip()),
-            'baseUrl': str((aops.extra or {}).get('base_url') or ''),
-        }
-    else:
-        result['aops'] = {'present': False}
-    result['ok'] = 'aops' in result['connectedPlatforms']
+    def _read_dotenv(path):
+        values = {}
+        if not path.exists():
+            return values
+        for raw_line in path.read_text(encoding='utf-8').splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            key = key.strip()
+            value = value.strip()
+            if (len(value) >= 2) and value[0] == value[-1] and value[0] in {chr(34), chr(39)}:
+                value = value[1:-1]
+            values[key] = value
+        return values
+
+    dotenv_values = _read_dotenv(env_path)
+    for key, value in dotenv_values.items():
+        os.environ.setdefault(key, value)
+
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+        load_hermes_dotenv(hermes_home=profile_dir)
+    except Exception:
+        pass
+
+    config_path = profile_dir / 'config.yaml'
+    config_data = {}
+    if config_path.exists():
+        import yaml
+        loaded = yaml.safe_load(config_path.read_text(encoding='utf-8')) or {}
+        if isinstance(loaded, dict):
+            config_data = loaded
+
+    def _dict(value):
+        return value if isinstance(value, dict) else {}
+
+    def _deep_get(data, *keys):
+        cur = data
+        for key in keys:
+            if not isinstance(cur, dict):
+                return {}
+            cur = cur.get(key)
+        return _dict(cur)
+
+    def _clean(value):
+        return str(value or '').strip()
+
+    def _env(name):
+        return _clean(os.environ.get(name) or dotenv_values.get(name))
+
+    def _expand(value):
+        text = _clean(value)
+        placeholder_prefix = chr(36) + chr(123)
+        if text.startswith(placeholder_prefix) and text.endswith('}'):
+            name = text[2:-1].strip()
+            if name.startswith('env.'):
+                name = name[4:]
+            return _env(name)
+        return text
+
+    def _bool_or_none(value):
+        if isinstance(value, bool):
+            return value
+        text = _clean(value).lower()
+        if text in {'1', 'true', 'yes', 'y', 'on'}:
+            return True
+        if text in {'0', 'false', 'no', 'n', 'off'}:
+            return False
+        return None
+
+    blocks = [
+        _deep_get(config_data, 'gateway', 'platforms', 'aops'),
+        _deep_get(config_data, 'platforms', 'aops'),
+        _deep_get(config_data, 'aops'),
+    ]
+    merged = {}
+    merged_extra = {}
+    explicit_enabled = None
+    for block in blocks:
+        if not block:
+            continue
+        extra = _dict(block.get('extra'))
+        merged.update({k: v for k, v in block.items() if k != 'extra'})
+        merged_extra.update(extra)
+        if 'enabled' in block:
+            parsed_enabled = _bool_or_none(block.get('enabled'))
+            if parsed_enabled is not None:
+                explicit_enabled = parsed_enabled
+
+    token = (
+        _env('AOPS_BOT_TOKEN')
+        or _expand(merged.get('token'))
+        or _expand(merged.get('bot_token'))
+        or _expand(merged.get('AOPS_BOT_TOKEN'))
+    )
+    base_url = (
+        _env('AOPS_BOT_URL')
+        or _expand(merged_extra.get('base_url'))
+        or _expand(merged_extra.get('baseUrl'))
+        or _expand(merged.get('base_url'))
+        or _expand(merged.get('baseUrl'))
+        or _env('AOPS_BASE_URL')
+    ).rstrip('/')
+    present = bool(token or base_url or any(blocks))
+    enabled = explicit_enabled if explicit_enabled is not None else present
+    has_token = bool(token)
+    has_base_url = bool(base_url)
+    result['aops'] = {
+        'present': present,
+        'enabled': bool(enabled),
+        'hasToken': has_token,
+        'baseUrl': base_url,
+    }
+    if present and enabled and has_token and has_base_url:
+        result['connectedPlatforms'] = ['aops']
+        result['ok'] = True
 except Exception as exc:
     result['error'] = str(exc)
 
@@ -1624,6 +1829,7 @@ ensure_target_private_dir "$WORK_DIR"
 PAYLOAD_IN_HOME="$WORK_DIR/tec01-payload.json"
 PROFILE_JSON="$WORK_DIR/profile.json"
 APPLY_RESULT_JSON="$WORK_DIR/remote-config-apply.json"
+PREINSTALL_RESULT_JSON="$WORK_DIR/skills-preinstall-result.json"
 SKILLS_RESULT_JSON="$WORK_DIR/skills-install-result.json"
 RESTART_SUMMARY_JSON="$WORK_DIR/restart-summary.json"
 python3 - "$RESTART_SUMMARY_JSON" <<'PY'
@@ -1729,15 +1935,23 @@ fi
 
 STAGE="apply_profile_config"
 mark_payload_mode "$([[ "$PROFILE_ACTION" == "update" ]] && echo true || echo false)"
-run_as_target "'$INSTALL_DIR/venv/bin/python' -m hermes_cli.remote_config apply --payload '$PAYLOAD_JSON' --profile '$PROFILE_NAME'" | tee "$APPLY_RESULT_JSON"
+run_as_target "'$INSTALL_DIR/venv/bin/python' -m hermes_cli.remote_config apply --payload '$PAYLOAD_JSON' --profile '$PROFILE_NAME' --skip-skills" | tee "$APPLY_RESULT_JSON"
 APPLY_CHANGED="$(json_file_has_runtime_relevant_changes "$APPLY_RESULT_JSON")"
 
 STAGE="validate_aops_gateway_config"
 log "Validating AOPS gateway config for profile $PROFILE_NAME"
 validate_aops_gateway_config_for_profile "$PROFILE_NAME" | tee "$WORK_DIR/aops-gateway-config-check.json"
 
+install_preinstall_skills "$PROFILE_NAME" | tee "$PREINSTALL_RESULT_JSON"
+PREINSTALL_CHANGED="$(skills_result_has_changes "$PREINSTALL_RESULT_JSON")"
+
 install_skill_zips "$PROFILE_NAME" | tee "$SKILLS_RESULT_JSON"
-SKILLS_CHANGED="$(skills_result_has_changes "$SKILLS_RESULT_JSON")"
+SKILL_ZIPS_CHANGED="$(skills_result_has_changes "$SKILLS_RESULT_JSON")"
+if [[ "$PREINSTALL_CHANGED" == true || "$SKILL_ZIPS_CHANGED" == true ]]; then
+  SKILLS_CHANGED=true
+else
+  SKILLS_CHANGED=false
+fi
 
 STAGE="disable_gateway_lazy_installs"
 LAZY_INSTALLS_RESULT_JSON="$WORK_DIR/gateway-lazy-installs.json"

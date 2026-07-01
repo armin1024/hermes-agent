@@ -28,7 +28,7 @@ from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
 from agent.skill_utils import is_excluded_skill_path
 from typing import Any, Dict, List, Optional, Tuple, Union
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 
 import httpx
 import yaml
@@ -89,6 +89,42 @@ class SkillBundle:
     identifier: str
     trust_level: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class ClawHubRateLimitError(RuntimeError):
+    """Raised when the ClawHub-compatible registry returns HTTP 429."""
+
+    def __init__(self, url: str, retry_after: Optional[str] = None):
+        retry = f" retry_after={retry_after}" if retry_after else ""
+        super().__init__(f"ClawHub rate limited request: 429 Too Many Requests url={url}{retry}")
+        self.url = url
+        self.retry_after = retry_after
+
+
+class ClawHubFetchError(RuntimeError):
+    """Raised when the ClawHub-compatible registry cannot provide a skill bundle."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        status_code: int | None = None,
+        reason: str = "",
+        body: str = "",
+    ):
+        details = []
+        if status_code is not None:
+            details.append(f"status={status_code}")
+        if reason:
+            details.append(f"reason={reason}")
+        if body:
+            details.append(f"body={body[:300]}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        super().__init__(f"ClawHub fetch failed url={url}{suffix}")
+        self.url = url
+        self.status_code = status_code
+        self.reason = reason
+        self.body = body
 
 
 def _normalize_bundle_path(path_value: str, *, field_name: str, allow_nested: bool) -> str:
@@ -1986,6 +2022,27 @@ class ClawHubSource(SkillSource):
             return merged
         return data
 
+    @classmethod
+    def _absolute_registry_url(cls, url: str) -> str:
+        text = str(url or "").strip()
+        if not text:
+            return text
+        if text.startswith(("http://", "https://")):
+            return text
+        if text.startswith("/"):
+            parsed = urlparse(cls.configured_base_url())
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            return urljoin(origin, text)
+        return urljoin(f"{cls.configured_base_url().rstrip('/')}/", text)
+
+    @staticmethod
+    def _response_preview(resp: httpx.Response) -> str:
+        try:
+            text = resp.text
+        except Exception:
+            return ""
+        return " ".join(text.strip().split())[:300]
+
     @staticmethod
     def _query_terms(query: str) -> List[str]:
         return [term for term in re.split(r"[^a-z0-9]+", query.lower()) if term]
@@ -2187,21 +2244,41 @@ class ClawHubSource(SkillSource):
     def fetch(self, identifier: str) -> Optional[SkillBundle]:
         slug = identifier.split("/")[-1]
 
-        skill_data = self._get_json(f"{self.configured_base_url()}/skills/{slug}")
-        if not isinstance(skill_data, dict):
-            return None
+        skill_data = self._get_json(f"{self.configured_base_url()}/skills/{quote(slug, safe='')}")
+        skill_payload = self._coerce_skill_payload(skill_data)
 
-        latest_version = self._resolve_latest_version(slug, skill_data)
+        resolve_data = self._resolve_clawhub_skill(slug)
+        if skill_payload is None and isinstance(resolve_data, dict):
+            # Some SkillHub deployments expose resolve/download compatibility
+            # but make `/skills/{slug}` stricter (for example when a legacy
+            # slug maps to a namespaced canonical slug). Keep installing from
+            # the compatible path instead of failing after a successful list.
+            skill_payload = resolve_data
+
+        if not isinstance(skill_payload, dict):
+            raise ClawHubFetchError(
+                f"{self.configured_base_url()}/skills/{slug}",
+                reason="skill metadata not found",
+            )
+
+        latest_version = self._resolve_latest_version(slug, skill_payload, resolve_data)
         if not latest_version:
             logger.warning("ClawHub fetch failed for %s: could not resolve latest version", slug)
-            return None
+            latest_version = "latest"
 
-        # Primary method: download the skill as a ZIP bundle from /download
-        files = self._download_zip(slug, latest_version)
+        canonical_slug = self._canonical_slug_from_payload(slug, skill_payload)
+        download_url = self._download_url_from_payload(resolve_data)
+
+        # Primary method: download using the registry-provided URL when
+        # present, then fall back across the historical ClawHub-compatible
+        # endpoint shapes used by SkillHub deployments.
+        files = self._download_zip(canonical_slug, latest_version, download_url=download_url)
 
         # Fallback: try the version metadata endpoint for inline/raw content
         if "SKILL.md" not in files:
-            version_data = self._get_json(f"{self.configured_base_url()}/skills/{slug}/versions/{latest_version}")
+            version_data = self._get_json(
+                f"{self.configured_base_url()}/skills/{quote(canonical_slug, safe='')}/versions/{quote(latest_version, safe='')}"
+            )
             if isinstance(version_data, dict):
                 # Files may be nested under version_data["version"]["files"]
                 files = self._extract_files(version_data) or files
@@ -2216,13 +2293,16 @@ class ClawHubSource(SkillSource):
                 slug,
                 latest_version,
             )
-            return None
+            raise ClawHubFetchError(
+                f"{self.configured_base_url()}/download",
+                reason=f"downloaded bundle missing SKILL.md for {canonical_slug}@{latest_version}",
+            )
 
         return SkillBundle(
-            name=slug,
+            name=canonical_slug.split("--")[-1] or slug,
             files=files,
             source="clawhub",
-            identifier=slug,
+            identifier=canonical_slug,
             trust_level="community",
         )
 
@@ -2354,20 +2434,57 @@ class ClawHubSource(SkillSource):
             _write_index_cache(cache_key, [_skill_meta_to_dict(s) for s in results])
         return results
 
-    def _get_json(self, url: str, timeout: int = 20) -> Optional[Any]:
+    def _get_json(
+        self,
+        url: str,
+        timeout: int = 20,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Any]:
         try:
-            resp = httpx.get(url, timeout=timeout)
+            resp = httpx.get(url, params=params, timeout=timeout)
+            if resp.status_code == 429:
+                raise ClawHubRateLimitError(url, resp.headers.get("retry-after"))
             if resp.status_code != 200:
                 return None
             return resp.json()
         except (httpx.HTTPError, json.JSONDecodeError):
             return None
 
-    def _resolve_latest_version(self, slug: str, skill_data: Dict[str, Any]) -> Optional[str]:
-        latest = skill_data.get("latestVersion")
-        if isinstance(latest, dict):
-            version = latest.get("version")
+    def _resolve_clawhub_skill(self, slug: str) -> Optional[Dict[str, Any]]:
+        quoted = quote(slug, safe="")
+        data = self._get_json(f"{self.configured_base_url()}/resolve/{quoted}")
+        if isinstance(data, dict):
+            return data
+        return self._get_json(
+            f"{self.configured_base_url()}/resolve",
+            params={"slug": slug, "version": "latest"},
+        )
+
+    @staticmethod
+    def _version_from_info(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            version = value.get("version")
             if isinstance(version, str) and version:
+                return version
+        return None
+
+    def _resolve_latest_version(
+        self,
+        slug: str,
+        skill_data: Dict[str, Any],
+        resolve_data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        latest = skill_data.get("latestVersion")
+        version = self._version_from_info(latest)
+        if version:
+            return version
+
+        if isinstance(resolve_data, dict):
+            version = self._version_from_info(resolve_data.get("match"))
+            if version:
+                return version
+            version = self._version_from_info(resolve_data.get("latestVersion"))
+            if version:
                 return version
 
         tags = skill_data.get("tags")
@@ -2376,13 +2493,35 @@ class ClawHubSource(SkillSource):
             if isinstance(latest_tag, str) and latest_tag:
                 return latest_tag
 
-        versions_data = self._get_json(f"{self.configured_base_url()}/skills/{slug}/versions")
+        versions_data = self._get_json(f"{self.configured_base_url()}/skills/{quote(slug, safe='')}/versions")
         if isinstance(versions_data, list) and versions_data:
             first = versions_data[0]
             if isinstance(first, dict):
                 version = first.get("version")
                 if isinstance(version, str) and version:
                     return version
+        return None
+
+    @staticmethod
+    def _canonical_slug_from_payload(fallback_slug: str, payload: Dict[str, Any]) -> str:
+        for value in (payload.get("slug"), payload.get("canonicalSlug"), payload.get("id")):
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return fallback_slug
+
+    def _download_url_from_payload(self, payload: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        for key in ("downloadUrl", "download_url", "url"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return self._absolute_registry_url(value)
+        for key in ("match", "latestVersion", "version"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                nested_url = self._download_url_from_payload(nested)
+                if nested_url:
+                    return nested_url
         return None
 
     def _extract_files(self, version_data: Dict[str, Any]) -> Dict[str, str]:
@@ -2416,67 +2555,102 @@ class ClawHubSource(SkillSource):
 
         return files
 
-    def _download_zip(self, slug: str, version: str) -> Dict[str, str]:
+    def _download_zip(self, slug: str, version: str, *, download_url: Optional[str] = None) -> Dict[str, str]:
         """Download skill as a ZIP bundle from the /download endpoint and extract text files."""
         import io
         import zipfile
 
         files: Dict[str, str] = {}
         max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                resp = httpx.get(
-                    f"{self.configured_base_url()}/download",
-                    params={"slug": slug, "version": version},
-                    timeout=30,
-                    follow_redirects=True,
-                )
-                if resp.status_code == 429:
-                    try:
-                        retry_after = int(resp.headers.get("retry-after", "5"))
-                    except (ValueError, TypeError):
-                        retry_after = 5
-                    retry_after = min(retry_after, 15)  # Cap wait time
-                    logger.debug(
-                        "ClawHub download rate-limited for %s, retrying in %ds (attempt %d/%d)",
-                        slug, retry_after, attempt + 1, max_retries,
+        last_rate_limited = False
+        last_error: ClawHubFetchError | None = None
+        quoted_slug = quote(slug, safe="")
+        quoted_version = quote(version, safe="")
+        candidates: list[tuple[str, Optional[dict[str, str]]]] = []
+        if download_url:
+            candidates.append((download_url, None))
+        candidates.extend([
+            (f"{self.configured_base_url()}/download/{quoted_slug}/{quoted_version}", None),
+            (f"{self.configured_base_url()}/download/{quoted_slug}", {"version": version}),
+            (f"{self.configured_base_url()}/download", {"slug": slug, "version": version}),
+        ])
+
+        seen_candidates: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        for url, params in candidates:
+            params_key = tuple(sorted((params or {}).items()))
+            candidate_key = (url, params_key)
+            if candidate_key in seen_candidates:
+                continue
+            seen_candidates.add(candidate_key)
+
+            for attempt in range(max_retries):
+                try:
+                    resp = httpx.get(
+                        url,
+                        params=params,
+                        timeout=30,
+                        follow_redirects=True,
                     )
-                    time.sleep(retry_after)
-                    continue
-                if resp.status_code != 200:
-                    logger.debug("ClawHub ZIP download for %s v%s returned %s", slug, version, resp.status_code)
+                    if resp.status_code == 429:
+                        last_rate_limited = True
+                        try:
+                            retry_after = int(resp.headers.get("retry-after", "5"))
+                        except (ValueError, TypeError):
+                            retry_after = 5
+                        retry_after = min(retry_after, 15)  # Cap wait time
+                        logger.debug(
+                            "ClawHub download rate-limited for %s, retrying in %ds (attempt %d/%d)",
+                            slug, retry_after, attempt + 1, max_retries,
+                        )
+                        time.sleep(retry_after)
+                        continue
+                    last_rate_limited = False
+                    if resp.status_code != 200:
+                        logger.debug("ClawHub ZIP download for %s v%s returned %s", slug, version, resp.status_code)
+                        last_error = ClawHubFetchError(
+                            str(resp.url),
+                            status_code=resp.status_code,
+                            reason="download endpoint returned non-200",
+                            body=self._response_preview(resp),
+                        )
+                        break
+
+                    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                        for info in zf.infolist():
+                            if info.is_dir():
+                                continue
+                            try:
+                                name = _validate_bundle_rel_path(info.filename)
+                            except ValueError:
+                                logger.debug("Skipping unsafe ZIP member path: %s", info.filename)
+                                continue
+                            # Only extract text-sized files (skip large binaries)
+                            if info.file_size > 500_000:
+                                logger.debug("Skipping large file in ZIP: %s (%d bytes)", name, info.file_size)
+                                continue
+                            try:
+                                raw = zf.read(info.filename)
+                                files[name] = raw.decode("utf-8")
+                            except (UnicodeDecodeError, KeyError):
+                                logger.debug("Skipping non-text file in ZIP: %s", name)
+                                continue
+
                     return files
 
-                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir():
-                            continue
-                        try:
-                            name = _validate_bundle_rel_path(info.filename)
-                        except ValueError:
-                            logger.debug("Skipping unsafe ZIP member path: %s", info.filename)
-                            continue
-                        # Only extract text-sized files (skip large binaries)
-                        if info.file_size > 500_000:
-                            logger.debug("Skipping large file in ZIP: %s (%d bytes)", name, info.file_size)
-                            continue
-                        try:
-                            raw = zf.read(info.filename)
-                            files[name] = raw.decode("utf-8")
-                        except (UnicodeDecodeError, KeyError):
-                            logger.debug("Skipping non-text file in ZIP: %s", name)
-                            continue
-
-                return files
-
-            except zipfile.BadZipFile:
-                logger.warning("ClawHub returned invalid ZIP for %s v%s", slug, version)
-                return files
-            except httpx.HTTPError as exc:
-                logger.debug("ClawHub ZIP download failed for %s v%s: %s", slug, version, exc)
-                return files
+                except zipfile.BadZipFile:
+                    logger.warning("ClawHub returned invalid ZIP for %s v%s", slug, version)
+                    last_error = ClawHubFetchError(url, status_code=200, reason="download response is not a ZIP")
+                    break
+                except httpx.HTTPError as exc:
+                    logger.debug("ClawHub ZIP download failed for %s v%s: %s", slug, version, exc)
+                    last_error = ClawHubFetchError(url, reason=str(exc))
+                    break
 
         logger.debug("ClawHub ZIP download exhausted retries for %s v%s", slug, version)
+        if last_rate_limited:
+            raise ClawHubRateLimitError(f"{self.configured_base_url()}/download")
+        if last_error is not None:
+            raise last_error
         return files
 
     def _fetch_text(self, url: str) -> Optional[str]:

@@ -5581,6 +5581,7 @@ async def test_aops_message_type_silent_skillhub_explore_returns_structured_resu
 def test_aops_skillhub_market_list_calls_clawhub_listing_api(monkeypatch):
     from gateway import aops_skillhub_bridge
 
+    aops_skillhub_bridge._MARKET_LIST_CACHE.update({"base_url": None, "items": None, "expires_at": 0.0})
     calls = []
 
     class _Resp:
@@ -5611,7 +5612,7 @@ def test_aops_skillhub_market_list_calls_clawhub_listing_api(monkeypatch):
 
     items = aops_skillhub_bridge._list_market_items()
 
-    assert calls == [("https://clawhub.internal/api/v1/skills", {"limit": 200}, 30)]
+    assert calls == [("https://clawhub.internal/api/v1/skills", {"limit": 50}, 30)]
     assert items == [
         {
             "slug": "knowledge-query",
@@ -5623,6 +5624,80 @@ def test_aops_skillhub_market_list_calls_clawhub_listing_api(monkeypatch):
             "latestVersion": {"version": "20260518.084923"},
         }
     ]
+
+
+def test_aops_skillhub_market_list_uses_ttl_cache(monkeypatch):
+    from gateway import aops_skillhub_bridge
+
+    aops_skillhub_bridge._MARKET_LIST_CACHE.update({"base_url": None, "items": None, "expires_at": 0.0})
+    calls = []
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"items": [{"slug": "cached-skill"}]}
+
+    def fake_get(url, *, params, timeout):
+        calls.append((url, params, timeout))
+        return _Resp()
+
+    monkeypatch.setenv("CLAWHUB_REGISTRY", "https://clawhub.internal")
+    monkeypatch.setattr(aops_skillhub_bridge.httpx, "get", fake_get)
+
+    first = aops_skillhub_bridge._list_market_items()
+    second = aops_skillhub_bridge._list_market_items()
+
+    assert len(calls) == 1
+    assert first == second
+    assert first[0]["slug"] == "cached-skill"
+
+
+def test_aops_skillhub_market_list_rate_limit_returns_cached_items(monkeypatch):
+    from gateway import aops_skillhub_bridge
+
+    base_url = "https://clawhub.internal/api/v1"
+    aops_skillhub_bridge._MARKET_LIST_CACHE.update({
+        "base_url": base_url,
+        "items": [{"slug": "stale-skill", "displayName": "Stale"}],
+        "expires_at": 0.0,
+    })
+
+    class _Resp:
+        status_code = 429
+        headers = {"retry-after": "7"}
+
+        def raise_for_status(self):
+            raise AssertionError("raise_for_status should not run for 429")
+
+    monkeypatch.setenv("CLAWHUB_REGISTRY", "https://clawhub.internal")
+    monkeypatch.setattr(aops_skillhub_bridge.httpx, "get", lambda *args, **kwargs: _Resp())
+
+    assert aops_skillhub_bridge._list_market_items() == [{"slug": "stale-skill", "displayName": "Stale"}]
+
+
+def test_aops_skillhub_market_list_rate_limit_without_cache_raises(monkeypatch):
+    from gateway import aops_skillhub_bridge
+
+    aops_skillhub_bridge._MARKET_LIST_CACHE.update({"base_url": None, "items": None, "expires_at": 0.0})
+
+    class _Resp:
+        status_code = 429
+        headers = {"retry-after": "7"}
+
+        def raise_for_status(self):
+            raise AssertionError("raise_for_status should not run for 429")
+
+    monkeypatch.setenv("CLAWHUB_REGISTRY", "https://clawhub.internal")
+    monkeypatch.setattr(aops_skillhub_bridge.httpx, "get", lambda *args, **kwargs: _Resp())
+
+    with pytest.raises(aops_skillhub_bridge.SkillHubRateLimitedError) as exc:
+        aops_skillhub_bridge._list_market_items()
+
+    assert exc.value.retry_after_seconds == 7
 
 
 @pytest.mark.asyncio
@@ -5712,6 +5787,7 @@ def test_aops_skillhub_install_uses_cli_short_name_and_detects_cli_error(monkeyp
     assert calls[0][1]["force"] is True
     assert calls[0][1]["skip_confirm"] is True
     assert calls[0][1]["ignore_scan_policy"] is True
+    assert calls[0][1]["source"] == "clawhub"
     assert payload["error"]["code"] == "INSTALL_FAILED"
 
 
@@ -5736,6 +5812,7 @@ def test_aops_skillhub_install_succeeds_when_cli_installs_short_name(monkeypatch
     assert payload["ok"] is True
     assert payload["installedPath"] == "machine-access-review"
     assert calls[0][1]["ignore_scan_policy"] is True
+    assert calls[0][1]["source"] == "clawhub"
     assert refreshed == [True]
 
 
@@ -5760,6 +5837,23 @@ def test_aops_skillhub_install_reports_ignored_scan_policy(monkeypatch):
     assert payload["scanIgnored"] is True
     assert payload["scanVerdict"] == "dangerous"
     assert payload["scanFindingsCount"] == 2
+
+
+def test_aops_skillhub_install_reports_rate_limit(monkeypatch):
+    from gateway import aops_skillhub_bridge
+
+    def fake_install(identifier, **kwargs):
+        kwargs["console"].print("Error: ClawHub rate limited request: 429 Too Many Requests")
+
+    monkeypatch.setattr(aops_skillhub_bridge, "_configure_clawhub_source_base_url", lambda: "http://clawhub.internal/api/v1")
+    monkeypatch.setattr(aops_skillhub_bridge, "_installed_path", lambda slug: None)
+    monkeypatch.setattr("hermes_cli.skills_hub.do_install", fake_install)
+
+    ok, payload = aops_skillhub_bridge._install_skill("machine-access-review")
+
+    assert ok is False
+    assert payload["error"]["code"] == "SKILLHUB_RATE_LIMITED"
+    assert payload["error"]["details"]["slug"] == "machine-access-review"
 
 
 @pytest.mark.asyncio
