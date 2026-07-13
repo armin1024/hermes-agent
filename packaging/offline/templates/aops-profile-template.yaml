@@ -9,6 +9,8 @@ parameters:
   env.CLAWHUB_REGISTRY:
     required: false
     default: http://tec01.internal/clawhub
+  hindsight.bank_id:
+    required: false
 
 bundle:
   url: http://tec01.internal/hermes/packages/hermes-aops-offline-bundle.tar.gz
@@ -108,7 +110,9 @@ config:
     api_url: ${hindsight.api_url}
     api_key: ${hindsight.api_key}
     # The one-click installer resolves AOPS_BOT_TOKEN ownership and writes the
-    # authoritative static bank_id (aops-tec01-{owner_user_id}).
+    # authoritative static bank_id (aops-tec01-{owner_user_id}); passing
+    # --set hindsight.bank_id=<bank> uses that value and skips the owner API.
+    bank_id: ${hindsight.bank_id}
     budget: mid
     timeout: 120
     idle_timeout: 300

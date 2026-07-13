@@ -87,6 +87,11 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "/other/aops/bot-token/owner-user" in script
     assert "default-all-profiles" in script
     assert "AOPS_OWNER_LOOKUP_ATTEMPTS" in script
+    assert "default_create_lookup = selected_action == \"create\" and selected_profile == \"default\"" in script
+    assert "timeout = 5.0 if default_create_lookup" in script
+    assert "attempts = 1 if default_create_lookup" in script
+    assert "new-profile-default-bank" in script
+    assert "default-config-bank" in script
     assert "restart_other_profiles_after_owner_bank_sync" in script
     preflight_call = script.index("resolve_aops_owner_bank_plan | tee")
     assert "resolve_aops_owner_bank_plan | tee \"$OWNER_BANK_PLAN_LOG_JSON\"" in script
@@ -192,9 +197,11 @@ def test_aops_profile_template_defaults_to_terminal_linux_toolsets():
     assert "unsupportedReasons:" in template
     assert "bank_id_template: users-{user}" not in template
     assert "authoritative static bank_id" in template
+    assert "hindsight.bank_id:" in template
+    assert "bank_id: ${hindsight.bank_id}" in template
 
 
-def test_oneclick_owner_lookup_default_update_scans_all_aops_profiles(tmp_path):
+def test_oneclick_default_update_reuses_default_owner_bank_for_all_profiles(tmp_path):
     script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
     resolver = tmp_path / "resolver.py"
     resolver.write_text(_embedded_python(script, "resolve_aops_owner_bank_plan"), encoding="utf-8")
@@ -249,11 +256,195 @@ def test_oneclick_owner_lookup_default_update_scans_all_aops_profiles(tmp_path):
         assert plan["mode"] == "default-all-profiles"
         assert [(item["profile"], item["bankId"]) for item in plan["profiles"]] == [
             ("default", "aops-tec01-user_default"),
-            ("ops-1", "aops-tec01-user_profile"),
+            ("ops-1", "aops-tec01-user_default"),
         ]
+        assert [item["source"] for item in plan["profiles"]] == ["default-owner-api", "default-owner-api"]
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_oneclick_manual_bank_skips_owner_api_and_updates_default_profiles(tmp_path):
+    script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
+    resolver = tmp_path / "resolver.py"
+    resolver.write_text(_embedded_python(script, "resolve_aops_owner_bank_plan"), encoding="utf-8")
+    hermes = tmp_path / ".hermes"
+    child = hermes / "profiles" / "ops-1"
+    child.mkdir(parents=True)
+    (child / ".env").write_text("AOPS_BOT_TOKEN=profile-token\n", encoding="utf-8")
+    payload = tmp_path / "payload.json"
+    payload.write_text(json.dumps({"config": {
+        "env": {"AOPS_BOT_TOKEN": "default-token", "AOPS_BOT_URL": "http://127.0.0.1:1"},
+        "hindsight": {"bank_id": "manual_bank_001"},
+    }}), encoding="utf-8")
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({"profile": "default", "action": "update"}), encoding="utf-8")
+    output = tmp_path / "plan.json"
+    env = os.environ | {
+        "HOME": str(tmp_path),
+        "PAYLOAD_JSON": str(payload),
+        "PROFILE_JSON": str(profile),
+        "OWNER_BANK_PLAN_JSON": str(output),
+        "AOPS_OWNER_LOOKUP_ATTEMPTS": "1",
+    }
+    subprocess.run([sys.executable, str(resolver)], check=True, env=env, capture_output=True, text=True)
+    plan = json.loads(output.read_text(encoding="utf-8"))
+    assert plan["mode"] == "manual-default-all-profiles"
+    assert [(item["profile"], item["bankId"], item["source"]) for item in plan["profiles"]] == [
+        ("default", "manual_bank_001", "manual"),
+        ("ops-1", "manual_bank_001", "manual"),
+    ]
+
+
+def test_oneclick_default_owner_api_failure_uses_existing_default_bank(tmp_path):
+    script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
+    resolver = tmp_path / "resolver.py"
+    resolver.write_text(_embedded_python(script, "resolve_aops_owner_bank_plan"), encoding="utf-8")
+    hermes = tmp_path / ".hermes"
+    (hermes / "hindsight").mkdir(parents=True)
+    (hermes / "hindsight" / "config.json").write_text(json.dumps({"bank_id": "saved_default_bank"}), encoding="utf-8")
+    child = hermes / "profiles" / "ops-1"
+    child.mkdir(parents=True)
+    (child / ".env").write_text("AOPS_BOT_TOKEN=profile-token\n", encoding="utf-8")
+    payload = tmp_path / "payload.json"
+    payload.write_text(json.dumps({"config": {"env": {
+        "AOPS_BOT_TOKEN": "default-token", "AOPS_BOT_URL": "http://127.0.0.1:1",
+    }}}), encoding="utf-8")
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({"profile": "default", "action": "update"}), encoding="utf-8")
+    output = tmp_path / "plan.json"
+    env = os.environ | {
+        "HOME": str(tmp_path),
+        "PAYLOAD_JSON": str(payload),
+        "PROFILE_JSON": str(profile),
+        "OWNER_BANK_PLAN_JSON": str(output),
+        "AOPS_OWNER_LOOKUP_ATTEMPTS": "1",
+        "AOPS_OWNER_LOOKUP_TIMEOUT": "0.1",
+    }
+    subprocess.run([sys.executable, str(resolver)], check=True, env=env, capture_output=True, text=True)
+    plan = json.loads(output.read_text(encoding="utf-8"))
+    assert [(item["profile"], item["bankId"], item["source"]) for item in plan["profiles"]] == [
+        ("default", "saved_default_bank", "default-config-fallback"),
+        ("ops-1", "saved_default_bank", "default-config-fallback"),
+    ]
+
+
+def test_oneclick_new_named_profile_reuses_default_bank_without_owner_api(tmp_path):
+    script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
+    resolver = tmp_path / "resolver.py"
+    resolver.write_text(_embedded_python(script, "resolve_aops_owner_bank_plan"), encoding="utf-8")
+    hermes = tmp_path / ".hermes"
+    (hermes / "hindsight").mkdir(parents=True)
+    (hermes / "hindsight" / "config.json").write_text(
+        json.dumps({"bank_id": "default_shared_bank"}), encoding="utf-8"
+    )
+    payload = tmp_path / "payload.json"
+    payload.write_text(
+        json.dumps({
+            "config": {
+                "env": {
+                    "AOPS_BOT_TOKEN": "named-token",
+                    "AOPS_BOT_URL": "http://127.0.0.1:1",
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({"profile": "ops-2", "action": "create"}), encoding="utf-8")
+    output = tmp_path / "plan.json"
+    env = os.environ | {
+        "HOME": str(tmp_path),
+        "PAYLOAD_JSON": str(payload),
+        "PROFILE_JSON": str(profile),
+        "OWNER_BANK_PLAN_JSON": str(output),
+    }
+    completed = subprocess.run([sys.executable, str(resolver)], check=True, env=env, capture_output=True, text=True)
+    plan = json.loads(output.read_text(encoding="utf-8"))
+    assert plan["mode"] == "new-profile-default-bank"
+    assert plan["profiles"] == [{
+        "profile": "ops-2",
+        "hermesHome": str(hermes / "profiles" / "ops-2"),
+        "ownerUserId": None,
+        "bankId": "default_shared_bank",
+        "previousBankId": "",
+        "source": "default-config-bank",
+    }]
+    assert "owner-user" not in completed.stdout
+
+
+def test_oneclick_new_named_profile_reuses_legacy_default_bank_field(tmp_path):
+    script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
+    resolver = tmp_path / "resolver.py"
+    resolver.write_text(_embedded_python(script, "resolve_aops_owner_bank_plan"), encoding="utf-8")
+    hermes = tmp_path / ".hermes"
+    (hermes / "hindsight").mkdir(parents=True)
+    (hermes / "hindsight" / "config.json").write_text(
+        json.dumps({"banks": {"hermes": {"bankId": "legacy_shared_bank"}}}), encoding="utf-8"
+    )
+    payload = tmp_path / "payload.json"
+    payload.write_text(json.dumps({"config": {"env": {}}}), encoding="utf-8")
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({"profile": "ops-legacy", "action": "create"}), encoding="utf-8")
+    output = tmp_path / "plan.json"
+    env = os.environ | {
+        "HOME": str(tmp_path),
+        "PAYLOAD_JSON": str(payload),
+        "PROFILE_JSON": str(profile),
+        "OWNER_BANK_PLAN_JSON": str(output),
+    }
+    subprocess.run([sys.executable, str(resolver)], check=True, env=env, capture_output=True, text=True)
+    plan = json.loads(output.read_text(encoding="utf-8"))
+    assert plan["profiles"][0]["bankId"] == "legacy_shared_bank"
+    assert plan["profiles"][0]["source"] == "default-config-bank"
+
+
+def test_oneclick_new_named_profile_fails_without_valid_default_bank(tmp_path):
+    script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
+    resolver = tmp_path / "resolver.py"
+    resolver.write_text(_embedded_python(script, "resolve_aops_owner_bank_plan"), encoding="utf-8")
+    (tmp_path / ".hermes").mkdir()
+    payload = tmp_path / "payload.json"
+    payload.write_text(json.dumps({"config": {"env": {}}}), encoding="utf-8")
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({"profile": "ops-missing", "action": "create"}), encoding="utf-8")
+    output = tmp_path / "plan.json"
+    env = os.environ | {
+        "HOME": str(tmp_path),
+        "PAYLOAD_JSON": str(payload),
+        "PROFILE_JSON": str(profile),
+        "OWNER_BANK_PLAN_JSON": str(output),
+    }
+    completed = subprocess.run([sys.executable, str(resolver)], env=env, capture_output=True, text=True)
+    assert completed.returncode != 0
+    assert "default Hindsight bank_id is missing or invalid" in completed.stderr
+    assert not output.exists()
+
+
+def test_oneclick_new_default_creation_is_fail_closed_when_owner_api_fails(tmp_path):
+    script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
+    resolver = tmp_path / "resolver.py"
+    resolver.write_text(_embedded_python(script, "resolve_aops_owner_bank_plan"), encoding="utf-8")
+    payload = tmp_path / "payload.json"
+    payload.write_text(json.dumps({"config": {"env": {
+        "AOPS_BOT_TOKEN": "default-token",
+        "AOPS_BOT_URL": "http://127.0.0.1:1",
+    }}}), encoding="utf-8")
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({"profile": "default", "action": "create"}), encoding="utf-8")
+    output = tmp_path / "plan.json"
+    env = os.environ | {
+        "HOME": str(tmp_path),
+        "PAYLOAD_JSON": str(payload),
+        "PROFILE_JSON": str(profile),
+        "OWNER_BANK_PLAN_JSON": str(output),
+        "AOPS_OWNER_LOOKUP_ATTEMPTS": "9",
+        "AOPS_OWNER_LOOKUP_TIMEOUT": "0.01",
+    }
+    completed = subprocess.run([sys.executable, str(resolver)], env=env, capture_output=True, text=True)
+    assert completed.returncode != 0
+    assert "AOPS owner lookup failed" in completed.stderr or "<urlopen error" in completed.stderr
+    assert not output.exists()
 
 
 def test_oneclick_owner_bank_sync_preserves_existing_hindsight_fields(tmp_path):
