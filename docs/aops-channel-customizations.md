@@ -324,7 +324,7 @@ curl -fsSL "http://tec01.internal/hermes/install-oneclick.sh" | sudo bash -s -- 
 
 脚本会根据是否已存在 Hermes 安装判断新装或更新；新装后可自动 `hermes gateway start`，更新后可自动 `hermes gateway restart`。
 
-Hindsight bank 以 AOPS Bot 所属人作为权威来源：脚本在下载离线包和写入配置前，调用 `POST {AOPS_BOT_URL}/other/aops/bot-token/owner-user` 查询当前 `AOPS_BOT_TOKEN` 的 `owner_user_id`，并写入 `bank_id=aops-tec01-{owner_user_id}`、清空 `bank_id_template`。新建或更新非 default profile 时只同步当前 profile；更新 default profile 时会扫描同一系统用户下所有带 AOPS Token 的 profile。任一查询失败会终止本次操作，避免使用过期 bank；owner 变化时旧 bank 保留，不自动迁移记忆。
+Hindsight bank 默认以 default AOPS Bot 所属人为权威来源：新建 default 且未手动指定 bank 时，脚本调用 `POST {AOPS_BOT_URL}/other/aops/bot-token/owner-user`（单次超时 5 秒）查询 default 的 `AOPS_BOT_TOKEN`，并写入 `bank_id=aops-tec01-{owner_user_id}`、清空 `bank_id_template`；API 失败会终止新建。新建 named profile 不调用 owner API，直接复用 default `hindsight/config.json` 中的 `bank_id`（兼容 `banks.hermes.bankId`）。命中 default 更新时所有带 AOPS Token 的 profile 同步为同一个 default bank；更新 default 的 API 不可用时回退 default 已有 bank。可通过 `--set hindsight.bank_id=<bank>` 手动指定同等的最终 bank，并跳过 API 查询。更新非 default profile 时只同步当前 profile；owner 变化时旧 bank 保留，不自动迁移记忆。
 
 ## 排障
 

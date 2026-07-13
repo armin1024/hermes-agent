@@ -240,7 +240,8 @@ write_default_template() {
     "targetUser": {"required": true},
     "env.AOPS_BOT_TOKEN": {"required": true},
     "env.AOPS_BOT_URL": {"required": false, "default": "http://aops-bot.internal"},
-    "env.CLAWHUB_REGISTRY": {"required": false, "default": "http://tec01.internal/clawhub"}
+    "env.CLAWHUB_REGISTRY": {"required": false, "default": "http://tec01.internal/clawhub"},
+    "hindsight.bank_id": {"required": false}
   },
   "bundle": {
     "url": "http://tec01.internal/hermes/packages/hermes-aops-offline-bundle.tar.gz",
@@ -343,6 +344,7 @@ write_default_template() {
       "mode": "local_external",
       "api_url": "${hindsight.api_url}",
       "api_key": "${hindsight.api_key}",
+      "bank_id": "${hindsight.bank_id}",
       "budget": "mid",
       "timeout": 120,
       "idle_timeout": 300
@@ -697,20 +699,19 @@ from pathlib import Path
 payload_path = Path(os.environ["PAYLOAD_JSON"])
 profile_path = Path(os.environ["PROFILE_JSON"])
 output_path = Path(os.environ["OWNER_BANK_PLAN_JSON"])
-timeout = float(os.environ.get("AOPS_OWNER_LOOKUP_TIMEOUT", "10"))
-attempts = max(1, int(os.environ.get("AOPS_OWNER_LOOKUP_ATTEMPTS", "3")))
-
 payload = json.loads(payload_path.read_text(encoding="utf-8"))
 selected = json.loads(profile_path.read_text(encoding="utf-8"))
 selected_profile = str(selected.get("profile") or "default")
 selected_action = str(selected.get("action") or "")
-payload_env = ((payload.get("config") or {}).get("env") or {})
-payload_token = str(payload_env.get("AOPS_BOT_TOKEN") or "").strip()
-payload_url = str(payload_env.get("AOPS_BOT_URL") or "").strip()
-if not payload_token:
-    raise SystemExit("AOPS owner lookup requires config.env.AOPS_BOT_TOKEN")
-if not payload_url:
-    raise SystemExit("AOPS owner lookup requires config.env.AOPS_BOT_URL")
+default_create_lookup = selected_action == "create" and selected_profile == "default"
+timeout = 5.0 if default_create_lookup else float(os.environ.get("AOPS_OWNER_LOOKUP_TIMEOUT", "5"))
+attempts = 1 if default_create_lookup else max(1, int(os.environ.get("AOPS_OWNER_LOOKUP_ATTEMPTS", "3")))
+payload_config = payload.get("config") or {}
+payload_env = payload_config.get("env") or {} if isinstance(payload_config, dict) else {}
+payload_hindsight = payload_config.get("hindsight") or {} if isinstance(payload_config, dict) else {}
+manual_bank_id = ""
+if isinstance(payload_hindsight, dict):
+    manual_bank_id = str(payload_hindsight.get("bank_id") or payload_hindsight.get("bankId") or "").strip()
 
 def read_dotenv(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
@@ -736,39 +737,88 @@ profiles_root = root / "profiles"
 def profile_dir(name: str) -> Path:
     return root if name == "default" else profiles_root / name
 
-def selected_record() -> dict[str, str]:
-    return {
-        "profile": selected_profile,
-        "home": str(profile_dir(selected_profile)),
-        "token": payload_token,
-        "baseUrl": payload_url,
-    }
+safe_bank_id = re.compile(r"^[A-Za-z0-9_-]+$")
 
-records: list[dict[str, str]] = []
-if selected_action == "update" and selected_profile == "default":
-    # A default-profile update is the fleet-wide reconciliation point.  Read
-    # every AOPS profile, but use the incoming values for default because this
-    # task may be rotating its token or base URL.
-    records.append(selected_record())
-    if profiles_root.is_dir():
+def current_bank_id(directory: Path) -> str:
+    config_path = directory / "hindsight" / "config.json"
+    old_bank_id = ""
+    try:
+        existing = json.loads(config_path.read_text(encoding="utf-8"))
+        if isinstance(existing, dict):
+            old_bank_id = str(existing.get("bank_id") or "").strip()
+            if not old_bank_id:
+                banks = existing.get("banks")
+                hermes_bank = banks.get("hermes") if isinstance(banks, dict) else None
+                if isinstance(hermes_bank, dict):
+                    old_bank_id = str(hermes_bank.get("bankId") or "").strip()
+    except Exception:
+        pass
+    return old_bank_id
+
+def target_records() -> list[dict[str, str]]:
+    records = [{"profile": selected_profile, "home": str(profile_dir(selected_profile))}]
+    if selected_action == "update" and selected_profile == "default" and profiles_root.is_dir():
         for child in sorted(profiles_root.iterdir()):
             if not child.is_dir():
                 continue
-            env = read_dotenv(child / ".env")
-            token = str(env.get("AOPS_BOT_TOKEN") or "").strip()
-            if not token:
+            if not str(read_dotenv(child / ".env").get("AOPS_BOT_TOKEN") or "").strip():
                 continue
-            base_url = str(env.get("AOPS_BOT_URL") or "").strip()
-            if not base_url:
-                raise SystemExit(f"AOPS owner lookup requires AOPS_BOT_URL for profile {child.name}")
-            records.append({
-                "profile": child.name,
-                "home": str(child),
-                "token": token,
-                "baseUrl": base_url,
-            })
-else:
-    records.append(selected_record())
+            records.append({"profile": child.name, "home": str(child)})
+    return records
+
+def make_plan_record(record: dict[str, str], bank_id: str, *, owner: str | None, source: str) -> dict[str, object]:
+    directory = Path(record["home"])
+    return {
+        "profile": record["profile"],
+        "hermesHome": str(directory),
+        "ownerUserId": owner,
+        "bankId": bank_id,
+        "previousBankId": current_bank_id(directory),
+        "source": source,
+    }
+
+def write_plan(*, mode: str, profiles: list[dict[str, object]]) -> None:
+    result = {
+        "ok": True,
+        "mode": mode,
+        "selectedProfile": selected_profile,
+        "profiles": profiles,
+    }
+    output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+if manual_bank_id:
+    if not safe_bank_id.fullmatch(manual_bank_id):
+        raise SystemExit("hindsight.bank_id must contain only letters, digits, '-' or '_'")
+    write_plan(
+        mode="manual-default-all-profiles" if selected_action == "update" and selected_profile == "default" else "manual-current-profile",
+        profiles=[make_plan_record(record, manual_bank_id, owner=None, source="manual") for record in target_records()],
+    )
+    raise SystemExit(0)
+
+if selected_action == "create" and selected_profile != "default":
+    default_bank_id = current_bank_id(profile_dir("default"))
+    if not safe_bank_id.fullmatch(default_bank_id):
+        raise SystemExit(
+            "Cannot create named profile: default Hindsight bank_id is missing or invalid"
+        )
+    write_plan(
+        mode="new-profile-default-bank",
+        profiles=[make_plan_record(
+            {"profile": selected_profile, "home": str(profile_dir(selected_profile))},
+            default_bank_id,
+            owner=None,
+            source="default-config-bank",
+        )],
+    )
+    raise SystemExit(0)
+
+payload_token = str(payload_env.get("AOPS_BOT_TOKEN") or "").strip()
+payload_url = str(payload_env.get("AOPS_BOT_URL") or "").strip()
+if not payload_token:
+    raise SystemExit("AOPS owner lookup requires config.env.AOPS_BOT_TOKEN")
+if not payload_url:
+    raise SystemExit("AOPS owner lookup requires config.env.AOPS_BOT_URL")
 
 def lookup_owner(base_url: str, token: str) -> str:
     endpoint = base_url.rstrip("/") + "/other/aops/bot-token/owner-user"
@@ -827,40 +877,35 @@ def lookup_owner(base_url: str, token: str) -> str:
         time.sleep(delay)
     raise RuntimeError(last_error)
 
-safe_uid = re.compile(r"^[A-Za-z0-9_-]+$")
-plan_profiles = []
-for record in records:
-    owner = lookup_owner(record["baseUrl"], record["token"])
-    if not safe_uid.fullmatch(owner):
-        raise SystemExit(
-            f"AOPS owner lookup returned unsupported owner_user_id for profile {record['profile']}; "
-            "expected only letters, digits, '-' or '_'"
-        )
-    bank_id = f"aops-tec01-{owner}"
-    config_path = Path(record["home"]) / "hindsight" / "config.json"
-    old_bank_id = ""
+if selected_action == "update" and selected_profile == "default":
     try:
-        existing = json.loads(config_path.read_text(encoding="utf-8"))
-        if isinstance(existing, dict):
-            old_bank_id = str(existing.get("bank_id") or "").strip()
-    except Exception:
-        pass
-    plan_profiles.append({
-        "profile": record["profile"],
-        "hermesHome": record["home"],
-        "ownerUserId": owner,
-        "bankId": bank_id,
-        "previousBankId": old_bank_id,
-    })
-
-result = {
-    "ok": True,
-    "mode": "default-all-profiles" if selected_action == "update" and selected_profile == "default" else "current-profile",
-    "selectedProfile": selected_profile,
-    "profiles": plan_profiles,
-}
-output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-print(json.dumps(result, ensure_ascii=False, indent=2))
+        owner = lookup_owner(payload_url, payload_token)
+        if not safe_bank_id.fullmatch(owner):
+            raise RuntimeError("owner lookup returned an unsupported owner_user_id")
+        bank_id = f"aops-tec01-{owner}"
+        source = "default-owner-api"
+    except Exception as exc:
+        bank_id = current_bank_id(profile_dir("default"))
+        if not safe_bank_id.fullmatch(bank_id):
+            raise SystemExit(
+                "AOPS owner lookup failed and default Hindsight bank_id is unavailable or invalid"
+            ) from exc
+        owner = None
+        source = "default-config-fallback"
+    write_plan(
+        mode="default-all-profiles",
+        profiles=[make_plan_record(record, bank_id, owner=owner, source=source) for record in target_records()],
+    )
+else:
+    # New default profile creation is deliberately fail-closed: unlike
+    # updates, it has no existing bank to use as a safe fallback.
+    owner = lookup_owner(payload_url, payload_token)
+    if not safe_bank_id.fullmatch(owner):
+        raise SystemExit("AOPS owner lookup returned an unsupported owner_user_id")
+    write_plan(
+        mode="current-profile",
+        profiles=[make_plan_record(record, f"aops-tec01-{owner}", owner=owner, source="owner-api") for record in target_records()],
+    )
 PY
   chmod 700 "$resolver"
   if [[ "$(id -u)" -eq 0 ]]; then

@@ -636,8 +636,9 @@ Profile 策略：
 - 相同 token 重新执行时更新原 default/profile；多个 profile 命中相同 token 时失败。
 - 已安装 runtime 会比较 `~/hermes-agent/.aops_bundle_sha256` 与模板 `bundle.sha256`，不一致则下载新 bundle 并升级。
 - 任意 profile 触发 runtime 升级后，会重启同一系统用户下其他已运行或已有 systemd user service 的 default/named profile gateway；不主动启动从未运行过的 profile。
-- 一键脚本在下载 bundle 前会调用 `POST {AOPS_BOT_URL}/other/aops/bot-token/owner-user`，以请求体中的 `AOPS_BOT_TOKEN` 查询 `owner_user_id`。最终 Hindsight bank 固定为 `aops-tec01-{owner_user_id}`，并清空 `bank_id_template`；owner 查询失败、为空或非法时整次安装/更新终止。
-- 新建或更新非 default profile 时只同步当前 profile；更新 default profile 时每次扫描同一系统用户下所有含 AOPS Token 的 profile。bank 发生变化的运行中 profile 会重启；未运行 profile 保持停止，下次启动使用新 bank。旧 bank 记忆不自动迁移。
+- 一键脚本创建 default profile 且未手动指定 bank 时，在下载 bundle 前调用 `POST {AOPS_BOT_URL}/other/aops/bot-token/owner-user`，以请求体中的 `AOPS_BOT_TOKEN` 查询 `owner_user_id`；该创建请求单次超时 5 秒，失败、为空或非法时立即终止，不使用旧 bank 兜底。最终 Hindsight bank 固定为 `aops-tec01-{owner_user_id}`，并清空 `bank_id_template`。
+- 可通过 `--set hindsight.bank_id=<bank>` 直接指定最终 bank。手动值与 API 获取结果等效，会跳过 owner API 并写入静态 bank；命中 default 时会同步至同一系统用户下所有含 AOPS Token 的 profile。
+- 新建 named profile 且未手动指定 bank 时不调用 owner API，直接复用 default 的 `hindsight/config.json`：优先顶层 `bank_id`，其次 `banks.hermes.bankId`；default bank 缺失或非法时终止创建。更新非 default profile 时仍只同步当前 profile，并按现有 Token 查询逻辑处理；default 更新会扫描所有含 AOPS Token 的 profile，但只查询 default 的 owner，并将 default bank 同步给全部 profile。default 更新的 owner API 不可用且没有手动 bank 时，回退 default 已有 bank；兜底值不存在或非法才终止。bank 发生变化的运行中 profile 会重启；未运行 profile 保持停止，下次启动使用新 bank。旧 bank 记忆不自动迁移。
 
 模板默认能力：
 
