@@ -141,6 +141,9 @@ try:
     stage = "import_aops_adapter"
     from gateway.platforms.aops import AIOHTTP_AVAILABLE, AopsAdapter
 
+    stage = "import_hindsight_client"
+    import hindsight_client
+
     stage = "import_cron_modules"
     import cron.jobs as cron_jobs_mod
     import cron.scheduler as cron_scheduler_mod
@@ -180,11 +183,13 @@ aops_url = os.getenv("AOPS_BOT_URL", "").strip()
 stage = "report"
 print(f"hermes_cli.config={config_mod.__file__}")
 print(f"gateway.platforms.aops={sys.modules[AopsAdapter.__module__].__file__}")
+print(f"hindsight_client={hindsight_client.__file__}")
 print(f"cron.jobs={cron_jobs_mod.__file__}")
 print(f"cron.scheduler={cron_scheduler_mod.__file__}")
 print(f"selfcheck_home={home}")
 print("selfcheck_mode=aops-overlay-light")
 print(f"aops_aiohttp_available={AIOHTTP_AVAILABLE}")
+print("hindsight_client_available=True")
 print(f"aops_env_loaded={bool(aops_token and aops_url)}")
 
 if missing or created_legacy or not AIOHTTP_AVAILABLE or not aops_token or not aops_url:

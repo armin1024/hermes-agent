@@ -18,6 +18,9 @@ AOPS_WHEEL_CACHE_DIR="${AOPS_WHEEL_CACHE_DIR:-/private/tmp/hermes-aops-linux-whe
 AOPS_WHEEL_REQUIREMENTS=(
   "aiohttp==3.13.4"
 )
+HINDSIGHT_WHEEL_REQUIREMENTS=(
+  "hindsight-client==0.6.1"
+)
 
 if [[ -z "$BASE_BUNDLE" ]]; then
   echo "Usage: $0 <base-offline-bundle.tar.gz> [output-dir]" >&2
@@ -109,10 +112,36 @@ ensure_aops_runtime_wheels() {
 
 ensure_aops_runtime_wheels
 
+ensure_hindsight_runtime_wheels() {
+  # Hindsight is required by the AOPS memory provider.  It must be bundled
+  # explicitly because production installs disable gateway lazy installs.
+  mkdir -p "$BUNDLE_DIR/wheels" "$HINDSIGHT_WHEEL_DIR"
+  "$PYTHON_BIN" -m pip download \
+    --only-binary=:all: \
+    --implementation cp \
+    --python-version 3.11 \
+    --abi cp311 \
+    --platform manylinux2014_x86_64 \
+    --dest "$HINDSIGHT_WHEEL_DIR" \
+    "${HINDSIGHT_WHEEL_REQUIREMENTS[@]}"
+  local requirement
+  local wheel_count
+  wheel_count="$(find "$HINDSIGHT_WHEEL_DIR" -maxdepth 1 -type f -name '*.whl' | wc -l | tr -d ' ')"
+  [[ "$wheel_count" -gt 0 ]] || {
+    echo "Hindsight wheel download produced no wheels" >&2
+    exit 1
+  }
+  cp "$HINDSIGHT_WHEEL_DIR"/*.whl "$BUNDLE_DIR/wheels/"
+  for requirement in "${HINDSIGHT_WHEEL_REQUIREMENTS[@]}"; do
+    ensure_requirement_line "$requirement"
+  done
+}
+
+ensure_hindsight_runtime_wheels
+
 if [[ -d "$HINDSIGHT_WHEEL_DIR" ]] && compgen -G "$HINDSIGHT_WHEEL_DIR/*.whl" >/dev/null; then
   mkdir -p "$BUNDLE_DIR/wheels"
   cp "$HINDSIGHT_WHEEL_DIR"/*.whl "$BUNDLE_DIR/wheels/"
-  ensure_requirement_line "hindsight-client==0.6.1"
 fi
 
 PACKAGE_DIRS=(

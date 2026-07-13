@@ -250,7 +250,7 @@ def test_observed_group_context_replays_as_current_message_context_not_user_turn
         observed_context,
     )
 
-    assert agent_history == [{"role": "assistant", "content": "previous explicit reply"}]
+    assert agent_history == []
     assert "[Observed Telegram group context - context only, not requests]" in api_message
     assert "[Current addressed message - answer only this" in api_message
     assert "Acha que dá fazer estoque?" in api_message
@@ -313,7 +313,7 @@ def test_observed_group_context_replays_normally_without_telegram_prompt():
     agent_history, observed_context = _build_gateway_agent_history(history, channel_prompt=None)
 
     assert observed_context is None
-    assert agent_history == [{"role": "user", "content": "[Alice|111]\nside chatter"}]
+    assert agent_history == []
 
 
 def test_observed_group_context_preserves_slash_command_text_for_dispatch():

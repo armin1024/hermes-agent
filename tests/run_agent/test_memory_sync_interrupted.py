@@ -35,6 +35,8 @@ def _bare_agent():
     # providers that cache per-session state can update it mid-process
     # (see #6672).
     agent.session_id = "test_session_001"
+    agent.platform = "cli"
+    agent._chat_id = ""
     return agent
 
 
@@ -128,6 +130,25 @@ class TestSyncExternalMemoryForTurn:
             "tests passed",
             session_id="test_session_001",
             messages=messages,
+        )
+
+    def test_aops_completed_turn_syncs_hindsight_tags(self, monkeypatch):
+        agent = _bare_agent()
+        agent.platform = "aops"
+        agent._chat_id = "tec01-conv-001"
+        monkeypatch.setenv("AOPS_BOT_TOKEN", "token-abc")
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="记住这个偏好",
+            final_response="已记录。",
+            interrupted=False,
+        )
+
+        agent._memory_manager.sync_all.assert_called_once_with(
+            "记住这个偏好",
+            "已记录。",
+            session_id="test_session_001",
+            tags=["aops_bot_token:token-abc", "channelId:tec01-conv-001"],
         )
 
     def test_completed_skill_turn_keeps_original_message_for_memory_manager(self):

@@ -1041,6 +1041,7 @@ def _build_gateway_agent_history(
     # Strip interrupted tool-call tails so the LLM doesn't re-execute
     # tools that were killed mid-flight.
     agent_history = _strip_interrupted_tool_tails(agent_history)
+    agent_history = _filter_gateway_replay_history(agent_history)
 
     # Strip a dangling assistant(tool_calls) tail with no tool answers —
     # the signature of a SIGKILL mid-tool-call (e.g. the tool itself ran
@@ -1082,6 +1083,141 @@ def _select_cached_agent_history(
     if isinstance(live_history, list) and len(live_history) > len(persisted_history):
         return list(live_history)
     return persisted_history
+
+
+def _history_preview(value: Any, limit: int = 80) -> str:
+    if isinstance(value, str):
+        text = value.replace("\n", "\\n")
+    elif isinstance(value, list):
+        text = "[multimodal]"
+    else:
+        text = str(value or "")
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _has_visible_assistant_content(msg: Dict[str, Any]) -> bool:
+    content = msg.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text" and str(part.get("text") or "").strip():
+                    return True
+                if part.get("type") not in {"thinking", "redacted_thinking"}:
+                    return True
+            elif str(part or "").strip():
+                return True
+    return False
+
+
+def _tool_call_ids_for_message(msg: Dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for tc in msg.get("tool_calls") or []:
+        if not isinstance(tc, dict):
+            continue
+        for key in ("id", "call_id"):
+            value = tc.get(key)
+            if value:
+                ids.add(str(value))
+    return ids
+
+
+def _is_complete_gateway_replay_turn(turn: List[Dict[str, Any]]) -> bool:
+    if not turn or turn[0].get("role") != "user":
+        return False
+    expected_tool_ids: set[str] = set()
+    seen_tool_ids: set[str] = set()
+    saw_tool_exchange = False
+    for msg in turn[1:]:
+        role = msg.get("role")
+        if role == "assistant" and msg.get("tool_calls"):
+            expected_tool_ids.update(_tool_call_ids_for_message(msg))
+            continue
+        if role == "tool":
+            tool_call_id = msg.get("tool_call_id") or msg.get("call_id")
+            if tool_call_id:
+                seen_tool_ids.add(str(tool_call_id))
+            if _is_interrupted_tool_result(msg.get("content", "")):
+                return False
+            saw_tool_exchange = True
+            continue
+        if role == "assistant" and not msg.get("tool_calls"):
+            if _has_visible_assistant_content(msg):
+                return True
+    return bool(saw_tool_exchange and expected_tool_ids and expected_tool_ids.issubset(seen_tool_ids))
+
+
+def _filter_gateway_replay_history(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only canonical LLM replay turns from persisted gateway transcript.
+
+    Persisted UI history can contain bare user queues or orphan assistant/tool
+    rows. Those are valid for display but dangerous as model input. Cache hits
+    use live AIAgent messages instead; this filter is for cache miss/restart
+    recovery.
+    """
+    rebuilt: List[Dict[str, Any]] = []
+    current: List[Dict[str, Any]] = []
+    dropped = 0
+    previews: List[str] = []
+
+    def flush() -> None:
+        nonlocal current, dropped
+        if not current:
+            return
+        if _is_complete_gateway_replay_turn(current):
+            rebuilt.extend(current)
+        else:
+            dropped += 1
+            first = next((m for m in current if m.get("role") == "user"), current[0])
+            if len(previews) < 3:
+                previews.append(_history_preview(first.get("content")))
+        current = []
+
+    for entry in entries:
+        role = entry.get("role")
+        if role == "user":
+            flush()
+            current = [entry]
+            continue
+        if current:
+            current.append(entry)
+            continue
+        if role in {"assistant", "tool", "function"}:
+            dropped += 1
+            if len(previews) < 3:
+                previews.append(_history_preview(entry.get("content")))
+            continue
+        rebuilt.append(entry)
+
+    flush()
+    if dropped:
+        logger.warning(
+            "Gateway replay history: dropped %d incomplete/orphan chunk(s); previews=%s",
+            dropped,
+            previews,
+        )
+    return rebuilt
+
+
+def _live_agent_conversation_history(agent: Any) -> List[Dict[str, Any]]:
+    live = getattr(agent, "_session_messages", None)
+    if not isinstance(live, list) or not live:
+        return []
+    return [m for m in live if isinstance(m, dict)]
+
+
+def _select_gateway_conversation_history(
+    agent: Any,
+    recovered_history: List[Dict[str, Any]],
+    *,
+    cached_agent: bool,
+) -> tuple[List[Dict[str, Any]], str]:
+    if cached_agent:
+        live = _live_agent_conversation_history(agent)
+        if live:
+            return live, "live_agent"
+    return list(recovered_history or []), "canonical_replay"
 
 
 def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
@@ -21248,7 +21384,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt,
                 inject_timestamps=_message_timestamps_enabled(_load_gateway_config()),
             )
-
+            _used_live_history = False
             # FTS write-corruption guard (#50502): when message persistence
             # fails silently through corrupt FTS triggers, the reloaded
             # transcript above is stale/empty even though the SAME cached agent
@@ -21276,11 +21412,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_history = _strip_stale_dangerous_confirmations(
                         _selected, now=time.time()
                     )
+                    _used_live_history = True
+            _conversation_history = agent_history
+            _conversation_history_source = (
+                "live_agent" if _used_live_history else "canonical_replay"
+            )
+            logger.debug(
+                "Gateway conversation history for session %s: source=%s count=%d recovered_count=%d",
+                session_key or session_id or "?",
+                _conversation_history_source,
+                len(_conversation_history),
+                len(agent_history),
+            )
             
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
             # even if the message list shrinks, we know which paths are old.
-            _history_media_paths: set = _collect_history_media_paths(agent_history)
+            _history_media_paths: set = _collect_history_media_paths(
+                _conversation_history
+            )
             
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
@@ -21454,8 +21604,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and (_interruption_is_fresh or _resume_mark_is_fresh)
             )
             _has_fresh_tool_tail = bool(
-                agent_history
-                and agent_history[-1].get("role") == "tool"
+                _conversation_history_source != "live_agent"
+                and _conversation_history
+                and _conversation_history[-1].get("role") == "tool"
                 and _interruption_is_fresh
             )
 
@@ -21565,7 +21716,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     observed_group_context,
                 )
                 _conversation_kwargs = {
-                    "conversation_history": agent_history,
+                    "conversation_history": _conversation_history,
                     "task_id": session_id,
                 }
                 if _persist_user_message_override is not None:
@@ -21707,7 +21858,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # set, so the gateway must persist all of it (offset 0), not slice
             # past the pre-compaction length (which would drop everything).
             _effective_history_offset = (
-                0 if (_session_was_split or _compacted_in_place) else len(agent_history)
+                0
+                if (_session_was_split or _compacted_in_place)
+                else len(_conversation_history)
             )
 
             if not final_response:
@@ -21749,10 +21902,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # append any that aren't already present in the final response, so the
             # adapter's extract_media() can find and deliver the files exactly once.
             #
-            # Scope the scan to THIS turn's tool results only. ``agent_history``
+            # Scope the scan to THIS turn's tool results only. ``_conversation_history``
             # was passed into run_conversation as ``conversation_history``, so the
-            # agent's returned ``messages`` list is ``agent_history`` followed by
-            # the messages produced this turn. Slicing at ``len(agent_history)``
+            # agent's returned ``messages`` list is that history followed by
+            # the messages produced this turn. Slicing at ``len(_conversation_history)``
             # isolates the current turn precisely, so a stale MEDIA: path emitted
             # by a tool several turns earlier (still present in the full message
             # list) can never leak onto a later text-only reply. (Fixes #34608)
@@ -21765,7 +21918,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if "MEDIA:" not in final_response:
                 media_tags, has_voice_directive = _collect_auto_append_media_tags(
                     result.get("messages", []),
-                    history_offset=len(agent_history),
+                    history_offset=len(_conversation_history),
                     history_media_paths=_history_media_paths,
                 )
 
@@ -21786,7 +21939,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_id=effective_session_id,
                         user_message=message,
                         final_response=final_response,
-                        agent_history=agent_history,
+                        agent_history=_conversation_history,
                         agent=agent,
                         native_reply_bridge=native_reply_bridge,
                     )
@@ -22606,7 +22759,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).
 
-                updated_history = result.get("messages", history)
+                _followup_live_agent = agent_holder[0] if agent_holder else None
+                updated_history = (
+                    _live_agent_conversation_history(_followup_live_agent)
+                    or result.get("messages", history)
+                    or history
+                )
                 next_source = source
                 next_message = pending
                 next_message_id = None

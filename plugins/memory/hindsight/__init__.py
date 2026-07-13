@@ -1614,7 +1614,14 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["observation_scopes"] = self._observation_scopes
         return kwargs
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        tags: List[str] | None = None,
+    ) -> None:
         """Enqueue a retain for the current turn. Non-blocking.
 
         The actual aretain_batch runs on a single long-lived writer thread
@@ -1666,6 +1673,9 @@ class HindsightMemoryProvider(MemoryProvider):
             lineage_tags.append(f"session:{self._session_id}")
         if self._parent_session_id:
             lineage_tags.append(f"parent:{self._parent_session_id}")
+        for tag in _normalize_retain_tags(tags):
+            if tag not in lineage_tags:
+                lineage_tags.append(tag)
 
         # Snapshot the state needed for the retain. The writer may run after
         # _session_turns / _turn_index are mutated by a later sync_turn().
