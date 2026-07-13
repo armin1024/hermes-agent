@@ -3111,6 +3111,16 @@ class AIAgent:
             sync_kwargs = {"session_id": self.session_id or ""}
             if messages is not None:
                 sync_kwargs["messages"] = messages
+            memory_tags: list[str] = []
+            if str(getattr(self, "platform", "") or "").strip().lower() == "aops":
+                aops_token = str(os.environ.get("AOPS_BOT_TOKEN") or "").strip()
+                if aops_token:
+                    memory_tags.append(f"aops_bot_token:{aops_token}")
+                channel_id = str(getattr(self, "_chat_id", "") or "").strip()
+                if channel_id:
+                    memory_tags.append(f"channelId:{channel_id}")
+            if memory_tags:
+                sync_kwargs["tags"] = memory_tags
             self._memory_manager.sync_all(
                 user_text,
                 response_text,

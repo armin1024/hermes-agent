@@ -343,7 +343,6 @@ write_default_template() {
       "mode": "local_external",
       "api_url": "${hindsight.api_url}",
       "api_key": "${hindsight.api_key}",
-      "bank_id_template": "users-{user}",
       "budget": "mid",
       "timeout": 120,
       "idle_timeout": 300
@@ -679,6 +678,380 @@ profile_cfg["name"] = name
 payload["profile"] = profile_cfg
 payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 out_path.write_text(json.dumps({"profile": name, "action": action, "path": str(path)}, ensure_ascii=False) + "\n", encoding="utf-8")
+PY
+}
+
+resolve_aops_owner_bank_plan() {
+  local resolver="$WORK_DIR/resolve-aops-owner-banks.py"
+  cat > "$resolver" <<'PY'
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+payload_path = Path(os.environ["PAYLOAD_JSON"])
+profile_path = Path(os.environ["PROFILE_JSON"])
+output_path = Path(os.environ["OWNER_BANK_PLAN_JSON"])
+timeout = float(os.environ.get("AOPS_OWNER_LOOKUP_TIMEOUT", "10"))
+attempts = max(1, int(os.environ.get("AOPS_OWNER_LOOKUP_ATTEMPTS", "3")))
+
+payload = json.loads(payload_path.read_text(encoding="utf-8"))
+selected = json.loads(profile_path.read_text(encoding="utf-8"))
+selected_profile = str(selected.get("profile") or "default")
+selected_action = str(selected.get("action") or "")
+payload_env = ((payload.get("config") or {}).get("env") or {})
+payload_token = str(payload_env.get("AOPS_BOT_TOKEN") or "").strip()
+payload_url = str(payload_env.get("AOPS_BOT_URL") or "").strip()
+if not payload_token:
+    raise SystemExit("AOPS owner lookup requires config.env.AOPS_BOT_TOKEN")
+if not payload_url:
+    raise SystemExit("AOPS owner lookup requires config.env.AOPS_BOT_URL")
+
+def read_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if len(value) >= 2 and value[:1] == value[-1:] and value[:1] in {"'", '"'}:
+                value = value[1:-1]
+            values[key] = value
+    except OSError:
+        pass
+    return values
+
+home = Path.home()
+root = home / ".hermes"
+profiles_root = root / "profiles"
+
+def profile_dir(name: str) -> Path:
+    return root if name == "default" else profiles_root / name
+
+def selected_record() -> dict[str, str]:
+    return {
+        "profile": selected_profile,
+        "home": str(profile_dir(selected_profile)),
+        "token": payload_token,
+        "baseUrl": payload_url,
+    }
+
+records: list[dict[str, str]] = []
+if selected_action == "update" and selected_profile == "default":
+    # A default-profile update is the fleet-wide reconciliation point.  Read
+    # every AOPS profile, but use the incoming values for default because this
+    # task may be rotating its token or base URL.
+    records.append(selected_record())
+    if profiles_root.is_dir():
+        for child in sorted(profiles_root.iterdir()):
+            if not child.is_dir():
+                continue
+            env = read_dotenv(child / ".env")
+            token = str(env.get("AOPS_BOT_TOKEN") or "").strip()
+            if not token:
+                continue
+            base_url = str(env.get("AOPS_BOT_URL") or "").strip()
+            if not base_url:
+                raise SystemExit(f"AOPS owner lookup requires AOPS_BOT_URL for profile {child.name}")
+            records.append({
+                "profile": child.name,
+                "home": str(child),
+                "token": token,
+                "baseUrl": base_url,
+            })
+else:
+    records.append(selected_record())
+
+def lookup_owner(base_url: str, token: str) -> str:
+    endpoint = base_url.rstrip("/") + "/other/aops/bot-token/owner-user"
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("AOPS_BOT_URL must be an absolute http(s) URL")
+    body = json.dumps({"bot_token": token}).encode("utf-8")
+    last_error = "owner lookup failed"
+    for attempt in range(attempts):
+        retry_after = None
+        try:
+            request = urllib.request.Request(
+                endpoint,
+                data=body,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status_code = int(response.getcode())
+                response_body = response.read().decode("utf-8", errors="replace")
+            parsed_body = json.loads(response_body)
+            if status_code == 200 and isinstance(parsed_body, dict) and parsed_body.get("status") == 200:
+                data = parsed_body.get("data")
+                owner = data.get("owner_user_id") if isinstance(data, dict) else None
+                if isinstance(owner, str) and owner.strip():
+                    return owner.strip()
+                raise RuntimeError("owner lookup returned an empty owner_user_id")
+            message = parsed_body.get("msg") if isinstance(parsed_body, dict) else "invalid response"
+            raise RuntimeError(f"owner lookup returned HTTP {status_code}: {str(message)[:160]}")
+        except urllib.error.HTTPError as exc:
+            status_code = int(exc.code)
+            try:
+                response_body = exc.read().decode("utf-8", errors="replace")
+                parsed_body = json.loads(response_body)
+                message = parsed_body.get("msg") if isinstance(parsed_body, dict) else response_body
+            except Exception:
+                message = str(exc.reason)
+            last_error = f"owner lookup returned HTTP {status_code}: {str(message)[:160]}"
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            retryable = status_code in {408, 429} or status_code >= 500
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = f"owner lookup network error: {str(exc)[:160]}"
+            retryable = True
+        except (ValueError, json.JSONDecodeError) as exc:
+            last_error = f"owner lookup returned invalid JSON: {str(exc)[:160]}"
+            retryable = False
+        except RuntimeError as exc:
+            last_error = str(exc)
+            retryable = False
+        if not retryable or attempt + 1 >= attempts:
+            break
+        try:
+            delay = min(30.0, max(0.0, float(retry_after))) if retry_after else float(2 ** attempt)
+        except (TypeError, ValueError):
+            delay = float(2 ** attempt)
+        time.sleep(delay)
+    raise RuntimeError(last_error)
+
+safe_uid = re.compile(r"^[A-Za-z0-9_-]+$")
+plan_profiles = []
+for record in records:
+    owner = lookup_owner(record["baseUrl"], record["token"])
+    if not safe_uid.fullmatch(owner):
+        raise SystemExit(
+            f"AOPS owner lookup returned unsupported owner_user_id for profile {record['profile']}; "
+            "expected only letters, digits, '-' or '_'"
+        )
+    bank_id = f"aops-tec01-{owner}"
+    config_path = Path(record["home"]) / "hindsight" / "config.json"
+    old_bank_id = ""
+    try:
+        existing = json.loads(config_path.read_text(encoding="utf-8"))
+        if isinstance(existing, dict):
+            old_bank_id = str(existing.get("bank_id") or "").strip()
+    except Exception:
+        pass
+    plan_profiles.append({
+        "profile": record["profile"],
+        "hermesHome": record["home"],
+        "ownerUserId": owner,
+        "bankId": bank_id,
+        "previousBankId": old_bank_id,
+    })
+
+result = {
+    "ok": True,
+    "mode": "default-all-profiles" if selected_action == "update" and selected_profile == "default" else "current-profile",
+    "selectedProfile": selected_profile,
+    "profiles": plan_profiles,
+}
+output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(json.dumps(result, ensure_ascii=False, indent=2))
+PY
+  chmod 700 "$resolver"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown "$TARGET_USER":"$TARGET_USER" "$resolver"
+  fi
+  run_as_target "PAYLOAD_JSON=$(shell_quote "$PAYLOAD_JSON") PROFILE_JSON=$(shell_quote "$PROFILE_JSON") OWNER_BANK_PLAN_JSON=$(shell_quote "$OWNER_BANK_PLAN_JSON") AOPS_OWNER_LOOKUP_TIMEOUT=$(shell_quote "${AOPS_OWNER_LOOKUP_TIMEOUT:-10}") AOPS_OWNER_LOOKUP_ATTEMPTS=$(shell_quote "${AOPS_OWNER_LOOKUP_ATTEMPTS:-3}") python3 $(shell_quote "$resolver")"
+}
+
+inject_current_owner_bank_into_payload() {
+  python3 - "$PAYLOAD_JSON" "$OWNER_BANK_PLAN_JSON" "$PROFILE_NAME" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload_path = Path(sys.argv[1])
+plan_path = Path(sys.argv[2])
+profile = sys.argv[3]
+payload = json.loads(payload_path.read_text(encoding="utf-8"))
+plan = json.loads(plan_path.read_text(encoding="utf-8"))
+records = plan.get("profiles") if isinstance(plan, dict) else []
+record = next((item for item in records if isinstance(item, dict) and item.get("profile") == profile), None)
+if not isinstance(record, dict) or not str(record.get("bankId") or "").strip():
+    raise SystemExit(f"AOPS owner bank plan has no bank for current profile {profile}")
+config = payload.setdefault("config", {})
+if not isinstance(config, dict):
+    raise SystemExit("payload.config must be an object")
+hindsight = config.setdefault("hindsight", {})
+if not isinstance(hindsight, dict):
+    raise SystemExit("payload.config.hindsight must be an object")
+hindsight["bank_id"] = str(record["bankId"])
+hindsight["bank_id_template"] = ""
+payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+sync_hindsight_owner_banks() {
+  local synchronizer="$WORK_DIR/sync-hindsight-owner-banks.py"
+  cat > "$synchronizer" <<'PY'
+import json
+import os
+import tempfile
+import time
+from pathlib import Path
+
+plan_path = Path(os.environ["OWNER_BANK_PLAN_JSON"])
+result_path = Path(os.environ["OWNER_BANK_SYNC_RESULT_JSON"])
+plan = json.loads(plan_path.read_text(encoding="utf-8"))
+records = plan.get("profiles") if isinstance(plan, dict) else None
+if not isinstance(records, list) or not records:
+    raise SystemExit("AOPS owner bank plan is empty")
+
+stamp = time.strftime("%Y%m%d-%H%M%S")
+prepared = []
+for record in records:
+    if not isinstance(record, dict):
+        raise SystemExit("AOPS owner bank plan contains an invalid profile")
+    profile = str(record.get("profile") or "").strip()
+    home = Path(str(record.get("hermesHome") or "")).expanduser()
+    bank_id = str(record.get("bankId") or "").strip()
+    if not profile or not str(home) or not bank_id:
+        raise SystemExit("AOPS owner bank plan contains an incomplete profile")
+    path = home / "hindsight" / "config.json"
+    original = path.read_bytes() if path.exists() else None
+    try:
+        config = json.loads(original.decode("utf-8")) if original is not None else {}
+    except Exception as exc:
+        raise SystemExit(f"invalid Hindsight config for profile {profile}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise SystemExit(f"invalid Hindsight config root for profile {profile}")
+    updated = dict(config)
+    updated["bank_id"] = bank_id
+    # Static owner banks must win over all historic templates.
+    updated["bank_id_template"] = ""
+    banks = updated.get("banks")
+    banks = dict(banks) if isinstance(banks, dict) else {}
+    hermes = banks.get("hermes")
+    hermes = dict(hermes) if isinstance(hermes, dict) else {}
+    hermes["bankId"] = bank_id
+    hermes.setdefault("budget", updated.get("budget") or updated.get("recall_budget") or "mid")
+    hermes.setdefault("enabled", True)
+    banks["hermes"] = hermes
+    updated["banks"] = banks
+    rendered = (json.dumps(updated, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    prepared.append({
+        "profile": profile,
+        "path": path,
+        "bankId": bank_id,
+        "ownerUserId": str(record.get("ownerUserId") or ""),
+        "original": original,
+        "rendered": rendered,
+        "changed": original != rendered,
+    })
+
+written = []
+try:
+    for item in prepared:
+        if not item["changed"]:
+            continue
+        path = item["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        backup = None
+        if item["original"] is not None:
+            backup_path = path.with_name(f"{path.name}.bank.bak.{stamp}")
+            backup_path.write_bytes(item["original"])
+            backup = str(backup_path)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.bank.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(item["rendered"])
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
+        item["backup"] = backup
+        written.append(item)
+except Exception:
+    for item in reversed(written):
+        path = item["path"]
+        if item["original"] is None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        else:
+            path.write_bytes(item["original"])
+    raise
+
+changed = []
+unchanged = []
+for item in prepared:
+    target = changed if item["changed"] else unchanged
+    target.append({
+        "profile": item["profile"],
+        "ownerUserId": item["ownerUserId"],
+        "bankId": item["bankId"],
+        "path": str(item["path"]),
+        "backup": item.get("backup"),
+    })
+result = {"ok": True, "changedProfiles": changed, "unchangedProfiles": unchanged}
+result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(json.dumps(result, ensure_ascii=False, indent=2))
+PY
+  chmod 700 "$synchronizer"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown "$TARGET_USER":"$TARGET_USER" "$synchronizer"
+  fi
+  run_as_target "OWNER_BANK_PLAN_JSON=$(shell_quote "$OWNER_BANK_PLAN_JSON") OWNER_BANK_SYNC_RESULT_JSON=$(shell_quote "$OWNER_BANK_SYNC_RESULT_JSON") python3 $(shell_quote "$synchronizer")"
+}
+
+owner_bank_sync_changed_for_profile() {
+  local profile="$1"
+  python3 - "$OWNER_BANK_SYNC_RESULT_JSON" "$profile" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    payload = {}
+changed = payload.get("changedProfiles") if isinstance(payload, dict) else []
+print("true" if any(isinstance(item, dict) and item.get("profile") == sys.argv[2] for item in (changed or [])) else "false")
+PY
+}
+
+write_changed_owner_bank_profiles() {
+  local output="$1"
+  python3 - "$OWNER_BANK_SYNC_RESULT_JSON" "$PROFILE_NAME" "$output" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+current = sys.argv[2]
+output = Path(sys.argv[3])
+try:
+    payload = json.loads(source.read_text(encoding="utf-8"))
+except Exception:
+    payload = {}
+profiles = []
+for item in payload.get("changedProfiles") or []:
+    if isinstance(item, dict):
+        profile = str(item.get("profile") or "")
+        if profile and profile != current:
+            profiles.append(profile)
+output.write_text(json.dumps(profiles, ensure_ascii=False) + "\n", encoding="utf-8")
 PY
 }
 
@@ -1201,10 +1574,16 @@ from pathlib import Path
 home = Path.home()
 current_profile = os.environ.get("CURRENT_PROFILE") or "default"
 summary_json = os.environ.get("SUMMARY_JSON") or ""
+only_profiles_json = os.environ.get("ONLY_PROFILES_JSON") or ""
 os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={os.environ['XDG_RUNTIME_DIR']}/bus")
 root = home / ".hermes"
 profiles_root = root / "profiles"
+
+try:
+    only_profiles = set(json.loads(Path(only_profiles_json).read_text(encoding="utf-8"))) if only_profiles_json else set()
+except Exception:
+    only_profiles = set()
 
 def profile_home(profile: str) -> Path:
     return root if profile == "default" else profiles_root / profile
@@ -1274,6 +1653,8 @@ if profiles_root.is_dir():
 for profile, directory in candidates:
     if profile == current_profile:
         continue
+    if only_profiles and profile not in only_profiles:
+        continue
     state = read_json(directory / "gateway_state.json")
     gateway_state = str(state.get("gateway_state") or "")
     props = systemd_props(profile)
@@ -1317,6 +1698,47 @@ restart_other_running_profiles_after_upgrade() {
         ;;
     esac
     log "Restarting Hermes gateway profile $other_profile"
+    other_lazy_result="$WORK_DIR/gateway-lazy-installs-other.json"
+    ensure_gateway_lazy_installs_disabled_for_profile "$other_profile" > "$other_lazy_result" || true
+    record_lazy_installs_change_if_needed "$other_profile" "$other_lazy_result"
+    controlled_gateway_lifecycle "$other_profile" "restart" 120 false || true
+  done
+}
+
+restart_other_profiles_after_owner_bank_sync() {
+  [[ "${RUNTIME_CHANGED:-false}" == "true" ]] && return 0
+  local changed_profiles="$WORK_DIR/owner-bank-changed-profiles.json"
+  write_changed_owner_bank_profiles "$changed_profiles"
+  if [[ "$(python3 - "$changed_profiles" <<'PY'
+import json, sys
+from pathlib import Path
+try:
+    print("true" if json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")) else "false")
+except Exception:
+    print("false")
+PY
+)" != "true" ]]; then
+    return 0
+  fi
+
+  STAGE="gateway_restart_owner_bank_profiles"
+  log "Restarting running Hermes profile gateways whose AOPS owner bank changed"
+  local selector="$WORK_DIR/select-owner-bank-profiles.py"
+  write_gateway_profile_selector "$selector"
+  run_as_target "CURRENT_PROFILE=$(shell_quote "$PROFILE_NAME") SUMMARY_JSON=$(shell_quote "${RESTART_SUMMARY_JSON:-}") ONLY_PROFILES_JSON=$(shell_quote "$changed_profiles") python3 $(shell_quote "$selector")" | while IFS= read -r other_profile; do
+    [[ -n "$other_profile" ]] || continue
+    case "$other_profile" in
+      ::skip::*)
+        printf '[WARN] skipped profile gateway %s\n' "${other_profile#::skip::}"
+        continue
+        ;;
+      ::recover::*)
+        recovered="${other_profile#::recover::}"
+        other_profile="${recovered%%::*}"
+        log "Recovering Hermes gateway profile $other_profile from ${recovered#*::}"
+        ;;
+    esac
+    log "Restarting Hermes gateway profile $other_profile after Hindsight bank change"
     other_lazy_result="$WORK_DIR/gateway-lazy-installs-other.json"
     ensure_gateway_lazy_installs_disabled_for_profile "$other_profile" > "$other_lazy_result" || true
     record_lazy_installs_change_if_needed "$other_profile" "$other_lazy_result"
@@ -1854,6 +2276,13 @@ PAYLOAD_JSON="$PAYLOAD_IN_HOME"
 
 STAGE="select_profile"
 select_profile
+if [[ "$(id -u)" -eq 0 ]]; then
+  # select_profile runs as root and may inherit a 0600 umask.  The resolver
+  # intentionally runs as TARGET_USER, so hand off this non-secret profile
+  # metadata file before the owner-bank preflight reads it.
+  chown "$TARGET_USER":"$TARGET_USER" "$PROFILE_JSON"
+  chmod 600 "$PROFILE_JSON"
+fi
 PROFILE_NAME="$(python3 - "$PROFILE_JSON" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["profile"])
@@ -1865,6 +2294,16 @@ print(json.load(open(sys.argv[1], encoding="utf-8"))["action"])
 PY
 )"
 log "Selected profile: $PROFILE_NAME ($PROFILE_ACTION)"
+
+# Resolve the AOPS owner before downloading or modifying the runtime.  A
+# default-profile update reconciles every existing AOPS profile; all lookups
+# must succeed before any profile configuration is written.
+OWNER_BANK_PLAN_JSON="$WORK_DIR/aops-owner-bank-plan.json"
+OWNER_BANK_PLAN_LOG_JSON="$WORK_DIR/aops-owner-bank-plan.log"
+STAGE="resolve_aops_owner_banks"
+log "Resolving AOPS owner-backed Hindsight bank(s)"
+resolve_aops_owner_bank_plan | tee "$OWNER_BANK_PLAN_LOG_JSON"
+inject_current_owner_bank_into_payload
 
 HERMES_INSTALLED=false
 RUNTIME_CHANGED=false
@@ -1938,6 +2377,18 @@ mark_payload_mode "$([[ "$PROFILE_ACTION" == "update" ]] && echo true || echo fa
 run_as_target "'$INSTALL_DIR/venv/bin/python' -m hermes_cli.remote_config apply --payload '$PAYLOAD_JSON' --profile '$PROFILE_NAME' --skip-skills" | tee "$APPLY_RESULT_JSON"
 APPLY_CHANGED="$(json_file_has_runtime_relevant_changes "$APPLY_RESULT_JSON")"
 
+# The owner lookup is authoritative even when ordinary remote config updates
+# preserve an existing Hindsight file.  This synchronizes only the bank fields
+# for every profile included in the already-successful preflight plan.
+OWNER_BANK_SYNC_RESULT_JSON="$WORK_DIR/hindsight-owner-bank-sync.json"
+OWNER_BANK_SYNC_LOG_JSON="$WORK_DIR/hindsight-owner-bank-sync.log"
+STAGE="sync_hindsight_owner_banks"
+log "Synchronizing owner-backed Hindsight bank(s)"
+sync_hindsight_owner_banks | tee "$OWNER_BANK_SYNC_LOG_JSON"
+if [[ "$(owner_bank_sync_changed_for_profile "$PROFILE_NAME")" == "true" ]]; then
+  APPLY_CHANGED=true
+fi
+
 STAGE="validate_aops_gateway_config"
 log "Validating AOPS gateway config for profile $PROFILE_NAME"
 validate_aops_gateway_config_for_profile "$PROFILE_NAME" | tee "$WORK_DIR/aops-gateway-config-check.json"
@@ -1979,6 +2430,7 @@ else
   fi
 fi
 
+restart_other_profiles_after_owner_bank_sync
 restart_other_running_profiles_after_upgrade
 
 STAGE="complete"

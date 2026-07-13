@@ -92,6 +92,30 @@ def test_remote_config_applies_allowed_fields(tmp_path, monkeypatch):
     assert hindsight_cfg["timeout"] == 120
 
 
+def test_remote_config_honors_explicit_static_hindsight_bank(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    payload = {
+        "config": {
+            "hindsight": {
+                "mode": "local_external",
+                "api_url": "http://hindsight.example",
+                "bank_id": "aops-tec01-user_001",
+                "bank_id_template": "",
+            },
+        },
+    }
+    path = tmp_path / "payload.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    from hermes_cli.remote_config import apply_payload
+
+    apply_payload(str(path), skip_skills=True)
+    hindsight_cfg = json.loads((tmp_path / "hindsight" / "config.json").read_text(encoding="utf-8"))
+    assert hindsight_cfg["bank_id"] == "aops-tec01-user_001"
+    assert hindsight_cfg["bank_id_template"] == ""
+    assert hindsight_cfg["banks"]["hermes"]["bankId"] == "aops-tec01-user_001"
+
+
 def test_remote_config_installs_top_level_preinstall_skills(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

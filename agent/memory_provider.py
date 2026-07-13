@@ -119,6 +119,7 @@ class MemoryProvider(ABC):
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        tags: Optional[List[str]] = None,
     ) -> None:
         """Persist a completed turn to the backend.
 
@@ -128,6 +129,9 @@ class MemoryProvider(ABC):
         ``messages`` is the OpenAI-style conversation message list as of the
         completed turn, including any assistant tool calls and tool results.
         Providers that do not need raw turn context can ignore it.
+
+        ``tags`` are optional per-turn labels for providers with native tag
+        support. Providers that do not need tags can ignore them.
         """
 
     @abstractmethod

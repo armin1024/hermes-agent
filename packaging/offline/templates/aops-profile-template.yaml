@@ -107,7 +107,8 @@ config:
     mode: local_external
     api_url: ${hindsight.api_url}
     api_key: ${hindsight.api_key}
-    bank_id_template: users-{user}
+    # The one-click installer resolves AOPS_BOT_TOKEN ownership and writes the
+    # authoritative static bank_id (aops-tec01-{owner_user_id}).
     budget: mid
     timeout: 120
     idle_timeout: 300

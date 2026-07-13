@@ -440,6 +440,57 @@ class TestAgentCacheLifecycle:
         assert cached[1] == sig
         assert cached[0] is agent1  # same instance
 
+    def test_cached_live_messages_are_preferred_over_recovered_history(self):
+        from gateway.run import _select_gateway_conversation_history
+
+        agent = MagicMock()
+        agent._session_messages = [
+            {"role": "user", "content": "通知一冰"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_300595", "function": {"name": "terminal", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_300595", "content": "sent to 300595"},
+        ]
+        recovered = [
+            {"role": "user", "content": "stale transcript row"},
+            {"role": "assistant", "content": "stale answer"},
+        ]
+
+        history, source = _select_gateway_conversation_history(
+            agent,
+            recovered,
+            cached_agent=True,
+        )
+
+        assert source == "live_agent"
+        assert history == agent._session_messages
+        assert history[-1]["content"] == "sent to 300595"
+
+    def test_cache_miss_uses_canonical_recovered_history(self):
+        from gateway.run import _select_gateway_conversation_history
+
+        agent = MagicMock()
+        agent._session_messages = [
+            {"role": "user", "content": "live but not cached"},
+        ]
+        recovered = [
+            {"role": "user", "content": "recovered"},
+            {"role": "assistant", "content": "answer"},
+        ]
+
+        history, source = _select_gateway_conversation_history(
+            agent,
+            recovered,
+            cached_agent=False,
+        )
+
+        assert source == "canonical_replay"
+        assert history == recovered
+
     def test_cache_miss_on_model_change(self):
         """Model change produces different signature → cache miss."""
         from run_agent import AIAgent

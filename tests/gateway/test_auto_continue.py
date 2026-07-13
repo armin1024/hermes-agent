@@ -118,7 +118,7 @@ class TestInterruptedReplayFiltering:
         agent_history, observed_context = _build_gateway_agent_history(history)
 
         assert observed_context is None
-        assert agent_history == [{"role": "user", "content": "transcribe this video"}]
+        assert agent_history == []
 
     def test_mixed_tail_with_one_interrupted_result_is_removed(self):
         from gateway.run import _build_gateway_agent_history
@@ -143,7 +143,7 @@ class TestInterruptedReplayFiltering:
 
         agent_history, _observed_context = _build_gateway_agent_history(history)
 
-        assert agent_history == [{"role": "user", "content": "search and transcribe"}]
+        assert agent_history == []
 
     def test_successful_tool_tail_is_preserved(self):
         from gateway.run import _build_gateway_agent_history
@@ -164,6 +164,26 @@ class TestInterruptedReplayFiltering:
 
         assert agent_history[-1]["role"] == "tool"
         assert agent_history[-1]["content"] == "deployed successfully"
+
+    def test_missing_tool_result_tail_is_not_replayed(self):
+        from gateway.run import _build_gateway_agent_history
+
+        history = [
+            {"role": "user", "content": "deploy"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_1", "function": {"name": "terminal", "arguments": "{}"}},
+                    {"id": "call_2", "function": {"name": "terminal", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "partial result"},
+        ]
+
+        agent_history, _observed_context = _build_gateway_agent_history(history)
+
+        assert agent_history == []
 
     def test_persisted_auto_continue_note_is_not_replayed(self):
         from gateway.run import _build_gateway_agent_history
@@ -190,8 +210,24 @@ class TestInterruptedReplayFiltering:
         agent_history, _observed_context = _build_gateway_agent_history(history)
 
         assert agent_history == [
-            {"role": "user", "content": "first real question"},
             {"role": "user", "content": "second real question"},
             {"role": "assistant", "content": "answer"},
-            {"role": "user", "content": "third"},
+        ]
+
+    def test_bare_user_queue_is_dropped_before_current_turn(self):
+        from gateway.run import _build_gateway_agent_history
+
+        history = [
+            {"role": "user", "content": "通知一冰"},
+            {"role": "assistant", "content": "已通知刘一冰"},
+            {"role": "user", "content": "S000640"},
+            {"role": "user", "content": "？"},
+            {"role": "user", "content": "给雷涛说一下，今天先别走，要值班"},
+        ]
+
+        agent_history, _observed_context = _build_gateway_agent_history(history)
+
+        assert agent_history == [
+            {"role": "user", "content": "通知一冰"},
+            {"role": "assistant", "content": "已通知刘一冰"},
         ]

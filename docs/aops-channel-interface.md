@@ -636,12 +636,14 @@ Profile 策略：
 - 相同 token 重新执行时更新原 default/profile；多个 profile 命中相同 token 时失败。
 - 已安装 runtime 会比较 `~/hermes-agent/.aops_bundle_sha256` 与模板 `bundle.sha256`，不一致则下载新 bundle 并升级。
 - 任意 profile 触发 runtime 升级后，会重启同一系统用户下其他已运行或已有 systemd user service 的 default/named profile gateway；不主动启动从未运行过的 profile。
+- 一键脚本在下载 bundle 前会调用 `POST {AOPS_BOT_URL}/other/aops/bot-token/owner-user`，以请求体中的 `AOPS_BOT_TOKEN` 查询 `owner_user_id`。最终 Hindsight bank 固定为 `aops-tec01-{owner_user_id}`，并清空 `bank_id_template`；owner 查询失败、为空或非法时整次安装/更新终止。
+- 新建或更新非 default profile 时只同步当前 profile；更新 default profile 时每次扫描同一系统用户下所有含 AOPS Token 的 profile。bank 发生变化的运行中 profile 会重启；未运行 profile 保持停止，下次启动使用新 bank。旧 bank 记忆不自动迁移。
 
 模板默认能力：
 
 - `.env`：写入 AOPS、ClawHub、模型网关等环境变量。
 - `config.yaml`：支持完整 `config.configYaml` 深合并。
-- Hindsight：写入 `hindsight/config.json`，默认 `bank_id_template=users-{user}`。
+- Hindsight：写入 `hindsight/config.json`，由 AOPS Bot owner 查询结果强制同步 `bank_id=aops-tec01-{owner_user_id}`，不使用 `bank_id_template`。
 - Memory/Soul：写入 `memories/USER.md` 和 `SOUL.md`。
 - 技能包：写入当前 profile `skills/`。
 

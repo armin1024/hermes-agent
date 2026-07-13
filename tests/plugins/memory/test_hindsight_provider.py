@@ -923,12 +923,16 @@ class TestSyncTurn:
 
     def test_sync_turn_with_tags(self, provider_with_config):
         p = provider_with_config(retain_tags=["conv", "session1"])
-        p.sync_turn("hello", "hi")
+        p.sync_turn("hello", "hi", tags=["aops_bot_token:tok", "channelId:conv-1"])
         p._retain_queue.join()
         item = p._client.aretain_batch.call_args.kwargs["items"][0]
-        assert "conv" in item["tags"]
-        assert "session1" in item["tags"]
-        assert "session:test-session" in item["tags"]
+        assert item["tags"] == [
+            "conv",
+            "session1",
+            "session:test-session",
+            "aops_bot_token:tok",
+            "channelId:conv-1",
+        ]
 
     def test_sync_turn_uses_aretain_batch(self, provider):
         """sync_turn should use aretain_batch with retain_async."""

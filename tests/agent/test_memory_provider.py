@@ -92,6 +92,13 @@ class MessagesMemoryProvider(FakeMemoryProvider):
         self.synced_turns.append((user_content, assistant_content, session_id, messages))
 
 
+class TagsMemoryProvider(FakeMemoryProvider):
+    """Provider that opts into completed-turn tags."""
+
+    def sync_turn(self, user_content, assistant_content, *, session_id="", tags=None):
+        self.synced_turns.append((user_content, assistant_content, session_id, tags))
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider ABC tests
 # ---------------------------------------------------------------------------
@@ -265,6 +272,31 @@ class TestMemoryManager:
         mgr.add_provider(p)
 
         mgr.sync_all("user msg", "assistant msg", messages=[{"role": "tool"}])
+        mgr.flush_pending(timeout=5)
+        assert p.synced_turns == [("user msg", "assistant msg")]
+
+    def test_sync_all_passes_tags_to_opted_in_provider(self):
+        mgr = MemoryManager()
+        p = TagsMemoryProvider("external")
+        mgr.add_provider(p)
+
+        mgr.sync_all(
+            "user msg",
+            "assistant msg",
+            session_id="sess-1",
+            tags=["aops_bot_token:tok", "channelId:conv-1"],
+        )
+        mgr.flush_pending(timeout=5)
+        assert p.synced_turns == [
+            ("user msg", "assistant msg", "sess-1", ["aops_bot_token:tok", "channelId:conv-1"])
+        ]
+
+    def test_sync_all_omits_tags_for_legacy_provider(self):
+        mgr = MemoryManager()
+        p = FakeMemoryProvider("external")
+        mgr.add_provider(p)
+
+        mgr.sync_all("user msg", "assistant msg", tags=["channelId:conv-1"])
         mgr.flush_pending(timeout=5)
         assert p.synced_turns == [("user msg", "assistant msg")]
 

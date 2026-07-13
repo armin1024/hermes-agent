@@ -635,12 +635,32 @@ def _build_hindsight_config(config_payload: dict[str, Any]) -> dict[str, Any] | 
         if key not in HINDSIGHT_ALLOWED_KEYS and key not in HINDSIGHT_ENV_KEYS:
             raise RemoteConfigError(f"config.hindsight.{key} is not supported")
 
+    explicit_bank_id = _hindsight_value(hindsight, "bankId", "bank_id", field="bank_id")
+    explicit_template = False
+    bank_id_template = ""
+    for alias in ("bankIdTemplate", "bank_id_template"):
+        if alias not in hindsight:
+            continue
+        explicit_template = True
+        raw_template = hindsight.get(alias)
+        if raw_template is None:
+            bank_id_template = ""
+        elif isinstance(raw_template, str):
+            # An explicit empty template means "use the static bank_id".  This
+            # is required for AOPS owner-derived banks and must not be silently
+            # replaced with the legacy users-{user} default.
+            bank_id_template = raw_template.strip()
+        else:
+            raise RemoteConfigError("config.hindsight.bank_id_template must be a string")
+        break
+
     cfg: dict[str, Any] = {
         "mode": _hindsight_value(hindsight, "mode", field="mode") or "cloud",
-        "bank_id": _hindsight_value(hindsight, "bankId", "bank_id", field="bank_id") or "hermes",
+        "bank_id": explicit_bank_id or "hermes",
         "bank_id_template": (
-            _hindsight_value(hindsight, "bankIdTemplate", "bank_id_template", field="bank_id_template")
-            or "users-{user}"
+            bank_id_template
+            if explicit_template
+            else "" if explicit_bank_id else "users-{user}"
         ),
     }
 
