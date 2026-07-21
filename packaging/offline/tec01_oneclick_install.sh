@@ -16,10 +16,26 @@ umask 077
 TEC01_REPORT_URL="${TEC01_REPORT_URL:-}"
 TASK_ID="${TASK_ID:-}"
 WORK_DIR="${WORK_DIR:-}"
+BUNDLE_CACHE_DIR="${HERMES_BUNDLE_CACHE_DIR:-}"
+HERMES_DATA_ROOT="${HERMES_DATA_ROOT:-/data/hermes-users}"
+SYNC_OTHER_PROFILES_CLI=""
 TEMPLATE_FILE=""
 TEMPLATE_URL=""
 SET_ARGS=()
 SKILLS_ZIPS=()
+TIMING_START_MS=""
+TIMING_STAGE_START_MS=""
+TIMING_RAW_FILE=""
+TIMING_FINALIZED=false
+BUNDLE_CACHE_LOCK_DIR=""
+STORAGE_LOCK_FD=""
+STORAGE_STATE_DIR=""
+STORAGE_SUMMARY_JSON=""
+STORAGE_STARTED_MS=""
+STORAGE_TARGET_MOUNT=""
+STORAGE_TARGET_FS=""
+STORAGE_CREATED_GUARDS=()
+STORAGE_ROLLBACK_ARMED=false
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -48,6 +64,9 @@ PY
 
 fail() {
   printf '[ERROR] %s\n' "$*" >&2
+  if [[ "${STAGE:-}" == storage_* ]] && declare -F storage_write_summary >/dev/null 2>&1 && [[ -n "${STORAGE_SUMMARY_JSON:-}" ]]; then
+    storage_write_summary "failed" "$(( $(now_ms) - ${STORAGE_STARTED_MS:-$(now_ms)} ))" 0 "" "" "${STORAGE_TARGET_FS:-}" "$*" 2>/dev/null || true
+  fi
   report_result "failed" "${STAGE:-unknown}" "$*"
   exit 1
 }
@@ -66,6 +85,13 @@ Options:
   --skills-zip VALUE    Local path or URL to a .zip skill bundle. Repeatable.
   --template-file FILE  Read YAML template from a local file.
   --template-url URL    Download YAML template from URL.
+  --bundle-cache-dir DIR
+                        Reuse verified offline bundles by SHA256.
+  --hermes-data-root DIR
+                        Physical root for Hermes runtime/profile data
+                        (default: /data/hermes-users).
+  --sync-other-profiles true|false
+                        Apply explicit overwrite fields to all existing profiles.
   --report-url URL      Optional task result report endpoint.
   --task-id ID          Optional task id for reporting/work-dir naming.
   --work-dir DIR        Optional private working directory.
@@ -88,6 +114,23 @@ while [[ $# -gt 0 ]]; do
       ;;
     --template-url)
       TEMPLATE_URL="$2"
+      shift 2
+      ;;
+    --bundle-cache-dir)
+      BUNDLE_CACHE_DIR="$2"
+      shift 2
+      ;;
+    --hermes-data-root)
+      [[ $# -ge 2 ]] || fail "--hermes-data-root requires an absolute path"
+      HERMES_DATA_ROOT="$2"
+      shift 2
+      ;;
+    --sync-other-profiles)
+      [[ $# -ge 2 ]] || fail "--sync-other-profiles requires true or false"
+      case "$2" in
+        true|false) SYNC_OTHER_PROFILES_CLI="$2" ;;
+        *) fail "--sync-other-profiles must be true or false" ;;
+      esac
       shift 2
       ;;
     --report-url)
@@ -119,6 +162,105 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Required command not found: $1"
 }
 
+now_ms() {
+  python3 - <<'PY'
+import time
+print(time.monotonic_ns() // 1_000_000)
+PY
+}
+
+begin_stage() {
+  local next_stage="$1"
+  local now duration
+  now="$(now_ms)"
+  if [[ -n "${STAGE:-}" && -n "$TIMING_STAGE_START_MS" && -n "$TIMING_RAW_FILE" ]]; then
+    duration=$((now - TIMING_STAGE_START_MS))
+    printf '%s\t%s\n' "$STAGE" "$duration" >> "$TIMING_RAW_FILE"
+    printf '[TIMING] stage=%s durationMs=%s\n' "$STAGE" "$duration"
+  fi
+  STAGE="$next_stage"
+  TIMING_STAGE_START_MS="$now"
+}
+
+finish_timings() {
+  local exit_code="${1:-0}"
+  local now duration output_path
+  [[ "$TIMING_FINALIZED" == false && -n "$TIMING_START_MS" ]] || return 0
+  TIMING_FINALIZED=true
+  now="$(now_ms)"
+  if [[ -n "${STAGE:-}" && -n "$TIMING_STAGE_START_MS" && -n "$TIMING_RAW_FILE" ]]; then
+    duration=$((now - TIMING_STAGE_START_MS))
+    printf '%s\t%s\n' "$STAGE" "$duration" >> "$TIMING_RAW_FILE"
+    printf '[TIMING] stage=%s durationMs=%s\n' "$STAGE" "$duration"
+  fi
+  duration=$((now - TIMING_START_MS))
+  printf '[TIMING] totalDurationMs=%s\n' "$duration"
+  if [[ -n "${WORK_DIR:-}" && -d "$WORK_DIR" ]]; then
+    output_path="$WORK_DIR/install-timings.json"
+  else
+    output_path="${BOOTSTRAP_DIR:-${TMPDIR:-/tmp}}/install-timings.json"
+  fi
+  python3 - "$TIMING_RAW_FILE" "$output_path" "$duration" "$exit_code" "${STORAGE_SUMMARY_JSON:-}" <<'PY' || true
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+raw_path, output_path, total_ms, exit_code, storage_summary_path = sys.argv[1:]
+stages = []
+try:
+    for line in Path(raw_path).read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        name, duration = line.split("\t", 1)
+        stages.append({"stage": name, "durationMs": int(duration)})
+except Exception:
+    pass
+total = int(total_ms)
+finished = datetime.now(timezone.utc)
+started = finished.timestamp() - total / 1000
+payload = {
+    "ok": int(exit_code) == 0,
+    "exitCode": int(exit_code),
+    "startedAt": datetime.fromtimestamp(started, timezone.utc).isoformat(),
+    "finishedAt": finished.isoformat(),
+    "totalDurationMs": total,
+    "stages": stages,
+}
+try:
+    storage_path = Path(storage_summary_path)
+    if storage_path.is_file():
+        payload["storage"] = json.loads(storage_path.read_text(encoding="utf-8"))
+except Exception:
+    pass
+Path(output_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+  if [[ -n "${TARGET_USER:-}" && "$(id -u)" -eq 0 && -f "$output_path" ]]; then
+    chown "$TARGET_USER":"$TARGET_USER" "$output_path" 2>/dev/null || true
+  fi
+}
+
+on_exit() {
+  local exit_code=$?
+  trap - EXIT
+  trap - HUP INT TERM
+  set +e
+  if [[ "${STORAGE_ROLLBACK_ARMED:-false}" == true ]] && declare -F rollback_storage_cutover >/dev/null 2>&1; then
+    warn "Installer interrupted during Hermes storage migration; rolling back"
+    rollback_storage_cutover || true
+  fi
+  finish_timings "$exit_code"
+  if [[ -n "$BUNDLE_CACHE_LOCK_DIR" ]]; then
+    rmdir "$BUNDLE_CACHE_LOCK_DIR" 2>/dev/null || true
+  fi
+  exit "$exit_code"
+}
+
+on_interrupt() {
+  local signal_number="$1"
+  exit "$((128 + signal_number))"
+}
+
 download() {
   local url="$1"
   local dst="$2"
@@ -137,6 +279,68 @@ sha256_file() {
     sha256sum "$path" | awk '{print $1}'
   else
     shasum -a 256 "$path" | awk '{print $1}'
+  fi
+}
+
+download_bundle() {
+  local url="$1"
+  local expected_sha="$2"
+  local dst="$3"
+  local cache_file lock_file tmp_file actual_sha lock_dir=""
+
+  if [[ -z "$BUNDLE_CACHE_DIR" ]]; then
+    download "$url" "$dst"
+    return 0
+  fi
+
+  mkdir -p "$BUNDLE_CACHE_DIR"
+  chmod 700 "$BUNDLE_CACHE_DIR" 2>/dev/null || true
+  cache_file="$BUNDLE_CACHE_DIR/${expected_sha}.tar.gz"
+  lock_file="$BUNDLE_CACHE_DIR/${expected_sha}.lock"
+
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>"$lock_file"
+    flock 8
+  else
+    lock_dir="${lock_file}.d"
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+      sleep 0.2
+    done
+    BUNDLE_CACHE_LOCK_DIR="$lock_dir"
+  fi
+
+  if [[ -f "$cache_file" ]]; then
+    actual_sha="$(sha256_file "$cache_file")"
+    if [[ "$actual_sha" == "$expected_sha" ]]; then
+      log "Using cached bundle: $cache_file"
+    else
+      warn "Removing corrupt cached bundle: $cache_file"
+      rm -f "$cache_file"
+    fi
+  fi
+
+  if [[ ! -f "$cache_file" ]]; then
+    tmp_file="$BUNDLE_CACHE_DIR/.${expected_sha}.$$.tmp"
+    rm -f "$tmp_file"
+    download "$url" "$tmp_file"
+    actual_sha="$(sha256_file "$tmp_file")"
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+      rm -f "$tmp_file"
+      [[ -n "$lock_dir" ]] && rmdir "$lock_dir" 2>/dev/null || true
+      fail "sha256 mismatch: expected $expected_sha got $actual_sha"
+    fi
+    chmod 600 "$tmp_file"
+    mv -f "$tmp_file" "$cache_file"
+    log "Cached bundle: $cache_file"
+  fi
+
+  cp "$cache_file" "$dst"
+  if command -v flock >/dev/null 2>&1; then
+    flock -u 8 2>/dev/null || true
+    exec 8>&-
+  elif [[ -n "$lock_dir" ]]; then
+    rmdir "$lock_dir" 2>/dev/null || true
+    BUNDLE_CACHE_LOCK_DIR=""
   fi
 }
 
@@ -228,6 +432,537 @@ enable_linger_if_possible() {
     return 0
   fi
   warn "loginctl enable-linger $TARGET_USER failed; gateway service may not persist after logout"
+}
+
+storage_systemctl_as_target() {
+  local command="$1"
+  run_as_target "export XDG_RUNTIME_DIR=/run/user/\$(id -u); export DBUS_SESSION_BUS_ADDRESS=unix:path=\$XDG_RUNTIME_DIR/bus; $command"
+}
+
+storage_write_summary() {
+  local status="$1"
+  local duration_ms="$2"
+  local bytes_moved="$3"
+  local migrated_csv="$4"
+  local source_fs="$5"
+  local target_fs="$6"
+  local error_message="${7:-}"
+  [[ -n "$STORAGE_SUMMARY_JSON" ]] || return 0
+  python3 - "$STORAGE_SUMMARY_JSON" "$status" "$HERMES_DATA_ROOT" "$duration_ms" "$bytes_moved" "$migrated_csv" "$source_fs" "$target_fs" "$error_message" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path, status, data_root, duration, moved, migrated, source_fs, target_fs, error = sys.argv[1:]
+payload = {
+    "status": status,
+    "dataRoot": data_root,
+    "migratedPaths": [item for item in migrated.split(",") if item],
+    "bytesMoved": int(moved or 0),
+    "sourceFilesystem": source_fs or None,
+    "targetFilesystem": target_fs or None,
+    "durationMs": int(duration or 0),
+}
+if error:
+    payload["error"] = error
+Path(path).parent.mkdir(parents=True, exist_ok=True)
+Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+storage_find_existing_parent() {
+  local path="$1"
+  while [[ ! -e "$path" && "$path" != "/" ]]; do
+    path="$(dirname "$path")"
+  done
+  printf '%s' "$path"
+}
+
+storage_validate_target_mount() {
+  local probe mount_target fs_type mount_options target_source
+  probe="$(storage_find_existing_parent "$HERMES_DATA_ROOT")"
+  mount_target="$(findmnt -T "$probe" -n -o TARGET 2>/dev/null || true)"
+  fs_type="$(findmnt -T "$probe" -n -o FSTYPE 2>/dev/null || true)"
+  mount_options="$(findmnt -T "$probe" -n -o OPTIONS 2>/dev/null || true)"
+  target_source="$(findmnt -T "$probe" -n -o SOURCE 2>/dev/null || true)"
+  [[ -n "$mount_target" && "$mount_target" != "/" ]] || {
+    warn "$HERMES_DATA_ROOT is not backed by an independent mounted filesystem"
+    return 1
+  }
+  case "$fs_type" in
+    nfs|nfs4|cifs|smb3|fuse*|overlay)
+      warn "$HERMES_DATA_ROOT uses unsupported filesystem type: $fs_type"
+      return 1
+      ;;
+  esac
+  case ",$mount_options," in
+    *,ro,*) warn "$HERMES_DATA_ROOT is mounted read-only"; return 1 ;;
+    *,noexec,*) warn "$HERMES_DATA_ROOT is mounted noexec"; return 1 ;;
+  esac
+  STORAGE_TARGET_MOUNT="$mount_target"
+  STORAGE_TARGET_FS="$target_source"
+}
+
+storage_path_mount_target() {
+  findmnt -T "$1" -n -o TARGET 2>/dev/null || true
+}
+
+storage_check_nested_mounts() {
+  local source="$1"
+  local nested
+  nested="$(findmnt -rn -o TARGET | awk -v p="$source/" 'index($0,p)==1 {print; exit}')"
+  [[ -z "$nested" ]] || {
+    warn "Refusing to migrate $source because it contains nested mount $nested"
+    return 1
+  }
+}
+
+storage_find_unmanaged_processes() {
+  local source_a="$1"
+  local source_b="$2"
+  python3 - "$TARGET_USER" "$source_a" "$source_b" <<'PY'
+import os
+import pwd
+import sys
+from pathlib import Path
+
+uid = pwd.getpwnam(sys.argv[1]).pw_uid
+roots = [str(Path(item).resolve()) for item in sys.argv[2:] if item and Path(item).exists()]
+found = []
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    proc = Path("/proc") / name
+    try:
+        if proc.stat().st_uid != uid:
+            continue
+        values = []
+        for link in ("exe", "cwd"):
+            try:
+                values.append(os.path.realpath(proc / link))
+            except OSError:
+                pass
+        try:
+            for fd in (proc / "fd").iterdir():
+                try:
+                    values.append(os.path.realpath(fd))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        try:
+            values.append((proc / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace"))
+        except OSError:
+            pass
+        if any(value == root or value.startswith(root + os.sep) or root in value for root in roots for value in values):
+            # Do not persist cmdline arguments: installers may carry secrets in
+            # --set values. PID and executable are sufficient diagnostics.
+            executable = Path(values[0]).name if values else "unknown"
+            found.append(f"pid={name} executable={executable}")
+    except (OSError, ProcessLookupError):
+        pass
+if found:
+    print("\n".join(found))
+    raise SystemExit(1)
+PY
+}
+
+storage_snapshot_profile_state() {
+  local output="$1"
+  python3 - "$TARGET_HOME/.hermes" "$output" <<'PY'
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+output = Path(sys.argv[2])
+rows = []
+if root.is_dir():
+    profile_dirs = [("default", root)]
+    profiles = root / "profiles"
+    if profiles.is_dir():
+        profile_dirs.extend(
+            (child.name, child)
+            for child in sorted(profiles.iterdir(), key=lambda item: item.name)
+            if child.is_dir()
+        )
+    for name, directory in profile_dirs:
+        rows.append(f"profile\t{name}")
+        for relative in (".env", "config.yaml", "cron/jobs.json", "hindsight/config.json"):
+            path = directory / relative
+            if not path.is_file():
+                continue
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            rows.append(f"file\t{name}\t{relative}\t{digest}\t{path.stat().st_size}")
+output.write_text("\n".join(rows) + ("\n" if rows else ""), encoding="utf-8")
+PY
+}
+
+storage_capture_running_gateway_units() {
+  local output="$1"
+  : > "$output"
+  local unit_path unit
+  shopt -s nullglob
+  for unit_path in "$TARGET_HOME/.config/systemd/user/hermes-gateway"*.service; do
+    unit="$(basename "$unit_path")"
+    if storage_systemctl_as_target "timeout 10 systemctl --user is-active --quiet $(shell_quote "$unit")" >/dev/null 2>&1; then
+      printf '%s\n' "$unit" >> "$output"
+    fi
+  done
+  shopt -u nullglob
+}
+
+storage_stop_gateway_units() {
+  local units_file="$1"
+  local unit
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    log "Stopping gateway service for storage migration: $unit"
+    storage_systemctl_as_target "timeout 90 systemctl --user stop $(shell_quote "$unit")" || return 1
+  done < "$units_file"
+}
+
+storage_restore_gateway_units() {
+  local units_file="$1"
+  local unit rc=0
+  [[ -f "$units_file" ]] || return 0
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    log "Restoring gateway service after storage migration: $unit"
+    storage_systemctl_as_target "timeout 90 systemctl --user start $(shell_quote "$unit")" || rc=1
+  done < "$units_file"
+  return "$rc"
+}
+
+storage_install_mount_guards() {
+  [[ "${STORAGE_MANAGED:-false}" == true ]] || return 0
+  local marker="$HERMES_DATA_ROOT/$TARGET_USER/.hermes-storage-ready"
+  local unit_path unit dropin installed=0
+  [[ -f "$marker" ]] || return 1
+  shopt -s nullglob
+  for unit_path in "$TARGET_HOME/.config/systemd/user/hermes-gateway"*.service; do
+    unit="$(basename "$unit_path")"
+    dropin="$TARGET_HOME/.config/systemd/user/$unit.d/10-hermes-data-mount.conf"
+    mkdir -p "$(dirname "$dropin")" || { shopt -u nullglob; return 1; }
+    if [[ -f "$dropin" ]]; then
+      grep -Fqx "ExecStartPre=/usr/bin/test -f $marker" "$dropin" || {
+        shopt -u nullglob
+        warn "Refusing to overwrite an unexpected Hermes data mount guard: $dropin"
+        return 1
+      }
+      installed=$((installed + 1))
+      continue
+    fi
+    if ! cat > "$dropin" <<EOF
+[Unit]
+ConditionPathIsMountPoint=$STORAGE_TARGET_MOUNT
+
+[Service]
+ExecStartPre=/usr/bin/test -f $marker
+EOF
+    then
+      shopt -u nullglob
+      return 1
+    fi
+    chmod 600 "$dropin" || { shopt -u nullglob; return 1; }
+    if [[ "$(id -u)" -eq 0 ]]; then
+      chown "$TARGET_USER":"$TARGET_USER" "$(dirname "$dropin")" "$dropin" || { shopt -u nullglob; return 1; }
+    fi
+    STORAGE_CREATED_GUARDS+=("$dropin")
+    installed=$((installed + 1))
+  done
+  shopt -u nullglob
+  [[ "$installed" -eq 0 ]] || storage_systemctl_as_target "timeout 15 systemctl --user daemon-reload"
+}
+
+storage_remove_created_mount_guards() {
+  local guard
+  for guard in "${STORAGE_CREATED_GUARDS[@]}"; do
+    [[ -f "$guard" ]] && rm -f "$guard"
+    rmdir "$(dirname "$guard")" 2>/dev/null || true
+  done
+  STORAGE_CREATED_GUARDS=()
+  storage_systemctl_as_target "timeout 15 systemctl --user daemon-reload" >/dev/null 2>&1 || true
+}
+
+ensure_hermes_data_layout() {
+  local started source_fs="" target_base marker status="mapped" bytes=0
+  local logical name target mount_target required=0 migrate=0 root_device
+  local migrated_csv="" units_file backup_runtime="" backup_home="" marker_existed=false
+  local verify_profile_inventory=false
+  local -a migrate_sources=() migrate_targets=() new_logicals=() new_targets=() created_links=()
+  started="$(now_ms)"
+  STORAGE_STARTED_MS="$started"
+  STORAGE_MANAGED=false
+
+  [[ "$HERMES_DATA_ROOT" == /* ]] || fail "--hermes-data-root must be an absolute path"
+  [[ "$HERMES_DATA_ROOT" =~ ^/[A-Za-z0-9_./-]+$ ]] || fail "--hermes-data-root contains unsupported characters"
+  need_cmd findmnt
+  need_cmd realpath
+  HERMES_DATA_ROOT="$(realpath -m "$HERMES_DATA_ROOT")"
+  [[ "$HERMES_DATA_ROOT" != "/" ]] || fail "--hermes-data-root cannot be /"
+  target_base="$HERMES_DATA_ROOT/$TARGET_USER"
+  marker="$target_base/.hermes-storage-ready"
+  [[ ! -e "$marker" ]] || marker_existed=true
+  local target_uid
+  target_uid="$(id -u "$TARGET_USER")"
+  root_device="$(stat -Lc %d /)"
+
+  for logical in "$TARGET_HOME/hermes-agent" "$TARGET_HOME/.hermes"; do
+    name="$(basename "$logical")"
+    target="$target_base/$name"
+    if [[ -L "$logical" ]]; then
+      [[ "$(readlink -f "$logical" 2>/dev/null || true)" == "$target" ]] || fail "Unexpected Hermes symlink: $logical -> $(readlink "$logical")"
+      [[ -d "$target" ]] || fail "Hermes storage link is dangling: $logical"
+      [[ ! -L "$target" && "$(stat -c %u "$target")" == "$target_uid" ]] || fail "Hermes storage target owner/type mismatch: $target"
+      STORAGE_MANAGED=true
+      continue
+    fi
+    if [[ ! -e "$logical" ]]; then
+      required=1
+      new_logicals+=("$logical")
+      new_targets+=("$target")
+      continue
+    fi
+    [[ -d "$logical" ]] || fail "Hermes path is not a directory: $logical"
+    mount_target="$(storage_path_mount_target "$logical")"
+    if [[ "$(stat -Lc %d "$logical")" == "$root_device" ]]; then
+      storage_check_nested_mounts "$logical" || fail "Nested mount detected under $logical"
+      required=1
+      migrate=1
+      migrate_sources+=("$logical")
+      migrate_targets+=("$target")
+      if [[ "$logical" == "$TARGET_HOME/.hermes" ]]; then
+        verify_profile_inventory=true
+      fi
+      source_fs="$(findmnt -T "$logical" -n -o SOURCE 2>/dev/null || true)"
+      bytes=$((bytes + $(du -sx --block-size=1 "$logical" | awk '{print $1}')))
+    else
+      log "Keeping custom Hermes path outside root filesystem: $logical (mount=$mount_target)"
+      # Custom storage deliberately skips validation of HERMES_DATA_ROOT. Keep
+      # its actual filesystem in the diagnostic summary without requiring the
+      # managed-storage globals to have been populated.
+      [[ -n "$source_fs" ]] || source_fs="$(findmnt -T "$logical" -n -o SOURCE 2>/dev/null || true)"
+    fi
+  done
+
+  if [[ "$required" -eq 0 ]]; then
+    if [[ "$STORAGE_MANAGED" == true ]]; then
+      storage_validate_target_mount || fail "Hermes data root validation failed: $HERMES_DATA_ROOT"
+      [[ -f "$marker" ]] || fail "Hermes data marker is missing: $marker"
+      storage_write_summary "already_mapped" "$(( $(now_ms) - started ))" 0 "" "$source_fs" "$STORAGE_TARGET_FS"
+    else
+      storage_write_summary "external" "$(( $(now_ms) - started ))" 0 "" "$source_fs" "${STORAGE_TARGET_FS:-}"
+    fi
+    return 0
+  fi
+  storage_validate_target_mount || fail "Hermes data root validation failed: $HERMES_DATA_ROOT"
+  [[ "$(id -u)" -eq 0 ]] || fail "Run as root to create or migrate Hermes /data storage mappings"
+  need_cmd cmp
+  need_cmd df
+  need_cmd du
+  need_cmd find
+  need_cmd flock
+  need_cmd rsync
+  need_cmd stat
+  mkdir -p /var/lock
+  exec {STORAGE_LOCK_FD}>/var/lock/hermes-tec01-storage.lock
+  flock -w 300 "$STORAGE_LOCK_FD" || fail "Timed out waiting for Hermes storage migration lock"
+
+  local inode_need=1024
+  if [[ -e "$target_base" && ! -d "$target_base" ]]; then
+    fail "Hermes data target is not a directory: $target_base"
+  fi
+  if [[ -d "$target_base" && "$(stat -c %u "$target_base")" != "$target_uid" ]]; then
+    fail "Hermes data target owner mismatch: $target_base"
+  fi
+  mkdir -p "$HERMES_DATA_ROOT"
+  chown root:root "$HERMES_DATA_ROOT"
+  chmod 0711 "$HERMES_DATA_ROOT"
+  mkdir -p "$target_base"
+  chown "$TARGET_USER":"$TARGET_USER" "$target_base"
+  chmod 700 "$target_base"
+  for target in "${migrate_targets[@]}" "${new_targets[@]}"; do
+    [[ -n "$target" ]] || continue
+    [[ ! -L "$target" ]] || fail "Hermes data target must not be a symlink: $target"
+    if [[ -e "$target" ]]; then
+      [[ -d "$target" ]] || fail "Hermes data target is not a directory: $target"
+      [[ "$(stat -c %u "$target")" == "$target_uid" ]] || fail "Hermes data target owner mismatch: $target"
+    fi
+  done
+  for target in "${new_targets[@]}"; do
+    [[ ! -d "$target" || -z "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]] || fail "Refusing to reuse non-empty target for a new Hermes path: $target"
+  done
+  for target in "${migrate_targets[@]}"; do
+    [[ ! -d "$target" || -z "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]] || \
+      fail "Refusing to overwrite non-empty Hermes migration target: $target"
+  done
+  local available required_bytes available_inodes
+  available="$(df -PB1 "$STORAGE_TARGET_MOUNT" | awk 'NR==2 {print $4}')"
+  required_bytes=$((bytes + bytes / 10 + 536870912))
+  [[ "$available" -ge "$required_bytes" ]] || fail "Insufficient space on $STORAGE_TARGET_MOUNT: need $required_bytes bytes, available $available"
+  for logical in "${migrate_sources[@]}"; do
+    inode_need=$((inode_need + $(find "$logical" -xdev -printf '.' | wc -c)))
+  done
+  available_inodes="$(df -Pi "$STORAGE_TARGET_MOUNT" | awk 'NR==2 {print $4}')"
+  [[ "${available_inodes:-0}" -ge "$inode_need" ]] || fail "Insufficient free inodes on $STORAGE_TARGET_MOUNT: need $inode_need, available ${available_inodes:-0}"
+
+  STORAGE_STATE_DIR="$STORAGE_TARGET_MOUNT/hermes-tec01/migrations/$TARGET_USER/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  mkdir -p "$STORAGE_STATE_DIR"
+  chmod 700 "$STORAGE_STATE_DIR"
+  STORAGE_SUMMARY_JSON="$STORAGE_STATE_DIR/storage-summary.json"
+  units_file="$STORAGE_STATE_DIR/running-gateway-units.txt"
+  storage_capture_running_gateway_units "$units_file"
+  find "$TARGET_HOME/.hermes" -maxdepth 3 -type f \( -name 'config.yaml' -o -name '.env' -o -name 'gateway_state.json' \) -print 2>/dev/null > "$STORAGE_STATE_DIR/key-files.before" || true
+
+  begin_stage "storage_precopy"
+  for ((i=0; i<${#migrate_sources[@]}; i++)); do
+    mkdir -p "${migrate_targets[$i]}"
+    chown "$TARGET_USER":"$TARGET_USER" "${migrate_targets[$i]}"
+    log "Pre-copying ${migrate_sources[$i]} to ${migrate_targets[$i]}"
+    set +e
+    rsync -aHAXx --numeric-ids --delete "${migrate_sources[$i]}/" "${migrate_targets[$i]}/"
+    precopy_rc=$?
+    set -e
+    if [[ "$precopy_rc" -ne 0 && "$precopy_rc" -ne 24 ]]; then
+      fail "Hermes storage pre-copy failed (rsync exit $precopy_rc)"
+    fi
+    if [[ "$precopy_rc" -eq 24 ]]; then
+      warn "Files changed during Hermes pre-copy; the stopped final sync will reconcile them"
+    fi
+  done
+
+  rollback_storage_cutover() {
+    local created
+    STORAGE_ROLLBACK_ARMED=false
+    # A previous restore attempt may have started only some units. Stop every
+    # unit from the captured running set before reverting paths to avoid split
+    # writes between the source tree and /data.
+    storage_stop_gateway_units "$units_file" >/dev/null 2>&1 || true
+    for created in "${created_links[@]}"; do
+      [[ -L "$created" ]] && rm -f "$created"
+    done
+    if [[ -n "$backup_runtime" && -e "$backup_runtime" ]]; then
+      [[ -L "$TARGET_HOME/hermes-agent" ]] && rm -f "$TARGET_HOME/hermes-agent"
+      [[ -e "$TARGET_HOME/hermes-agent" ]] || mv "$backup_runtime" "$TARGET_HOME/hermes-agent"
+      backup_runtime=""
+    fi
+    if [[ -n "$backup_home" && -e "$backup_home" ]]; then
+      [[ -L "$TARGET_HOME/.hermes" ]] && rm -f "$TARGET_HOME/.hermes"
+      [[ -e "$TARGET_HOME/.hermes" ]] || mv "$backup_home" "$TARGET_HOME/.hermes"
+      backup_home=""
+    fi
+    [[ "$marker_existed" == true ]] || rm -f "$marker"
+    storage_remove_created_mount_guards
+    storage_restore_gateway_units "$units_file" || true
+  }
+  STORAGE_ROLLBACK_ARMED=true
+
+  begin_stage "storage_cutover"
+  if ! storage_stop_gateway_units "$units_file"; then
+    storage_restore_gateway_units "$units_file" || true
+    fail "Failed to stop gateway services for Hermes storage migration"
+  fi
+  if ! storage_find_unmanaged_processes "${migrate_sources[0]:-}" "${migrate_sources[1]:-}" > "$STORAGE_STATE_DIR/unmanaged-processes.txt"; then
+    storage_restore_gateway_units "$units_file" || true
+    fail "Unmanaged Hermes processes still use source paths; see $STORAGE_STATE_DIR/unmanaged-processes.txt"
+  fi
+  for ((i=0; i<${#migrate_sources[@]}; i++)); do
+    if ! rsync -aHAXx --numeric-ids --delete "${migrate_sources[$i]}/" "${migrate_targets[$i]}/"; then
+      storage_restore_gateway_units "$units_file" || true
+      fail "Hermes storage final sync failed"
+    fi
+    if [[ -n "$(rsync -aHAXxni --numeric-ids --delete "${migrate_sources[$i]}/" "${migrate_targets[$i]}/")" ]]; then
+      storage_restore_gateway_units "$units_file" || true
+      fail "Hermes storage verification found differences after final sync"
+    fi
+  done
+  # Inventory equivalence protects migrations of an existing .hermes tree.
+  # A fresh install has no pre-cutover profile tree, so comparing it with the
+  # newly-created empty .hermes directory would manufacture a false change.
+  if [[ "$verify_profile_inventory" == true ]]; then
+    storage_snapshot_profile_state "$STORAGE_STATE_DIR/profile-state.before"
+  fi
+
+  for ((i=0; i<${#migrate_sources[@]}; i++)); do
+    logical="${migrate_sources[$i]}"
+    target="${migrate_targets[$i]}"
+    name="$(basename "$logical")"
+    local backup="$logical.before-data-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    if [[ "$name" == "hermes-agent" ]]; then backup_runtime="$backup"; else backup_home="$backup"; fi
+    if ! mv "$logical" "$backup" || ! ln -s "$target" "$logical"; then
+      rollback_storage_cutover
+      fail "Failed to switch Hermes storage mapping for $logical"
+    fi
+    created_links+=("$logical")
+    migrated_csv="${migrated_csv}${migrated_csv:+,}$name"
+  done
+  for ((i=0; i<${#new_logicals[@]}; i++)); do
+    logical="${new_logicals[$i]}"
+    target="${new_targets[$i]}"
+    if ! mkdir -p "$target" || ! chown "$TARGET_USER":"$TARGET_USER" "$target" || ! chmod 700 "$target" || ! ln -s "$target" "$logical"; then
+      rollback_storage_cutover
+      fail "Failed to create Hermes storage link: $logical"
+    fi
+    created_links+=("$logical")
+    name="$(basename "$logical")"
+    migrated_csv="${migrated_csv}${migrated_csv:+,}$name"
+  done
+  if ! touch "$marker" || ! chown "$TARGET_USER":"$TARGET_USER" "$marker" || ! chmod 600 "$marker"; then
+    rollback_storage_cutover
+    fail "Failed to create Hermes storage marker: $marker"
+  fi
+  STORAGE_MANAGED=true
+
+  begin_stage "storage_verify"
+  for logical in "$TARGET_HOME/hermes-agent" "$TARGET_HOME/.hermes"; do
+    if [[ -L "$logical" ]]; then
+      target="$target_base/$(basename "$logical")"
+      [[ "$(readlink -f "$logical")" == "$target" && -d "$target" ]] || {
+        rollback_storage_cutover
+        fail "Hermes storage link verification failed: $logical"
+      }
+    fi
+  done
+  if [[ -n "$backup_runtime" && -x "$TARGET_HOME/hermes-agent/venv/bin/python" ]]; then
+    run_as_target "$(shell_quote "$TARGET_HOME/hermes-agent/venv/bin/python") -c 'import hermes_cli'" || {
+      rollback_storage_cutover
+      fail "Migrated Hermes runtime import verification failed"
+    }
+    if [[ -x "$TARGET_HOME/hermes-agent/hermes" ]]; then
+      run_as_target "$(shell_quote "$TARGET_HOME/hermes-agent/hermes") --version >/dev/null" || {
+        rollback_storage_cutover
+        fail "Migrated Hermes runtime version verification failed"
+      }
+    fi
+  fi
+  if ! storage_install_mount_guards; then
+    rollback_storage_cutover
+    fail "Failed to install Hermes data mount guards"
+  fi
+  if [[ "$verify_profile_inventory" == true ]]; then
+    storage_snapshot_profile_state "$STORAGE_STATE_DIR/profile-state.after"
+    if ! cmp -s "$STORAGE_STATE_DIR/profile-state.before" "$STORAGE_STATE_DIR/profile-state.after"; then
+      rollback_storage_cutover
+      fail "Hermes profile/config inventory changed during storage cutover"
+    fi
+  fi
+  if ! storage_restore_gateway_units "$units_file"; then
+    rollback_storage_cutover
+    fail "Hermes data migrated, but one or more gateway services could not be restored"
+  fi
+
+  begin_stage "storage_cleanup"
+  [[ -z "$backup_runtime" ]] || rm -rf --one-file-system "$backup_runtime"
+  [[ -z "$backup_home" ]] || rm -rf --one-file-system "$backup_home"
+  sync
+  status="$([[ "$migrate" -eq 1 ]] && echo migrated || echo initialized)"
+  storage_write_summary "$status" "$(( $(now_ms) - started ))" "$bytes" "$migrated_csv" "${source_fs:-/}" "$STORAGE_TARGET_FS"
+  STORAGE_ROLLBACK_ARMED=false
+  STORAGE_CREATED_GUARDS=()
+  unset -f rollback_storage_cutover
+  log "Hermes storage $status at $target_base"
 }
 
 write_default_template() {
@@ -796,14 +1531,14 @@ if manual_bank_id:
     )
     raise SystemExit(0)
 
-if selected_action == "create" and selected_profile != "default":
+if selected_profile != "default":
     default_bank_id = current_bank_id(profile_dir("default"))
     if not safe_bank_id.fullmatch(default_bank_id):
         raise SystemExit(
-            "Cannot create named profile: default Hindsight bank_id is missing or invalid"
+            "Cannot configure named profile: default Hindsight bank_id is missing or invalid"
         )
     write_plan(
-        mode="new-profile-default-bank",
+        mode="named-profile-default-bank",
         profiles=[make_plan_record(
             {"profile": selected_profile, "home": str(profile_dir(selected_profile))},
             default_bank_id,
@@ -1119,6 +1854,190 @@ path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encodi
 PY
 }
 
+apply_sync_other_profiles_cli_override() {
+  [[ -n "$SYNC_OTHER_PROFILES_CLI" ]] || return 0
+  python3 - "$PAYLOAD_JSON" "$SYNC_OTHER_PROFILES_CLI" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+value = sys.argv[2] == "true"
+payload = json.loads(path.read_text(encoding="utf-8"))
+options = payload.setdefault("options", {})
+if not isinstance(options, dict):
+    raise SystemExit("payload.options must be an object")
+options["syncOtherProfiles"] = value
+path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+build_profile_sync_payload() {
+  local output_payload="$1"
+  local output_profiles="$2"
+  python3 - "$PAYLOAD_JSON" "$output_payload" "$output_profiles" "$PROFILE_SYNC_SUMMARY_JSON" "$PROFILE_NAME" "$TARGET_HOME" <<'PY'
+import copy
+import json
+import sys
+from pathlib import Path
+
+source_path, output_path, profiles_path, summary_path, selected_profile, target_home = sys.argv[1:]
+payload = json.loads(Path(source_path).read_text(encoding="utf-8"))
+config = payload.get("config") or {}
+options = payload.get("options") or {}
+if not isinstance(config, dict) or not isinstance(options, dict):
+    raise SystemExit("payload config/options must be objects")
+
+overwrite_all = bool(options.get("overwriteExistingConfig", options.get("overwrite", False)))
+overwrite_fields = options.get("overwriteFields") or []
+if not isinstance(overwrite_fields, list) or not all(isinstance(item, str) and item.strip() for item in overwrite_fields):
+    raise SystemExit("options.overwriteFields must be a list of non-empty strings")
+
+allowed_roots = {
+    "env", "configYaml", "config_yaml", "aops", "modelGateway", "hindsight",
+    "userInstructions", "userMemory", "soul",
+}
+
+def get_path(root, parts):
+    cur = root
+    for part in parts:
+        if not isinstance(cur, dict) or part not in cur:
+            return None, False
+        cur = cur[part]
+    return copy.deepcopy(cur), True
+
+def set_path(root, parts, value):
+    cur = root
+    for part in parts[:-1]:
+        cur = cur.setdefault(part, {})
+    cur[parts[-1]] = value
+
+sync_config = copy.deepcopy(config) if overwrite_all else {}
+if not overwrite_all:
+    for field in overwrite_fields:
+        parts = field.split(".")
+        if not parts or parts[0] not in allowed_roots:
+            continue
+        value, present = get_path(config, parts)
+        if present:
+            set_path(sync_config, parts, value)
+
+protected = []
+def remove_path(root, parts, label):
+    cur = root
+    for part in parts[:-1]:
+        if not isinstance(cur, dict) or part not in cur:
+            return
+        cur = cur[part]
+    if isinstance(cur, dict) and parts[-1] in cur:
+        cur.pop(parts[-1], None)
+        protected.append(label)
+
+remove_path(sync_config, ["env", "AOPS_BOT_TOKEN"], "env.AOPS_BOT_TOKEN")
+remove_path(sync_config, ["aops", "AOPS_BOT_TOKEN"], "aops.AOPS_BOT_TOKEN")
+remove_path(sync_config, ["configYaml", "platforms", "aops", "token"], "configYaml.platforms.aops.token")
+remove_path(sync_config, ["configYaml", "gateway", "platforms", "aops", "token"], "configYaml.gateway.platforms.aops.token")
+remove_path(sync_config, ["config_yaml", "platforms", "aops", "token"], "configYaml.platforms.aops.token")
+remove_path(sync_config, ["config_yaml", "gateway", "platforms", "aops", "token"], "configYaml.gateway.platforms.aops.token")
+
+sync_overwrite_fields = []
+for field in overwrite_fields:
+    if field in {
+        "env.AOPS_BOT_TOKEN", "aops.AOPS_BOT_TOKEN",
+        "configYaml.platforms.aops.token", "configYaml.gateway.platforms.aops.token",
+        "config_yaml.platforms.aops.token", "config_yaml.gateway.platforms.aops.token",
+    }:
+        if field not in protected:
+            protected.append(field.replace("config_yaml", "configYaml"))
+        continue
+    if field.split(".", 1)[0] in allowed_roots:
+        sync_overwrite_fields.append(field)
+
+sync_payload = {
+    "config": sync_config,
+    "options": {
+        "upgrade": True,
+        "overwriteExistingConfig": overwrite_all,
+        "overwriteFields": sync_overwrite_fields,
+    },
+}
+Path(output_path).write_text(json.dumps(sync_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+home = Path(target_home)
+root = home / ".hermes"
+profiles_root = root / "profiles"
+profiles = ["default"]
+if profiles_root.is_dir():
+    base = profiles_root.resolve()
+    for child in sorted(profiles_root.iterdir()):
+        if child.is_symlink() or not child.is_dir():
+            continue
+        try:
+            child.resolve().relative_to(base)
+        except ValueError:
+            continue
+        profiles.append(child.name)
+Path(profiles_path).write_text(json.dumps(profiles, ensure_ascii=False) + "\n", encoding="utf-8")
+
+summary = {
+    "enabled": True,
+    "selectedProfile": selected_profile,
+    "protectedFields": sorted(set(protected)),
+    "profiles": [],
+    "failedProfiles": [],
+}
+Path(summary_path).write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+record_profile_sync_result() {
+  local profile="$1"
+  local config_status="$2"
+  local gateway_action="$3"
+  local gateway_status="$4"
+  local duration_ms="$5"
+  local message="${6:-}"
+  python3 - "$PROFILE_SYNC_SUMMARY_JSON" "$profile" "$config_status" "$gateway_action" "$gateway_status" "$duration_ms" "$message" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+profile, config_status, gateway_action, gateway_status, duration_ms, message = sys.argv[2:]
+data = json.loads(path.read_text(encoding="utf-8"))
+entries = data.setdefault("profiles", [])
+entry = next((item for item in entries if item.get("profile") == profile), None)
+if entry is None:
+    entry = {"profile": profile}
+    entries.append(entry)
+entry.update({
+    "configStatus": config_status,
+    "gatewayAction": gateway_action or None,
+    "gatewayStatus": gateway_status or None,
+    "durationMs": int(entry.get("durationMs") or 0) + int(duration_ms or 0),
+})
+if message:
+    entry["message"] = message
+if config_status == "failed" or gateway_status == "failed":
+    failed = data.setdefault("failedProfiles", [])
+    if profile not in failed:
+        failed.append(profile)
+path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+profile_sync_has_failures() {
+  python3 - "$PROFILE_SYNC_SUMMARY_JSON" <<'PY'
+import json, sys
+from pathlib import Path
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    print("true" if data.get("failedProfiles") else "false")
+except Exception:
+    print("true")
+PY
+}
+
 remote_config_supports_profile() {
   [[ -x "$INSTALL_DIR/venv/bin/python" ]] || return 1
   run_as_target "'$INSTALL_DIR/venv/bin/python' -m hermes_cli.remote_config apply --help | grep -q -- '--profile'" >/dev/null 2>&1
@@ -1237,11 +2156,12 @@ ensure_gateway_service_installed() {
   local profile_arg
   profile_arg="$(profile_arg_for "$profile")"
   if json_bool options.installGatewayService true; then
-    STAGE="gateway_install_service"
+    begin_stage "gateway_install_service"
     log "Ensuring Hermes gateway service is installed for $TARGET_USER profile $profile"
     run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; hermes $profile_arg gateway install --force --no-start-now --start-on-login"
+    storage_install_mount_guards || fail "Failed to install Hermes data mount guard for profile $profile"
   fi
-  STAGE="gateway_${action}"
+  begin_stage "gateway_${action}"
   controlled_gateway_lifecycle "$profile" "$action" 240 true
 }
 
@@ -1282,8 +2202,9 @@ def profile_home(profile: str) -> Path:
 unit = service_name(profile)
 profile_dir = profile_home(profile)
 profile_args = [] if profile == "default" else ["-p", profile]
+lifecycle_started = time.monotonic()
 
-def append_summary(bucket: str, message: str) -> None:
+def append_summary(bucket: str, message: str, **extra) -> None:
     if not summary_json:
         return
     try:
@@ -1291,7 +2212,13 @@ def append_summary(bucket: str, message: str) -> None:
         data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         for key in ("restartedProfiles", "skippedProfiles", "failedProfiles", "diagnostics"):
             data.setdefault(key, [])
-        data[bucket].append({"profile": profile, "message": message})
+        entry = {
+            "profile": profile,
+            "message": message,
+            "durationMs": int((time.monotonic() - lifecycle_started) * 1000),
+        }
+        entry.update({key: value for key, value in extra.items() if value is not None})
+        data[bucket].append(entry)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except Exception:
         pass
@@ -1453,6 +2380,7 @@ def wait_ready() -> bool:
     deadline = time.monotonic() + max_wait
     next_progress = time.monotonic()
     warned_60 = False
+    runtime_ready_at = None
     while time.monotonic() < deadline:
         st = state()
         pid = int(st.get("pid") or current_pid() or 0)
@@ -1464,17 +2392,53 @@ def wait_ready() -> bool:
         if gateway_state == "running" and pid_alive(pid):
             if not require_aops:
                 print(f"✓ Gateway profile {profile} runtime is running (PID {pid})")
-                append_summary("restartedProfiles", f"{action} completed; pid={pid}")
+                append_summary(
+                    "restartedProfiles",
+                    f"{action} completed; pid={pid}",
+                    runtimeState="running",
+                    aopsState=None,
+                )
                 return True
             aops_state, aops_detail = aops_status(st)
             if aops_state == "connected":
                 print(f"✓ Gateway profile {profile} runtime is running with AOPS connected (PID {pid})")
-                append_summary("restartedProfiles", f"{action} completed; pid={pid}; aops=connected")
+                append_summary(
+                    "restartedProfiles",
+                    f"{action} completed; pid={pid}; aops=connected",
+                    runtimeState="running",
+                    aopsState="connected",
+                )
                 return True
-            if aops_state in {"missing", "error", "failed", "startup_failed", "fatal", "disconnected"}:
-                diagnostics(f"AOPS platform not connected after gateway runtime started: state={aops_state}; {aops_detail or 'no detail'}")
-                append_summary("failedProfiles", f"aops not connected: {aops_state}")
-                return False
+            if runtime_ready_at is None:
+                runtime_ready_at = time.monotonic()
+                print(
+                    f"⏳ Gateway profile {profile} runtime is running; "
+                    f"waiting up to 15s for AOPS (state={aops_state})"
+                )
+            fatal_aops = aops_state in {"error", "failed", "startup_failed", "fatal"}
+            if fatal_aops or time.monotonic() - runtime_ready_at >= 15:
+                if fatal_aops:
+                    warning = (
+                        f"AOPS startup reported state={aops_state}; gateway runtime remains active "
+                        f"({aops_detail or 'no detail'})"
+                    )
+                else:
+                    warning = (
+                        f"AOPS not connected within 15s; gateway will continue reconnecting "
+                        f"(state={aops_state}; {aops_detail or 'no detail'})"
+                    )
+                print(f"⚠ {warning}", file=sys.stderr)
+                append_summary(
+                    "restartedProfiles",
+                    f"{action} completed; pid={pid}; aops={aops_state}",
+                    runtimeState="running",
+                    aopsState=aops_state,
+                    warning=warning,
+                )
+                append_summary("diagnostics", warning, runtimeState="running", aopsState=aops_state)
+                return True
+        else:
+            runtime_ready_at = None
         if gateway_state == "startup_failed":
             diagnostics(f"startup_failed: {st.get('exit_reason') or 'unknown'}")
             append_summary("failedProfiles", "startup_failed")
@@ -1511,6 +2475,32 @@ def wait_ready() -> bool:
         time.sleep(2)
     diagnostics(f"runtime did not become ready within {max_wait}s")
     append_summary("failedProfiles", f"timeout after {max_wait}s")
+    return False
+
+def wait_for_replacement(old_pid: int, timeout_seconds: int = 30) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    next_progress = time.monotonic()
+    while time.monotonic() < deadline:
+        st = state()
+        candidate = int(st.get("pid") or current_pid() or 0)
+        props = systemd_props()
+        main_pid = systemd_main_pid(props)
+        if candidate and candidate != old_pid and pid_alive(candidate):
+            print(f"✓ Replacement gateway process detected for profile {profile} (PID {candidate})")
+            return True
+        if main_pid and main_pid != old_pid and pid_alive(main_pid):
+            print(f"✓ Replacement systemd MainPID detected for profile {profile} (PID {main_pid})")
+            return True
+        if str(st.get("gateway_state") or "") == "startup_failed" or start_limited(props):
+            return False
+        now = time.monotonic()
+        if now >= next_progress:
+            print(
+                f"⏳ Waiting for systemd replacement for profile {profile}: "
+                f"oldPid={old_pid} mainPid={main_pid or 'unknown'}"
+            )
+            next_progress = now + 15
+        time.sleep(1)
     return False
 
 def hard_systemd_restart() -> int:
@@ -1563,13 +2553,34 @@ if before_state == "running" and pid_alive(before_pid):
             append_summary("failedProfiles", f"systemd restart failed: {rc}")
             raise SystemExit(rc)
         raise SystemExit(0 if wait_ready() else 1)
-    drain_deadline = time.monotonic() + 185
+    try:
+        active_agents = int(before.get("active_agents") or 0)
+    except Exception:
+        active_agents = 0
+    drain_timeout = 185 if active_agents > 0 else 30
+    drain_started = time.monotonic()
+    drain_deadline = drain_started + drain_timeout
+    next_drain_progress = drain_started + 15
     while pid_alive(before_pid) and time.monotonic() < drain_deadline:
+        now = time.monotonic()
+        if now >= next_drain_progress:
+            print(
+                f"⏳ Graceful restart draining profile {profile}: "
+                f"elapsed={int(now - drain_started)}s activeAgents={active_agents} "
+                f"timeout={drain_timeout}s"
+            )
+            next_drain_progress = now + 15
         time.sleep(1)
     if pid_alive(before_pid):
-        print(f"⚠ Graceful restart for profile {profile} did not exit within 185s; forcing systemd restart.")
+        print(
+            f"⚠ Graceful restart for profile {profile} did not exit within "
+            f"{drain_timeout}s; forcing systemd restart."
+        )
     else:
-        print(f"✓ Previous gateway PID {before_pid} exited; starting replacement.")
+        print(f"✓ Previous gateway PID {before_pid} exited; waiting for systemd replacement.")
+        if wait_for_replacement(before_pid, 30):
+            raise SystemExit(0 if wait_ready() else 1)
+        print(f"⚠ No replacement process appeared for profile {profile} within 30s; forcing systemd restart.")
     rc = hard_systemd_restart()
     if rc != 0:
         diagnostics(f"systemd restart failed with exit code {rc}")
@@ -1725,7 +2736,7 @@ restart_other_running_profiles_after_upgrade() {
   [[ "${RUNTIME_CHANGED:-false}" == "true" ]] || return 0
   json_bool options.restartOtherRunningProfilesAfterUpgrade true || return 0
 
-  STAGE="gateway_restart_other_profiles"
+  begin_stage "gateway_restart_other_profiles"
   log "Restarting other running Hermes profile gateways after runtime upgrade"
   local selector="$WORK_DIR/select-running-profiles.py"
   write_gateway_profile_selector "$selector"
@@ -1766,7 +2777,7 @@ PY
     return 0
   fi
 
-  STAGE="gateway_restart_owner_bank_profiles"
+  begin_stage "gateway_restart_owner_bank_profiles"
   log "Restarting running Hermes profile gateways whose AOPS owner bank changed"
   local selector="$WORK_DIR/select-owner-bank-profiles.py"
   write_gateway_profile_selector "$selector"
@@ -1791,6 +2802,117 @@ PY
   done
 }
 
+profile_sync_config_status() {
+  local profile="$1"
+  python3 - "$PROFILE_SYNC_SUMMARY_JSON" "$profile" <<'PY'
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+entry = next((item for item in data.get("profiles", []) if item.get("profile") == sys.argv[2]), {})
+print(entry.get("configStatus") or "pending")
+PY
+}
+
+apply_other_profile_configs() {
+  [[ "$SYNC_OTHER_PROFILES" == true ]] || return 0
+  local profile started duration result_path lazy_path status
+  while IFS= read -r profile; do
+    [[ -n "$profile" && "$profile" != "$PROFILE_NAME" ]] || continue
+    started="$(now_ms)"
+    result_path="$WORK_DIR/remote-config-apply-${profile//[^A-Za-z0-9_.-]/_}.json"
+    log "Synchronizing explicit configuration to profile $profile"
+    set +e
+    run_as_target "'$INSTALL_DIR/venv/bin/python' -m hermes_cli.remote_config apply --payload $(shell_quote "$PROFILE_SYNC_PAYLOAD_JSON") --profile $(shell_quote "$profile") --skip-skills" > "$result_path" 2>&1
+    status=$?
+    set -e
+    if [[ "$status" -ne 0 ]]; then
+      duration=$(($(now_ms) - started))
+      warn "Configuration sync failed for profile $profile; continuing"
+      record_profile_sync_result "$profile" "failed" "" "" "$duration" "remote_config apply failed (exit $status)"
+      continue
+    fi
+    lazy_path="$WORK_DIR/gateway-lazy-installs-${profile//[^A-Za-z0-9_.-]/_}.json"
+    ensure_gateway_lazy_installs_disabled_for_profile "$profile" > "$lazy_path" || true
+    record_lazy_installs_change_if_needed "$profile" "$lazy_path"
+    set +e
+    validate_aops_gateway_config_for_profile "$profile" > "$WORK_DIR/aops-gateway-config-check-${profile//[^A-Za-z0-9_.-]/_}.json" 2>&1
+    status=$?
+    set -e
+    duration=$(($(now_ms) - started))
+    if [[ "$status" -ne 0 ]]; then
+      warn "AOPS config validation failed for profile $profile; continuing"
+      record_profile_sync_result "$profile" "failed" "" "" "$duration" "AOPS config validation failed"
+    else
+      record_profile_sync_result "$profile" "updated" "" "" "$duration" "configuration synchronized"
+    fi
+  done < <(python3 - "$PROFILE_SYNC_PROFILES_JSON" <<'PY'
+import json, sys
+from pathlib import Path
+for profile in json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")):
+    print(profile)
+PY
+)
+}
+
+gateway_action_for_profile() {
+  local profile="$1"
+  python3 - "$(profile_home_for "$profile")" <<'PY'
+import json, os, sys
+from pathlib import Path
+home = Path(sys.argv[1])
+try:
+    state = json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))
+except Exception:
+    state = {}
+pid = state.get("pid")
+alive = False
+try:
+    if int(pid or 0) > 0:
+        os.kill(int(pid), 0)
+        alive = True
+except (OSError, TypeError, ValueError):
+    pass
+print("restart" if state.get("gateway_state") == "running" and alive else "start")
+PY
+}
+
+start_all_profile_gateways() {
+  [[ "$SYNC_OTHER_PROFILES" == true ]] || return 0
+  local profile action started duration status profile_arg
+  while IFS= read -r profile; do
+    [[ -n "$profile" ]] || continue
+    if [[ "$(profile_sync_config_status "$profile")" == "failed" ]]; then
+      warn "Not starting profile $profile because its configuration failed"
+      continue
+    fi
+    started="$(now_ms)"
+    action="$(gateway_action_for_profile "$profile")"
+    profile_arg="$(profile_arg_for "$profile")"
+    log "Gateway profile $profile: synchronized action=$action"
+    set +e
+    run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; hermes $profile_arg gateway install --force --no-start-now --start-on-login"
+    status=$?
+    if [[ "$status" -eq 0 ]]; then
+      controlled_gateway_lifecycle "$profile" "$action" 240 true
+      status=$?
+    fi
+    set -e
+    duration=$(($(now_ms) - started))
+    if [[ "$status" -eq 0 ]]; then
+      record_profile_sync_result "$profile" "$(profile_sync_config_status "$profile")" "$action" "running" "$duration" "gateway $action completed"
+    else
+      warn "Gateway $action failed for profile $profile; continuing"
+      record_profile_sync_result "$profile" "$(profile_sync_config_status "$profile")" "$action" "failed" "$duration" "gateway lifecycle failed (exit $status)"
+    fi
+  done < <(python3 - "$PROFILE_SYNC_PROFILES_JSON" <<'PY'
+import json, sys
+from pathlib import Path
+for profile in json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")):
+    print(profile)
+PY
+)
+}
+
 install_skill_zips() {
   local profile="$1"
   local profile_dir
@@ -1800,7 +2922,6 @@ install_skill_zips() {
     profile_dir="$TARGET_HOME/.hermes/profiles/$profile"
   fi
   [[ -s "$SKILLS_FILE" ]] || return 0
-  STAGE="skills_zip"
   log "Installing skill zip(s) into profile $profile"
   python3 - "$SKILLS_FILE" "$profile_dir" "$WORK_DIR/skills-zip" "$(json_get options.overwriteSkills)" <<'PY'
 import json
@@ -1880,7 +3001,6 @@ install_preinstall_skills() {
   local profile="$1"
   local profile_dir
   profile_dir="$(profile_home_for "$profile")"
-  STAGE="skills_preinstall"
   log "Installing preinstall skill(s) into profile $profile"
   run_as_target "$(shell_quote "$INSTALL_DIR/venv/bin/python") - $(shell_quote "$PAYLOAD_JSON") $(shell_quote "$profile_dir") <<'PY'
 import inspect
@@ -2234,14 +3354,30 @@ PY
 
 need_cmd python3
 need_cmd tar
+if [[ -n "$BUNDLE_CACHE_DIR" && "$BUNDLE_CACHE_DIR" != /* ]]; then
+  fail "--bundle-cache-dir must be an absolute path"
+fi
+if [[ "$HERMES_DATA_ROOT" != /* ]]; then
+  fail "--hermes-data-root must be an absolute path"
+fi
 
 BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-tec01-bootstrap.XXXXXX")"
 chmod 700 "$BOOTSTRAP_DIR"
+TIMING_RAW_FILE="$BOOTSTRAP_DIR/install-timings.tsv"
+: > "$TIMING_RAW_FILE"
+TIMING_START_MS="$(now_ms)"
+TIMING_STAGE_START_MS="$TIMING_START_MS"
+STAGE="bootstrap"
+trap on_exit EXIT
+trap 'on_interrupt 1' HUP
+trap 'on_interrupt 2' INT
+trap 'on_interrupt 15' TERM
 TEMPLATE_YAML="$BOOTSTRAP_DIR/template.yaml"
 SETS_FILE="$BOOTSTRAP_DIR/sets.txt"
 SKILLS_FILE="$BOOTSTRAP_DIR/skills-zips.txt"
 PAYLOAD_JSON="$BOOTSTRAP_DIR/payload.json"
 PROFILE_JSON="$BOOTSTRAP_DIR/profile.json"
+STORAGE_SUMMARY_JSON="$BOOTSTRAP_DIR/storage-summary.json"
 
 python3 - "$SETS_FILE" "${SET_ARGS[@]}" <<'PY'
 import json
@@ -2252,7 +3388,7 @@ Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:], ensure_ascii=False) + "\n"
 PY
 printf '%s\n' "${SKILLS_ZIPS[@]}" > "$SKILLS_FILE"
 
-STAGE="template"
+begin_stage "template"
 if [[ -n "$TEMPLATE_FILE" ]]; then
   [[ -f "$TEMPLATE_FILE" ]] || fail "Template file not found: $TEMPLATE_FILE"
   cp "$TEMPLATE_FILE" "$TEMPLATE_YAML"
@@ -2263,15 +3399,23 @@ else
   write_default_template "$TEMPLATE_YAML"
 fi
 
-STAGE="render_payload"
+begin_stage "render_payload"
 render_payload
+apply_sync_other_profiles_cli_override
+
+SYNC_OTHER_PROFILES_RAW="$(json_get options.syncOtherProfiles)"
+case "${SYNC_OTHER_PROFILES_RAW:-false}" in
+  true|True) SYNC_OTHER_PROFILES=true ;;
+  false|False|"") SYNC_OTHER_PROFILES=false ;;
+  *) fail "options.syncOtherProfiles must be true or false" ;;
+esac
 
 TASK_ID="$(json_get taskId || true)"
 TARGET_USER="$(json_get targetUser)"
 [[ -n "$TARGET_USER" ]] || fail "targetUser is required"
 validate_username "$TARGET_USER"
 
-STAGE="ensure_user"
+begin_stage "ensure_user"
 if ! id "$TARGET_USER" >/dev/null 2>&1; then
   [[ "$(id -u)" -eq 0 ]] || fail "target user does not exist; run with sudo to create it"
   log "Creating user: $TARGET_USER"
@@ -2281,6 +3425,8 @@ fi
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 [[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]] || fail "Could not resolve HOME for $TARGET_USER"
 INSTALL_DIR="$TARGET_HOME/hermes-agent"
+begin_stage "storage_preflight"
+ensure_hermes_data_layout
 ensure_target_private_dir "$TARGET_HOME/.hermes"
 ensure_target_private_dir "$TARGET_HOME/.hermes/tec01-install"
 enable_linger_if_possible
@@ -2293,12 +3439,26 @@ fi
 rm -rf "$WORK_DIR"
 ensure_target_private_dir "$WORK_DIR"
 
+if [[ -f "$STORAGE_SUMMARY_JSON" ]]; then
+  storage_summary_source="$STORAGE_SUMMARY_JSON"
+  STORAGE_SUMMARY_JSON="$WORK_DIR/storage-summary.json"
+  if [[ "$storage_summary_source" != "$STORAGE_SUMMARY_JSON" ]]; then
+    cp "$storage_summary_source" "$STORAGE_SUMMARY_JSON"
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown "$TARGET_USER":"$TARGET_USER" "$STORAGE_SUMMARY_JSON"
+  fi
+else
+  STORAGE_SUMMARY_JSON="$WORK_DIR/storage-summary.json"
+fi
+
 PAYLOAD_IN_HOME="$WORK_DIR/tec01-payload.json"
 PROFILE_JSON="$WORK_DIR/profile.json"
 APPLY_RESULT_JSON="$WORK_DIR/remote-config-apply.json"
 PREINSTALL_RESULT_JSON="$WORK_DIR/skills-preinstall-result.json"
 SKILLS_RESULT_JSON="$WORK_DIR/skills-install-result.json"
 RESTART_SUMMARY_JSON="$WORK_DIR/restart-summary.json"
+PROFILE_SYNC_SUMMARY_JSON="$WORK_DIR/profile-sync-summary.json"
 python3 - "$RESTART_SUMMARY_JSON" <<'PY'
 import json
 import sys
@@ -2311,15 +3471,28 @@ Path(sys.argv[1]).write_text(json.dumps({
     "diagnostics": [],
 }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
+python3 - "$PROFILE_SYNC_SUMMARY_JSON" <<'PY'
+import json
+import sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({
+    "enabled": False,
+    "selectedProfile": None,
+    "protectedFields": [],
+    "profiles": [],
+    "failedProfiles": [],
+}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
 cp "$PAYLOAD_JSON" "$PAYLOAD_IN_HOME"
 chmod 600 "$PAYLOAD_IN_HOME"
 if [[ "$(id -u)" -eq 0 ]]; then
   chown "$TARGET_USER":"$TARGET_USER" "$PAYLOAD_IN_HOME"
   chown "$TARGET_USER":"$TARGET_USER" "$RESTART_SUMMARY_JSON"
+  chown "$TARGET_USER":"$TARGET_USER" "$PROFILE_SYNC_SUMMARY_JSON"
 fi
 PAYLOAD_JSON="$PAYLOAD_IN_HOME"
 
-STAGE="select_profile"
+begin_stage "select_profile"
 select_profile
 if [[ "$(id -u)" -eq 0 ]]; then
   # select_profile runs as root and may inherit a 0600 umask.  The resolver
@@ -2339,16 +3512,41 @@ print(json.load(open(sys.argv[1], encoding="utf-8"))["action"])
 PY
 )"
 log "Selected profile: $PROFILE_NAME ($PROFILE_ACTION)"
+if [[ "$SYNC_OTHER_PROFILES" == true && "$PROFILE_ACTION" != "update" ]]; then
+  fail "syncOtherProfiles is only supported when updating an existing profile"
+fi
 
 # Resolve the AOPS owner before downloading or modifying the runtime.  A
 # default-profile update reconciles every existing AOPS profile; all lookups
 # must succeed before any profile configuration is written.
 OWNER_BANK_PLAN_JSON="$WORK_DIR/aops-owner-bank-plan.json"
 OWNER_BANK_PLAN_LOG_JSON="$WORK_DIR/aops-owner-bank-plan.log"
-STAGE="resolve_aops_owner_banks"
+begin_stage "resolve_aops_owner_banks"
 log "Resolving AOPS owner-backed Hindsight bank(s)"
 resolve_aops_owner_bank_plan | tee "$OWNER_BANK_PLAN_LOG_JSON"
 inject_current_owner_bank_into_payload
+
+PROFILE_SYNC_PAYLOAD_JSON="$WORK_DIR/profile-sync-payload.json"
+PROFILE_SYNC_PROFILES_JSON="$WORK_DIR/profile-sync-profiles.json"
+if [[ "$SYNC_OTHER_PROFILES" == true ]]; then
+  build_profile_sync_payload "$PROFILE_SYNC_PAYLOAD_JSON" "$PROFILE_SYNC_PROFILES_JSON"
+  if [[ "$(json_get options.overwriteExistingConfig)" == "True" || "$(json_get options.overwriteExistingConfig)" == "true" ]]; then
+    log "Cross-profile sync will apply all managed config fields except protected AOPS tokens"
+  else
+    log "Cross-profile sync will apply only options.overwriteFields"
+  fi
+  protected_fields="$(python3 - "$PROFILE_SYNC_SUMMARY_JSON" <<'PY'
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(",".join(data.get("protectedFields") or []))
+PY
+)"
+  [[ -z "$protected_fields" ]] || warn "Protected fields excluded from cross-profile sync: $protected_fields"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown "$TARGET_USER":"$TARGET_USER" "$PROFILE_SYNC_PAYLOAD_JSON" "$PROFILE_SYNC_PROFILES_JSON" "$PROFILE_SYNC_SUMMARY_JSON"
+  fi
+fi
 
 HERMES_INSTALLED=false
 RUNTIME_CHANGED=false
@@ -2385,27 +3583,27 @@ if [[ "$RUNTIME_UPDATE_NEEDED" == true ]]; then
   [[ -n "$BUNDLE_URL" ]] || fail "bundle.url is required when Hermes runtime must be installed or upgraded"
   [[ -n "$BUNDLE_SHA" && "$BUNDLE_SHA" != "<sha256>" ]] || fail "bundle.sha256 is required when Hermes runtime must be installed or upgraded"
 
-  STAGE="download_bundle"
+  begin_stage "download_bundle"
   BUNDLE_TGZ="$WORK_DIR/hermes-offline-bundle.tar.gz"
   log "Downloading bundle"
-  download "$BUNDLE_URL" "$BUNDLE_TGZ"
+  download_bundle "$BUNDLE_URL" "$BUNDLE_SHA" "$BUNDLE_TGZ"
   chmod 600 "$BUNDLE_TGZ"
   if [[ "$(id -u)" -eq 0 ]]; then
     chown "$TARGET_USER":"$TARGET_USER" "$BUNDLE_TGZ"
   fi
 
-  STAGE="verify_bundle"
+  begin_stage "verify_bundle"
   actual_sha="$(sha256_file "$BUNDLE_TGZ")"
   [[ "$actual_sha" == "$BUNDLE_SHA" ]] || fail "sha256 mismatch: expected $BUNDLE_SHA got $actual_sha"
 
-  STAGE="extract_bundle"
+  begin_stage "extract_bundle"
   ensure_target_private_dir "$WORK_DIR/extracted"
   run_as_target "tar -xzf '$BUNDLE_TGZ' -C '$WORK_DIR/extracted'"
   BUNDLE_DIR="$(find "$WORK_DIR/extracted" -maxdepth 1 -type d -name 'offline-bundle-*' | head -n 1)"
   [[ -n "$BUNDLE_DIR" && -f "$BUNDLE_DIR/install.sh" ]] || fail "bundle install.sh not found"
   chmod +x "$BUNDLE_DIR/install.sh"
 
-  STAGE="install_or_upgrade"
+  begin_stage "install_or_upgrade"
   if [[ -x "$INSTALL_DIR/hermes" || -d "$INSTALL_DIR/venv" || -d "$INSTALL_DIR/source-overlay" ]]; then
     log "Upgrading Hermes runtime for $TARGET_USER"
     run_as_target "cd '$BUNDLE_DIR' && bash install.sh '$INSTALL_DIR' --link --upgrade --preserve-config"
@@ -2417,45 +3615,96 @@ if [[ "$RUNTIME_UPDATE_NEEDED" == true ]]; then
   run_as_target "printf '%s\n' $(shell_quote "$BUNDLE_SHA") > $(shell_quote "$BUNDLE_STAMP")"
 fi
 
-STAGE="apply_profile_config"
+begin_stage "apply_profile_config"
 mark_payload_mode "$([[ "$PROFILE_ACTION" == "update" ]] && echo true || echo false)"
-run_as_target "'$INSTALL_DIR/venv/bin/python' -m hermes_cli.remote_config apply --payload '$PAYLOAD_JSON' --profile '$PROFILE_NAME' --skip-skills" | tee "$APPLY_RESULT_JSON"
-APPLY_CHANGED="$(json_file_has_runtime_relevant_changes "$APPLY_RESULT_JSON")"
+CURRENT_PROFILE_CONFIG_OK=true
+if [[ "$SYNC_OTHER_PROFILES" == true ]]; then
+  current_apply_started="$(now_ms)"
+  set +e
+  run_as_target "'$INSTALL_DIR/venv/bin/python' -m hermes_cli.remote_config apply --payload '$PAYLOAD_JSON' --profile '$PROFILE_NAME' --skip-skills" | tee "$APPLY_RESULT_JSON"
+  current_apply_status=$?
+  set -e
+  if [[ "$current_apply_status" -ne 0 ]]; then
+    CURRENT_PROFILE_CONFIG_OK=false
+    APPLY_CHANGED=false
+    record_profile_sync_result "$PROFILE_NAME" "failed" "" "" "$(($(now_ms) - current_apply_started))" "remote_config apply failed (exit $current_apply_status)"
+  else
+    APPLY_CHANGED="$(json_file_has_runtime_relevant_changes "$APPLY_RESULT_JSON")"
+    record_profile_sync_result "$PROFILE_NAME" "updated" "" "" "$(($(now_ms) - current_apply_started))" "configuration updated"
+  fi
+else
+  run_as_target "'$INSTALL_DIR/venv/bin/python' -m hermes_cli.remote_config apply --payload '$PAYLOAD_JSON' --profile '$PROFILE_NAME' --skip-skills" | tee "$APPLY_RESULT_JSON"
+  APPLY_CHANGED="$(json_file_has_runtime_relevant_changes "$APPLY_RESULT_JSON")"
+fi
 
 # The owner lookup is authoritative even when ordinary remote config updates
 # preserve an existing Hindsight file.  This synchronizes only the bank fields
 # for every profile included in the already-successful preflight plan.
 OWNER_BANK_SYNC_RESULT_JSON="$WORK_DIR/hindsight-owner-bank-sync.json"
 OWNER_BANK_SYNC_LOG_JSON="$WORK_DIR/hindsight-owner-bank-sync.log"
-STAGE="sync_hindsight_owner_banks"
+begin_stage "sync_hindsight_owner_banks"
 log "Synchronizing owner-backed Hindsight bank(s)"
 sync_hindsight_owner_banks | tee "$OWNER_BANK_SYNC_LOG_JSON"
 if [[ "$(owner_bank_sync_changed_for_profile "$PROFILE_NAME")" == "true" ]]; then
   APPLY_CHANGED=true
 fi
 
-STAGE="validate_aops_gateway_config"
-log "Validating AOPS gateway config for profile $PROFILE_NAME"
-validate_aops_gateway_config_for_profile "$PROFILE_NAME" | tee "$WORK_DIR/aops-gateway-config-check.json"
+if [[ "$SYNC_OTHER_PROFILES" == true ]]; then
+  begin_stage "sync_profile_configs"
+  apply_other_profile_configs
+fi
 
-install_preinstall_skills "$PROFILE_NAME" | tee "$PREINSTALL_RESULT_JSON"
-PREINSTALL_CHANGED="$(skills_result_has_changes "$PREINSTALL_RESULT_JSON")"
+begin_stage "validate_aops_gateway_config"
+if [[ "$CURRENT_PROFILE_CONFIG_OK" == true ]]; then
+  log "Validating AOPS gateway config for profile $PROFILE_NAME"
+  if ! validate_aops_gateway_config_for_profile "$PROFILE_NAME" | tee "$WORK_DIR/aops-gateway-config-check.json"; then
+    if [[ "$SYNC_OTHER_PROFILES" == true ]]; then
+      CURRENT_PROFILE_CONFIG_OK=false
+      record_profile_sync_result "$PROFILE_NAME" "failed" "" "" "0" "AOPS config validation failed"
+    else
+      fail "AOPS config validation failed for profile $PROFILE_NAME"
+    fi
+  fi
+fi
 
-install_skill_zips "$PROFILE_NAME" | tee "$SKILLS_RESULT_JSON"
-SKILL_ZIPS_CHANGED="$(skills_result_has_changes "$SKILLS_RESULT_JSON")"
+begin_stage "skills_preinstall"
+if [[ "$CURRENT_PROFILE_CONFIG_OK" == true ]]; then
+  install_preinstall_skills "$PROFILE_NAME" | tee "$PREINSTALL_RESULT_JSON"
+  PREINSTALL_CHANGED="$(skills_result_has_changes "$PREINSTALL_RESULT_JSON")"
+else
+  printf '{"installed":[]}\n' > "$PREINSTALL_RESULT_JSON"
+  PREINSTALL_CHANGED=false
+fi
+
+begin_stage "skills_zip"
+if [[ "$CURRENT_PROFILE_CONFIG_OK" == true ]]; then
+  install_skill_zips "$PROFILE_NAME" | tee "$SKILLS_RESULT_JSON"
+  SKILL_ZIPS_CHANGED="$(skills_result_has_changes "$SKILLS_RESULT_JSON")"
+else
+  printf '{"installed":[]}\n' > "$SKILLS_RESULT_JSON"
+  SKILL_ZIPS_CHANGED=false
+fi
 if [[ "$PREINSTALL_CHANGED" == true || "$SKILL_ZIPS_CHANGED" == true ]]; then
   SKILLS_CHANGED=true
 else
   SKILLS_CHANGED=false
 fi
 
-STAGE="disable_gateway_lazy_installs"
+begin_stage "disable_gateway_lazy_installs"
 LAZY_INSTALLS_RESULT_JSON="$WORK_DIR/gateway-lazy-installs.json"
-ensure_gateway_lazy_installs_disabled_for_profile "$PROFILE_NAME" | tee "$LAZY_INSTALLS_RESULT_JSON"
-LAZY_INSTALLS_CHANGED="$(json_file_changed_flag "$LAZY_INSTALLS_RESULT_JSON")"
-record_lazy_installs_change_if_needed "$PROFILE_NAME" "$LAZY_INSTALLS_RESULT_JSON"
+if [[ "$CURRENT_PROFILE_CONFIG_OK" == true ]]; then
+  ensure_gateway_lazy_installs_disabled_for_profile "$PROFILE_NAME" | tee "$LAZY_INSTALLS_RESULT_JSON"
+  LAZY_INSTALLS_CHANGED="$(json_file_changed_flag "$LAZY_INSTALLS_RESULT_JSON")"
+  record_lazy_installs_change_if_needed "$PROFILE_NAME" "$LAZY_INSTALLS_RESULT_JSON"
+else
+  printf '{"changed":false}\n' > "$LAZY_INSTALLS_RESULT_JSON"
+  LAZY_INSTALLS_CHANGED=false
+fi
 
-if [[ "$PROFILE_ACTION" == "update" ]]; then
+if [[ "$SYNC_OTHER_PROFILES" == true ]]; then
+  begin_stage "start_all_profile_gateways"
+  start_all_profile_gateways
+elif [[ "$PROFILE_ACTION" == "update" ]]; then
   FORCE_GATEWAY_RESTART=false
   if json_bool options.forceGatewayRestart false; then
     FORCE_GATEWAY_RESTART=true
@@ -2475,10 +3724,18 @@ else
   fi
 fi
 
-restart_other_profiles_after_owner_bank_sync
-restart_other_running_profiles_after_upgrade
+if [[ "$SYNC_OTHER_PROFILES" != true ]]; then
+  restart_other_profiles_after_owner_bank_sync
+  restart_other_running_profiles_after_upgrade
+fi
 
-STAGE="complete"
+begin_stage "complete"
 print_restart_summary
+if [[ "$SYNC_OTHER_PROFILES" == true ]]; then
+  cat "$PROFILE_SYNC_SUMMARY_JSON"
+  if [[ "$(profile_sync_has_failures)" == "true" ]]; then
+    fail "One or more profiles failed during synchronized update"
+  fi
+fi
 report_result "success" "$STAGE" "Hermes profile $PROFILE_NAME $PROFILE_ACTION completed for $TARGET_USER"
 log "Hermes profile $PROFILE_NAME $PROFILE_ACTION completed for $TARGET_USER"

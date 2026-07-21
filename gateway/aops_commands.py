@@ -62,6 +62,7 @@ _AOPS_NATIVE_COMMANDS = {
     "curator",
     "toolsets",
     "skills",
+    "memory",
 }
 
 _CATEGORY_MAP = {
@@ -112,6 +113,7 @@ _DESCRIPTION_ZH = {
     "soul": "查看或编辑当前 profile 的 SOUL.md 指令。",
     "user": "查看或编辑当前 profile 的 memories/USER.md 指令。",
     "busy": "查看或切换 busy 输入策略。",
+    "memory": "管理 MEMORY.md、USER.md、记忆预算和 memory provider。",
     "security": "查看或切换安全审批策略。",
     "securty": "查看或切换安全审批策略。",
 }
@@ -628,6 +630,8 @@ def _is_supported_custom_shape(canonical: str, raw_args: str) -> bool:
         return False
     if canonical == "busy":
         return (not args) or (len(args) == 1 and args[0] in {"status", "queue", "steer", "interrupt"})
+    if canonical == "memory":
+        return True
     return False
 
 
@@ -635,7 +639,7 @@ def is_supported_command(command: str | None, raw_args: str = "", canonical: str
     normalized = _effective_command(canonical or command, raw_args)
     if not normalized:
         return False
-    if normalized in {"skills", "cron", "curator", "toolsets", "soul", "user", "busy"}:
+    if normalized in {"skills", "cron", "curator", "toolsets", "soul", "user", "busy", "memory"}:
         return _is_supported_custom_shape(normalized, raw_args)
     try:
         from agent.skill_commands import resolve_skill_command_key
@@ -708,6 +712,17 @@ def _single_response(
 
 _INSTRUCTION_CONTENT_PREVIEW_LIMIT = 300
 _BUSY_MODES = {"queue", "steer", "interrupt"}
+_MEMORY_LIMIT_KEYS = {
+    "memory_char_limit": ("memory_char_limit", "记忆"),
+    "user_char_limit": ("user_char_limit", "用户画像"),
+}
+_MEMORY_TARGETS = {
+    "memory": "memory",
+    "user": "user",
+    "profile": "user",
+}
+_MEMORY_PROVIDER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_MEMORY_LIMIT_MAX = 100_000
 
 
 def _now_ms() -> int:
@@ -961,6 +976,300 @@ def _busy_command(command_text: str, args: list[str]) -> LocalCommandResult:
             }
         },
     )
+
+
+def _memory_paths() -> tuple[Path, Path, Path, Path]:
+    """Return profile-scoped memory files and provider state path."""
+    from hermes_constants import get_hermes_home
+    from tools.memory_tool import get_memory_dir
+
+    home = Path(get_hermes_home())
+    memory_dir = Path(get_memory_dir())
+    return (
+        memory_dir / "MEMORY.md",
+        memory_dir / "USER.md",
+        home / "aops-memory-state.json",
+        home,
+    )
+
+
+def _read_memory_provider_state(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_memory_provider_state(path: Path, provider: str) -> None:
+    from utils import atomic_json_write
+
+    atomic_json_write(path, {"lastProvider": provider, "updatedAtMs": _now_ms()}, mode=0o600)
+
+
+def _load_memory_config() -> dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    memory = cfg.get("memory") if isinstance(cfg, dict) else {}
+    return memory if isinstance(memory, dict) else {}
+
+
+def _memory_limit_value(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _memory_status_data() -> dict[str, Any]:
+    memory_path, user_path, state_path, _home = _memory_paths()
+    cfg = _load_memory_config()
+    state = _read_memory_provider_state(state_path)
+    provider = str(cfg.get("provider") or "").strip()
+    last_provider = provider or str(state.get("lastProvider") or "").strip()
+    return {
+        "memory": {
+            "enabled": bool(cfg.get("memory_enabled", True)),
+            "charLimit": _memory_limit_value(cfg.get("memory_char_limit", 2200), 2200),
+            "path": str(memory_path),
+        },
+        "userProfile": {
+            "enabled": bool(cfg.get("user_profile_enabled", True)),
+            "charLimit": _memory_limit_value(cfg.get("user_char_limit", 1375), 1375),
+            "path": str(user_path),
+        },
+        "provider": {
+            "enabled": bool(provider),
+            "name": provider,
+            "lastProvider": last_provider,
+        },
+        "effectiveImmediately": True,
+        "restartRequired": False,
+    }
+
+
+def _memory_response(
+    command_text: str,
+    type_: str,
+    data: dict[str, Any] | None = None,
+    *,
+    ok: bool = True,
+    error: dict[str, Any] | None = None,
+    effects: dict[str, Any] | None = None,
+) -> LocalCommandResult:
+    metadata = {"effects": effects} if effects else {}
+    return LocalCommandResult(
+        text=_single_response(type_=type_, command=command_text, data=data or {}, ok=ok, error=error),
+        metadata=metadata,
+    )
+
+
+def _memory_error(command_text: str, code: str, message: str) -> LocalCommandResult:
+    data = _memory_status_data()
+    data["effectiveImmediately"] = False
+    return _memory_response(
+        command_text,
+        "memory.updated",
+        data,
+        ok=False,
+        error={"code": code, "message": message},
+    )
+
+
+def _memory_content(command_text: str) -> LocalCommandResult:
+    """Return the current profile's complete MEMORY.md without changing runtime state."""
+    memory_path, _user_path, _state_path, _home = _memory_paths()
+    status = _memory_status_data()["memory"]
+    exists = False
+    try:
+        exists = memory_path.exists()
+        content = _read_text_file(memory_path)
+        updated_at_ms = int(memory_path.stat().st_mtime * 1000) if exists else None
+    except Exception as exc:
+        return _memory_response(
+            command_text,
+            "memory.content",
+            {
+                "path": str(memory_path),
+                "content": "",
+                "contentLength": 0,
+                "exists": exists,
+                "updatedAtMs": None,
+                "enabled": bool(status["enabled"]),
+                "charLimit": int(status["charLimit"]),
+                "effectiveImmediately": False,
+                "restartRequired": False,
+            },
+            ok=False,
+            error={"code": "AOPS_MEMORY_READ_FAILED", "message": str(exc)},
+        )
+    return _memory_response(
+        command_text,
+        "memory.content",
+        {
+            "path": str(memory_path),
+            "content": content,
+            "contentLength": len(content),
+            "exists": exists,
+            "updatedAtMs": updated_at_ms,
+            "enabled": bool(status["enabled"]),
+            "charLimit": int(status["charLimit"]),
+            "effectiveImmediately": True,
+            "restartRequired": False,
+        },
+    )
+
+
+def _memory_write_config(updates: dict[str, Any]) -> None:
+    from hermes_constants import get_hermes_home
+    from utils import atomic_roundtrip_yaml_update
+
+    config_path = Path(get_hermes_home()) / "config.yaml"
+    for key, value in updates.items():
+        atomic_roundtrip_yaml_update(config_path, f"memory.{key}", value)
+    try:
+        os.chmod(config_path, 0o600)
+    except (OSError, NotImplementedError):
+        pass
+
+
+def _memory_command(command_text: str, args: list[str]) -> LocalCommandResult:
+    """Handle profile-scoped memory controls without restarting the gateway."""
+    if not args or args[0].lower() in {"status", "show"}:
+        return _memory_response(command_text, "memory.status", _memory_status_data())
+
+    action = args[0].lower().replace("-", "_")
+    if action == "get":
+        if len(args) not in {1, 2} or (len(args) == 2 and args[1].lower() != "memory"):
+            return _memory_error(command_text, "AOPS_MEMORY_INVALID_SUBCOMMAND", "Usage: /memory get [memory]")
+        return _memory_content(command_text)
+
+    if action == "reset":
+        target = args[1].lower() if len(args) > 1 else ""
+        if target not in {"memory", "user", "all"} or len(args) > 2:
+            return _memory_error(command_text, "AOPS_MEMORY_INVALID_TARGET", "Usage: /memory reset <memory|user|all>")
+        memory_path, user_path, _state_path, _home = _memory_paths()
+        paths = [memory_path, user_path] if target == "all" else [memory_path if target == "memory" else user_path]
+        try:
+            for path in paths:
+                _atomic_write_text(path, "")
+        except Exception as exc:
+            return _memory_error(command_text, "AOPS_MEMORY_RESET_FAILED", str(exc))
+        data = _memory_status_data()
+        data.update({
+            "target": target,
+            "resetPaths": [str(path) for path in paths],
+            "remoteDataRetained": True,
+        })
+        return _memory_response(
+            command_text,
+            "memory.reset",
+            data,
+            effects={"invalidateAgentCache": True, "memoryReset": True, "reason": "aops_memory_reset"},
+        )
+
+    if action in _MEMORY_LIMIT_KEYS:
+        config_key, label = _MEMORY_LIMIT_KEYS[action]
+        if len(args) == 1:
+            return _memory_response(command_text, "memory.status", _memory_status_data())
+        if len(args) != 2:
+            return _memory_error(command_text, "AOPS_MEMORY_INVALID_LIMIT", f"Usage: /memory {action} <positive integer>")
+        try:
+            value = int(args[1], 10)
+        except (TypeError, ValueError):
+            value = -1
+        if value <= 0 or value > _MEMORY_LIMIT_MAX or str(value) != str(args[1]).strip().lstrip("+"):
+            return _memory_error(command_text, "AOPS_MEMORY_INVALID_LIMIT", f"{label}预算必须是 1..{_MEMORY_LIMIT_MAX} 的正整数。")
+        try:
+            _memory_write_config({config_key: value})
+        except Exception as exc:
+            return _memory_error(command_text, "AOPS_MEMORY_CONFIG_WRITE_FAILED", str(exc))
+        data = _memory_status_data()
+        data["updatedField"] = config_key
+        data["updatedValue"] = value
+        return _memory_response(
+            command_text,
+            "memory.updated",
+            data,
+            effects={"invalidateAgentCache": True, "memoryConfigChanged": True, "reason": "aops_memory_limit_updated"},
+        )
+
+    if action in {"enable", "disable"}:
+        if len(args) != 2:
+            return _memory_error(command_text, "AOPS_MEMORY_INVALID_TARGET", f"Usage: /memory {action} <memory|user|all>")
+        target = _MEMORY_TARGETS.get(args[1].lower())
+        if target is None and args[1].lower() != "all":
+            return _memory_error(command_text, "AOPS_MEMORY_INVALID_TARGET", "Target must be memory, user, profile, or all.")
+        value = action == "enable"
+        updates = {}
+        if args[1].lower() in {"memory", "all"}:
+            updates["memory_enabled"] = value
+        if args[1].lower() in {"user", "profile", "all"}:
+            updates["user_profile_enabled"] = value
+        try:
+            _memory_write_config(updates)
+        except Exception as exc:
+            return _memory_error(command_text, "AOPS_MEMORY_CONFIG_WRITE_FAILED", str(exc))
+        data = _memory_status_data()
+        data["updatedTarget"] = args[1].lower()
+        data["enabled"] = value
+        return _memory_response(
+            command_text,
+            "memory.updated",
+            data,
+            effects={"invalidateAgentCache": True, "memoryConfigChanged": True, "reason": "aops_memory_toggle"},
+        )
+
+    if action == "provider":
+        provider_action = args[1].lower() if len(args) > 1 else "status"
+        if provider_action in {"status", "show"} and len(args) in {1, 2}:
+            return _memory_response(command_text, "memory.status", _memory_status_data())
+        if provider_action == "disable" and len(args) == 2:
+            current = str(_load_memory_config().get("provider") or "").strip()
+            if current:
+                try:
+                    _write_memory_provider_state(_memory_paths()[2], current)
+                except Exception as exc:
+                    return _memory_error(command_text, "AOPS_MEMORY_CONFIG_WRITE_FAILED", str(exc))
+            try:
+                _memory_write_config({"provider": ""})
+            except Exception as exc:
+                return _memory_error(command_text, "AOPS_MEMORY_CONFIG_WRITE_FAILED", str(exc))
+            data = _memory_status_data()
+            data["updatedProvider"] = ""
+            return _memory_response(
+                command_text,
+                "memory.updated",
+                data,
+                effects={"invalidateAgentCache": True, "providerChanged": True, "reason": "aops_memory_provider_disabled"},
+            )
+        if provider_action == "enable" and len(args) in {2, 3}:
+            provider = args[2].strip() if len(args) == 3 else str(_memory_status_data()["provider"].get("lastProvider") or "").strip()
+            if not provider:
+                return _memory_error(command_text, "AOPS_MEMORY_PROVIDER_REQUIRED", "Specify a provider, for example: /memory provider enable hindsight")
+            if not _MEMORY_PROVIDER_RE.fullmatch(provider):
+                return _memory_error(command_text, "AOPS_MEMORY_PROVIDER_INVALID", "Provider name contains unsupported characters.")
+            try:
+                _memory_write_config({"provider": provider})
+                _write_memory_provider_state(_memory_paths()[2], provider)
+            except Exception as exc:
+                return _memory_error(command_text, "AOPS_MEMORY_CONFIG_WRITE_FAILED", str(exc))
+            data = _memory_status_data()
+            data["updatedProvider"] = provider
+            return _memory_response(
+                command_text,
+                "memory.updated",
+                data,
+                effects={"invalidateAgentCache": True, "providerChanged": True, "reason": "aops_memory_provider_enabled"},
+            )
+        return _memory_error(command_text, "AOPS_MEMORY_INVALID_SUBCOMMAND", "Usage: /memory provider <status|enable [name]|disable>")
+
+    return _memory_error(command_text, "AOPS_MEMORY_INVALID_SUBCOMMAND", "Usage: /memory [status|get|reset|memory_char_limit|user_char_limit|enable|disable|provider]")
 
 
 def _cfg_get(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -2181,24 +2490,14 @@ def _resolve_aops_model_endpoint(event: MessageEvent | None = None) -> dict[str,
     from gateway import aops_state
     from hermes_cli.config import get_compatible_custom_providers, load_config
 
+    # Model selection used to be persisted per AOPS channel.  It is now
+    # profile-global; clean up the old state without allowing it to override
+    # config.yaml.
+    try:
+        aops_state.clear_model_preferences()
+    except Exception:
+        pass
     cfg = load_config()
-    pref = None
-    pref_key = None
-    raw = event.raw_message if event and isinstance(event.raw_message, dict) else {}
-    agent_key = str(raw.get("agentKey") or raw.get("agentId") or "main")
-    if event and event.source:
-        pref_key = aops_state.preference_key(
-            platform=str(event.source.platform.value if event.source.platform else "aops"),
-            channel_id=str(event.source.chat_id or ""),
-            agent_key=agent_key,
-        )
-        pref = aops_state.get_model_preference(pref_key)
-        if pref and _is_reserved_model_token(pref.get("model")):
-            try:
-                aops_state.delete_model_preference(pref_key)
-            except Exception:
-                pass
-            pref = None
 
     model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
     current_model = ""
@@ -2216,16 +2515,6 @@ def _resolve_aops_model_endpoint(event: MessageEvent | None = None) -> dict[str,
         api_mode = str(model_cfg.get("api_mode") or "")
     elif isinstance(model_cfg, str):
         current_model = model_cfg
-
-    if pref:
-        current_model = str(pref.get("model") or current_model)
-        current_provider = str(pref.get("provider") or current_provider)
-        base_url = _expand_env_ref(pref.get("base_url")) or base_url
-        pref_api_key, pref_api_key_ref = _resolve_model_api_key(pref)
-        api_key = pref_api_key or api_key
-        api_key_ref = pref_api_key_ref or api_key_ref
-        api_mode = str(pref.get("api_mode") or api_mode)
-        source = "aops.channelPreference"
 
     if isinstance(cfg, dict):
         try:
@@ -2247,7 +2536,7 @@ def _resolve_aops_model_endpoint(event: MessageEvent | None = None) -> dict[str,
             api_key = api_key or entry_api_key
             api_key_ref = api_key_ref or entry_api_key_ref
             api_mode = api_mode or str(entry.get("api_mode") or entry.get("transport") or "")
-            source = source if source == "aops.channelPreference" else "config.custom_providers"
+            source = "config.custom_providers"
             break
 
     if isinstance(cfg, dict) and not base_url:
@@ -2276,7 +2565,7 @@ def _resolve_aops_model_endpoint(event: MessageEvent | None = None) -> dict[str,
         "apiKeyRef": api_key_ref,
         "apiMode": api_mode,
         "source": source,
-        "preferenceKey": pref_key,
+        "preferenceKey": None,
     }
 
 
@@ -2291,7 +2580,6 @@ def _model_item(model_id: str, *, current_model: str = "", provider: str = "cust
 
 
 def _current_model_payload(event: MessageEvent | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    from hermes_constants import get_hermes_home
     from hermes_cli.models import probe_api_models
 
     endpoint = _resolve_aops_model_endpoint(event)
@@ -2377,7 +2665,7 @@ def _current_model_payload(event: MessageEvent | None = None) -> tuple[dict[str,
     }
     context = {
         "preferenceKey": endpoint["preferenceKey"],
-        "statePath": str(get_hermes_home() / "aops" / "channel-state.json"),
+        "statePath": "",
         "source": endpoint["source"],
         "baseUrl": endpoint["baseUrl"],
         "apiKeyConfigured": bool(endpoint["apiKey"]),
@@ -2413,7 +2701,6 @@ def _aops_model_list(command_text: str, event: MessageEvent) -> str:
 
 
 def _aops_model_status(command_text: str, event: MessageEvent) -> str:
-    from hermes_constants import get_hermes_home
     from hermes_cli.config import get_config_path
 
     endpoint = _resolve_aops_model_endpoint(event)
@@ -2427,9 +2714,9 @@ def _aops_model_status(command_text: str, event: MessageEvent) -> str:
         "apiKeyConfigured": bool(endpoint.get("apiKey")),
         "apiKeyPreview": _redact_secret(str(endpoint.get("apiKey") or "")),
         "source": endpoint.get("source") or "",
-        "scope": "aops-channel" if endpoint.get("source") == "aops.channelPreference" else "config",
-        "preferenceKey": endpoint.get("preferenceKey"),
-        "statePath": str(get_hermes_home() / "aops" / "channel-state.json"),
+        "scope": "config",
+        "preferenceKey": None,
+        "statePath": "",
         "configPath": str(get_config_path()),
         "commands": {
             "list": "/model list",
@@ -2490,7 +2777,6 @@ def _persist_aops_model_config(
 
 
 def _aops_model_use(command_text: str, event: MessageEvent, args: list[str]) -> str:
-    from gateway import aops_state
     from hermes_cli.model_switch import switch_model
     from hermes_cli.config import load_config
 
@@ -2540,23 +2826,7 @@ def _aops_model_use(command_text: str, event: MessageEvent, args: list[str]) -> 
         str(endpoint.get("source") or "").strip().lower(),
     }
     if provider_alias in current_provider_aliases or provider_alias.startswith("custom:"):
-        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
-        agent_key = str(raw.get("agentKey") or raw.get("agentId") or "main")
-        pref_key = aops_state.preference_key(
-            platform=str(event.source.platform.value if event.source and event.source.platform else "aops"),
-            channel_id=str(event.source.chat_id if event.source else ""),
-            agent_key=agent_key,
-        )
         target_provider = explicit_provider or current_provider or "custom"
-        preference = {
-            "model": model_input,
-            "provider": target_provider,
-            "api_key": current_api_key,
-            "api_key_ref": current_api_key_ref,
-            "base_url": current_base_url,
-            "api_mode": current_api_mode,
-        }
-        aops_state.set_model_preference(pref_key, preference)
         config_update = _persist_aops_model_config(
             model=model_input,
             provider=target_provider,
@@ -2575,12 +2845,14 @@ def _aops_model_use(command_text: str, event: MessageEvent, args: list[str]) -> 
                 "baseUrl": current_base_url,
                 "apiMode": current_api_mode,
                 "apiKeyConfigured": bool(current_api_key),
-                "scope": "aops-channel",
+                "scope": "config",
                 "persisted": True,
                 "configUpdated": config_update["updated"],
                 "configPath": config_update["path"],
-                "preferenceKey": pref_key,
-                "source": endpoint.get("source"),
+                "preferenceKey": None,
+                "source": "config.model",
+                "effectiveImmediately": True,
+                "restartRequired": False,
             },
         )
 
@@ -2611,22 +2883,6 @@ def _aops_model_use(command_text: str, event: MessageEvent, args: list[str]) -> 
             error={"code": "MODEL_SWITCH_FAILED", "message": result.error_message},
         )
 
-    raw = event.raw_message if isinstance(event.raw_message, dict) else {}
-    agent_key = str(raw.get("agentKey") or raw.get("agentId") or "main")
-    pref_key = aops_state.preference_key(
-        platform=str(event.source.platform.value if event.source and event.source.platform else "aops"),
-        channel_id=str(event.source.chat_id if event.source else ""),
-        agent_key=agent_key,
-    )
-    preference = {
-        "model": result.new_model,
-        "provider": result.target_provider,
-        "api_key": result.api_key,
-        "api_key_ref": current_api_key_ref,
-        "base_url": result.base_url,
-        "api_mode": result.api_mode,
-    }
-    aops_state.set_model_preference(pref_key, preference)
     config_update = _persist_aops_model_config(
         model=result.new_model,
         provider=result.target_provider,
@@ -2642,11 +2898,14 @@ def _aops_model_use(command_text: str, event: MessageEvent, args: list[str]) -> 
             "model": result.new_model,
             "provider": result.target_provider,
             "providerLabel": result.provider_label or result.target_provider,
-            "scope": "aops-channel",
+            "scope": "config",
             "persisted": True,
             "configUpdated": config_update["updated"],
             "configPath": config_update["path"],
-            "preferenceKey": pref_key,
+            "preferenceKey": None,
+            "source": "config.model",
+            "effectiveImmediately": True,
+            "restartRequired": False,
         },
     )
 
@@ -3469,6 +3728,14 @@ def maybe_local_command(event: MessageEvent) -> str | LocalCommandResult | None:
     if canonical == "busy":
         return _busy_command(full_command, args)
 
+    if canonical == "memory":
+        return _memory_command(full_command, args)
+
+    if canonical == "profile" and args[:1] and args[0].lower() == "delete":
+        from gateway.aops_profile_delete import handle as _handle_profile_delete
+
+        return _handle_profile_delete(full_command, event, args)
+
     if canonical == "cron":
         if not args or args[:1] == ["list"]:
             try:
@@ -3583,7 +3850,7 @@ def _build_official_nodes(config: Any) -> list[HelpNode]:
     overrides = _resolve_config_gates()
     nodes: list[HelpNode] = []
     for cmd in COMMAND_REGISTRY:
-        if cmd.name in _REMOVED_AOPS_COMMANDS or cmd.name in {"skills", "cron", "security", "securty"}:
+        if cmd.name in _REMOVED_AOPS_COMMANDS or cmd.name in {"skills", "cron", "memory", "security", "securty"}:
             continue
         if cmd.name not in _AOPS_NATIVE_COMMANDS:
             continue
@@ -3593,6 +3860,29 @@ def _build_official_nodes(config: Any) -> list[HelpNode]:
         if cmd.name == "curator":
             continue
         children: list[HelpNode] = []
+        if cmd.name == "profile":
+            delete_full = "/profile delete"
+            children = [
+                _node(
+                    type_="info",
+                    command="delete",
+                    full_command=delete_full,
+                    description="预览并请求永久删除当前 named profile。",
+                    dangerous=True,
+                    usage=delete_full,
+                    executable=True,
+                ),
+                _node(
+                    type_="info",
+                    command="delete confirm",
+                    full_command="/profile delete confirm",
+                    description="使用一次性确认码执行 profile 删除。",
+                    dangerous=True,
+                    usage="/profile delete confirm <token>",
+                    executable=True,
+                    completions=[_param("token", "预览响应返回的一次性确认码。", required=True)],
+                ),
+            ]
         nodes.append(
             _node(
                 type_=_command_category(cmd.category),
@@ -3600,7 +3890,7 @@ def _build_official_nodes(config: Any) -> list[HelpNode]:
                 full_command=full_command,
                 description=_DESCRIPTION_ZH.get(cmd.name, cmd.description),
                 dangerous=_dangerous(config, full_command),
-                usage=_usage_for_command(cmd.name, cmd.args_hint),
+                usage="/profile" if cmd.name == "profile" else _usage_for_command(cmd.name, cmd.args_hint),
                 executable=("<" not in cmd.args_hint),
                 completions=list(_USAGE_COMPLETIONS.get(cmd.name, [])),
                 children=children,
@@ -4122,6 +4412,99 @@ def _busy_node(config: Any) -> HelpNode:
     )
 
 
+def _memory_node(config: Any) -> HelpNode:
+    full_command = "/memory"
+    children = [
+        _node(
+            type_="configuration",
+            command="status",
+            full_command="/memory status",
+            description="查看记忆、用户画像预算、开关和 provider 状态。",
+            dangerous=False,
+            usage="/memory status",
+            executable=True,
+        ),
+        _node(
+            type_="configuration",
+            command="get",
+            full_command="/memory get",
+            description="读取当前 profile 的完整 MEMORY.md 内容。",
+            dangerous=False,
+            usage="/memory get [memory]",
+            executable=True,
+            completions=[_param("target", "可选目标，仅支持 memory。", required=False, choices=[_choice("memory", "记忆文件")])],
+        ),
+        _node(
+            type_="configuration",
+            command="reset",
+            full_command="/memory reset",
+            description="重置本地 MEMORY.md、USER.md 内容。",
+            dangerous=_dangerous(config, "/memory reset"),
+            usage="/memory reset <memory|user|all>",
+            executable=False,
+            completions=[_param("target", "重置目标。", required=True, choices=[_choice("memory", "记忆文件"), _choice("user", "用户画像文件"), _choice("all", "两个文件")])],
+        ),
+        _node(
+            type_="configuration",
+            command="memory_char_limit",
+            full_command="/memory memory_char_limit",
+            description="查询或设置 MEMORY.md 字符预算。",
+            dangerous=_dangerous(config, "/memory memory_char_limit"),
+            usage="/memory memory_char_limit [positive integer]",
+            executable=True,
+        ),
+        _node(
+            type_="configuration",
+            command="user_char_limit",
+            full_command="/memory user_char_limit",
+            description="查询或设置 USER.md 字符预算。",
+            dangerous=_dangerous(config, "/memory user_char_limit"),
+            usage="/memory user_char_limit [positive integer]",
+            executable=True,
+        ),
+        _node(
+            type_="configuration",
+            command="enable",
+            full_command="/memory enable",
+            description="开启内置记忆或用户画像。",
+            dangerous=_dangerous(config, "/memory enable"),
+            usage="/memory enable <memory|user|all>",
+            executable=False,
+            completions=[_param("target", "开启目标。", required=True, choices=[_choice("memory", "记忆"), _choice("user", "用户画像"), _choice("all", "两者")])],
+        ),
+        _node(
+            type_="configuration",
+            command="disable",
+            full_command="/memory disable",
+            description="关闭内置记忆或用户画像。",
+            dangerous=_dangerous(config, "/memory disable"),
+            usage="/memory disable <memory|user|all>",
+            executable=False,
+            completions=[_param("target", "关闭目标。", required=True, choices=[_choice("memory", "记忆"), _choice("user", "用户画像"), _choice("all", "两者")])],
+        ),
+        _node(
+            type_="configuration",
+            command="provider",
+            full_command="/memory provider",
+            description="查看或切换外部 memory provider。",
+            dangerous=_dangerous(config, "/memory provider"),
+            usage="/memory provider <status|enable [name]|disable>",
+            executable=True,
+            completions=[_param("action", "provider 操作。", required=False, choices=[_choice("status", "查看状态"), _choice("enable", "开启 provider"), _choice("disable", "关闭 provider")])],
+        ),
+    ]
+    return _node(
+        type_="configuration",
+        command=full_command,
+        full_command=full_command,
+        description=_DESCRIPTION_ZH["memory"],
+        dangerous=_dangerous(config, full_command),
+        usage="/memory [status|get|reset|memory_char_limit|user_char_limit|enable|disable|provider]",
+        executable=True,
+        children=children,
+    )
+
+
 def _curator_node(config: Any) -> HelpNode:
     full_command = "/curator"
     children: list[HelpNode] = []
@@ -4181,6 +4564,7 @@ def help_tree_response(config: Any, command_text: str = "/help") -> str:
     nodes.append(_instruction_node(config, "soul"))
     nodes.append(_instruction_node(config, "user"))
     nodes.append(_busy_node(config))
+    nodes.append(_memory_node(config))
     if not is_blocked(config, "security"):
         nodes.append(_security_node(config))
     nodes = [node for node in nodes if node.full_command != "/curator"]
@@ -4241,6 +4625,9 @@ def filter_help_lines(lines: Iterable[str], config: Any) -> list[str]:
 
 def aops_text_command_lines() -> list[str]:
     return [
+        "`/profile` -- Show current profile name and home directory",
+        "`/profile delete` -- Preview permanent deletion of the current named profile",
+        "`/profile delete confirm <token>` -- Confirm profile deletion with a one-time token",
         "`/skills` -- List installed skills",
         "`/skills list` -- List installed skills",
         "`/skills enable <name>` -- Enable an installed skill",
@@ -4269,6 +4656,15 @@ def aops_text_command_lines() -> list[str]:
         "`/user set {json}` -- Replace memories/USER.md instructions",
         "`/user append {json}` -- Append to memories/USER.md instructions",
         "`/busy [queue|steer|interrupt|status]` -- Show or switch busy input mode",
+        "`/memory` -- Show or manage memory settings",
+        "`/memory status` -- Show memory, user profile, budget, and provider status",
+        "`/memory get [memory]` -- Show the complete MEMORY.md content",
+        "`/memory reset <memory|user|all>` -- Reset local MEMORY.md and/or USER.md",
+        "`/memory memory_char_limit [chars]` -- Show or set MEMORY.md character budget",
+        "`/memory user_char_limit [chars]` -- Show or set USER.md character budget",
+        "`/memory enable <memory|user|all>` -- Enable built-in memory or user profile",
+        "`/memory disable <memory|user|all>` -- Disable built-in memory or user profile",
+        "`/memory provider <status|enable [name]|disable>` -- Manage external memory provider",
         "`/security` -- Show current approval policy",
         "`/security set <off|manual|smart>` -- Switch approval policy",
     ]

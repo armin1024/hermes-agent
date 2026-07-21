@@ -53,6 +53,7 @@ def register(
     confirm_id: str,
     command: str,
     handler: Callable[[str], Awaitable[Optional[str]]],
+    context: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Register a pending slash-command confirmation.
 
@@ -65,6 +66,7 @@ def register(
             "command": command,
             "handler": handler,
             "created_at": time.time(),
+            "context": dict(context or {}),
         }
 
 

@@ -557,9 +557,15 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
+    _drain_with_context = getattr(agent, "_drain_pending_steer_with_context", None)
+    if callable(_drain_with_context):
+        _leftover_steer, _leftover_steer_contexts = _drain_with_context()
+    else:
+        _leftover_steer, _leftover_steer_contexts = agent._drain_pending_steer(), []
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
+        if _leftover_steer_contexts:
+            result["pending_steer_contexts"] = _leftover_steer_contexts
     agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt

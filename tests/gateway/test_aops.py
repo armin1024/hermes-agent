@@ -15,7 +15,7 @@ import pytest
 
 import gateway.run as gateway_run
 from agent.prompt_builder import PLATFORM_HINTS
-from gateway.config import GatewayConfig, Platform, PlatformConfig, _apply_env_overrides
+from gateway.config import GatewayConfig, Platform, PlatformConfig, StreamingConfig, _apply_env_overrides
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms.aops import AopsAdapter, AopsLiveReplyBridge, SendResult
 import gateway.platforms.aops as aops_mod
@@ -34,12 +34,66 @@ class _CapturingAgent:
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
         self.tools = []
+        self.model = kwargs.get("model")
+        self.provider = kwargs.get("provider")
+        self.base_url = kwargs.get("base_url")
+        self.api_mode = kwargs.get("api_mode")
 
     def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
         return {
             "final_response": "ok",
             "messages": [],
             "api_calls": 1,
+        }
+
+
+class _AopsStreamingAgent:
+    def __init__(self, *args, **kwargs):
+        self.tools = []
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+
+    def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+        assert self.stream_delta_callback is not None
+        self.stream_delta_callback("主代理")
+        self.stream_delta_callback("流式回复")
+        return {
+            "final_response": "主代理流式回复",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class _AopsInterruptedStreamingAgent(_AopsStreamingAgent):
+    def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+        assert self.stream_delta_callback is not None
+        self.stream_delta_callback("partial")
+        return {
+            "final_response": "Operation interrupted: waiting for model response (2.1s elapsed).",
+            "messages": [],
+            "api_calls": 1,
+            "interrupted": True,
+        }
+
+
+class _AopsSteerHandoffStreamingAgent(_AopsStreamingAgent):
+    def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+        assert self.tool_progress_callback is not None
+        assert self.steer_applied_callback is not None
+        self.tool_progress_callback(
+            "tool.completed", "old-tool", "old result", {}, result="old result"
+        )
+        self.steer_applied_callback([
+            {
+                "reply_to_id": "msg-steer",
+                "channel_id": "conv-steer",
+            }
+        ])
+        self.tool_progress_callback("tool.started", "new-tool", "new", {})
+        self.stream_delta_callback("new answer")
+        return {
+            "final_response": "new answer",
+            "messages": [],
+            "api_calls": 2,
         }
 
 
@@ -84,11 +138,12 @@ class _FakeResponse:
 
 
 class _FakeWebSocket:
-    def __init__(self):
+    def __init__(self, *, protocol=None):
         self.sent = []
         self.closed = False
         self.messages = []
         self.on_receive = None
+        self.protocol = protocol
 
     async def send_json(self, payload):
         self.sent.append(payload)
@@ -362,7 +417,7 @@ async def test_create_adapter_returns_aops_adapter(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_aops_connect_calls_bot_me_and_ws_auth(monkeypatch):
+async def test_aops_connect_waits_for_auth_ok(monkeypatch):
     fake_ws = _FakeWebSocket()
     fake_session = _FakeClientSession(fake_ws)
     fake_aiohttp = types.SimpleNamespace(
@@ -376,15 +431,16 @@ async def test_aops_connect_calls_bot_me_and_ws_auth(monkeypatch):
     monkeypatch.setattr("gateway.platforms.aops._resolve_aops_client_id", lambda config: "client-123")
 
     adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
-    adapter._listen_loop = AsyncMock(return_value=None)
+    async def _fake_listener():
+        adapter._set_connection_state("READY")
+        adapter._set_connected_signal(True)
+        adapter._auth_event.set()
+
+    adapter._listen_loop = _fake_listener
 
     assert await adapter.connect() is True
-    assert fake_session.get_calls
-    get_url, get_kwargs = fake_session.get_calls[0]
-    assert get_url.endswith("/api/v1/bot/me")
-    assert get_kwargs["headers"]["Authorization"] == "Bearer tok"
-    assert get_kwargs["headers"]["tec-client-ip"] == "client-123"
-    assert fake_session.ws_calls
+    assert adapter._connection_state == "READY"
+    assert fake_session.ws_calls == []
 
 
 @pytest.mark.asyncio
@@ -407,15 +463,247 @@ async def test_aops_connect_timeout_reads_env(monkeypatch):
     monkeypatch.setattr("gateway.platforms.aops._resolve_aops_client_id", lambda config: "client-123")
 
     adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
-    adapter._listen_loop = AsyncMock(return_value=None)
+    async def _fake_listener():
+        adapter._set_connection_state("READY")
+        adapter._set_connected_signal(True)
+        adapter._auth_event.set()
+
+    adapter._listen_loop = _fake_listener
 
     assert await adapter.connect() is True
-    assert fake_session.kwargs["timeout"] == {"total": 90.0}
+    assert adapter._connect_timeout == 90.0
+    assert fake_session.ws_calls == []
+
+
+@pytest.mark.asyncio
+async def test_aops_open_connection_uses_auth_ok_and_target_subprotocol(monkeypatch):
+    fake_ws = _FakeWebSocket(protocol="10.244.1.23")
+    fake_session = _FakeClientSession(fake_ws)
+    fake_aiohttp = types.SimpleNamespace(
+        ClientSession=lambda **kwargs: fake_session,
+        ClientTimeout=lambda total: total,
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setattr("gateway.platforms.aops.AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr("gateway.platforms.aops._resolve_aops_client_id", lambda config: "client-123")
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    await adapter._open_connection(target_ip="10.244.1.23")
+
     ws_url, ws_kwargs = fake_session.ws_calls[0]
     assert ws_url == "wss://aops.example.com/api/v1/ws"
     assert ws_kwargs["headers"]["Authorization"] == "Bearer tok"
+    assert ws_kwargs["headers"]["tec-client-ip"] == "client-123"
+    assert "x-target-ip" not in ws_kwargs["headers"]
+    assert ws_kwargs["protocols"] == ["10.244.1.23"]
+    assert fake_session.get_calls == []
     assert fake_ws.sent == [{"action": "auth", "token": "tok"}]
-    assert fake_session.post_calls
+
+    assert await adapter._handle_ws_control_event(
+        {
+            "event": "auth_ok",
+            "data": {
+                "botId": "bot-001",
+                "botName": "Tec01",
+                "ownerUserId": "user-001",
+                "targetIp": "10.244.1.23",
+            },
+        }
+    ) is True
+    assert adapter._connection_state == "READY"
+    assert adapter._bot_id == "bot-001"
+    assert adapter._owner_user_id == "user-001"
+    assert adapter._connected is True
+
+
+@pytest.mark.asyncio
+async def test_aops_initial_connection_has_no_target_subprotocol(monkeypatch):
+    fake_ws = _FakeWebSocket()
+    fake_session = _FakeClientSession(fake_ws)
+    fake_aiohttp = types.SimpleNamespace(
+        ClientSession=lambda **kwargs: fake_session,
+        ClientTimeout=lambda total: total,
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setattr("gateway.platforms.aops.AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr("gateway.platforms.aops._resolve_aops_client_id", lambda config: "client-123")
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    await adapter._open_connection()
+
+    _, ws_kwargs = fake_session.ws_calls[0]
+    assert ws_kwargs["protocols"] == ()
+    assert "x-target-ip" not in ws_kwargs["headers"]
+
+
+@pytest.mark.asyncio
+async def test_aops_target_subprotocol_must_be_echoed(monkeypatch):
+    fake_ws = _FakeWebSocket(protocol=None)
+    fake_session = _FakeClientSession(fake_ws)
+    fake_aiohttp = types.SimpleNamespace(
+        ClientSession=lambda **kwargs: fake_session,
+        ClientTimeout=lambda total: total,
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setattr("gateway.platforms.aops.AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr("gateway.platforms.aops._resolve_aops_client_id", lambda config: "client-123")
+
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    with pytest.raises(RuntimeError, match="subprotocol negotiation failed"):
+        await adapter._open_connection(target_ip="10.244.1.23")
+    assert fake_ws.closed is True
+
+
+def test_aops_websocket_url_preserves_reverse_proxy_path():
+    assert aops_mod._build_ws_url("http://a018-aiapp.cloud-tfb.cn:40018/aops/tec01") == (
+        "ws://a018-aiapp.cloud-tfb.cn:40018/aops/tec01/api/v1/ws"
+    )
+    assert aops_mod._build_ws_url("https://aops.example.com/") == (
+        "wss://aops.example.com/api/v1/ws"
+    )
+
+
+@pytest.mark.asyncio
+async def test_aops_redirect_reconnect_state_and_limit(monkeypatch):
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    fake_ws = _FakeWebSocket()
+    adapter._ws = fake_ws
+    adapter._running = True
+    adapter._set_connection_state("READY")
+
+    assert await adapter._handle_ws_control_event(
+        {"event": "redirect", "data": {"targetIp": "10.244.1.23", "retryAfterMs": 1}}
+    ) is True
+    assert adapter._connection_state == "REDIRECTING"
+    assert adapter._pending_redirect_target == "10.244.1.23"
+    assert adapter._pending_redirect_delay_ms == 1
+    assert fake_ws.closed is True
+
+    adapter._pending_redirect_target = ""
+    adapter._redirect_count = 3
+    adapter._ws = _FakeWebSocket()
+    assert await adapter._handle_ws_control_event(
+        {"event": "redirect", "data": {"targetIp": "10.244.1.24"}}
+    ) is True
+    assert adapter._connection_state == "REDIRECT_COOLDOWN"
+    assert adapter._pending_redirect_target == ""
+    assert adapter._pending_redirect_delay_ms == 30_000
+    assert adapter._redirect_count == 0
+    assert adapter.has_fatal_error is False
+
+    adapter._ws = _FakeWebSocket()
+    adapter._set_connection_state("READY")
+    assert await adapter._handle_ws_control_event(
+        {"event": "redirect", "data": {"targetIp": "10.244.1.25", "retryAfterMs": 2}}
+    ) is True
+    assert adapter._connection_state == "REDIRECTING"
+    assert adapter._pending_redirect_target == "10.244.1.25"
+    assert adapter._redirect_count == 1
+
+
+@pytest.mark.asyncio
+async def test_aops_redirect_cooldown_resumes_with_ordinary_connection(monkeypatch):
+    adapter = AopsAdapter(
+        PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"})
+    )
+    adapter._running = True
+    opened_targets = []
+
+    async def fake_open_connection(*, target_ip=None):
+        opened_targets.append(target_ip)
+        if len(opened_targets) == 2:
+            adapter._running = False
+            raise asyncio.CancelledError
+
+    async def fake_read_events():
+        adapter._pending_redirect_target = ""
+        adapter._pending_redirect_delay_ms = 0
+        adapter._set_connection_state("REDIRECT_COOLDOWN")
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(adapter, "_open_connection", fake_open_connection)
+    monkeypatch.setattr(adapter, "_read_events", fake_read_events)
+    monkeypatch.setattr(aops_mod.asyncio, "sleep", no_sleep)
+
+    await adapter._listen_loop()
+
+    assert opened_targets == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_aops_redirect_target_is_consumed_before_failed_handshake(monkeypatch):
+    adapter = AopsAdapter(
+        PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"})
+    )
+    adapter._running = True
+    opened_targets = []
+
+    async def fake_open_connection(*, target_ip=None):
+        opened_targets.append(target_ip)
+        if len(opened_targets) == 2:
+            raise RuntimeError("target handshake failed")
+        if len(opened_targets) == 3:
+            adapter._running = False
+            raise asyncio.CancelledError
+
+    async def fake_read_events():
+        adapter._pending_redirect_target = "10.244.1.23"
+        adapter._pending_redirect_delay_ms = 0
+        adapter._set_connection_state("REDIRECTING")
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(adapter, "_open_connection", fake_open_connection)
+    monkeypatch.setattr(adapter, "_read_events", fake_read_events)
+    monkeypatch.setattr(aops_mod.asyncio, "sleep", no_sleep)
+
+    await adapter._listen_loop()
+
+    assert opened_targets == [None, "10.244.1.23", None]
+
+
+@pytest.mark.asyncio
+async def test_aops_auth_ok_target_does_not_route_next_ordinary_connection(monkeypatch):
+    fake_ws = _FakeWebSocket()
+    fake_session = _FakeClientSession(fake_ws)
+    fake_aiohttp = types.SimpleNamespace(
+        ClientSession=lambda **kwargs: fake_session,
+        ClientTimeout=lambda total: total,
+        WSMsgType=SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE", CLOSED="CLOSED", ERROR="ERROR"),
+    )
+    monkeypatch.setattr("gateway.platforms.aops.aiohttp", fake_aiohttp)
+    monkeypatch.setattr("gateway.platforms.aops.AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr("gateway.platforms.aops._resolve_aops_client_id", lambda config: "client-123")
+
+    adapter = AopsAdapter(
+        PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"})
+    )
+    adapter._target_ip = "10.244.1.23"  # status learned from a prior auth_ok
+
+    await adapter._open_connection()
+
+    _, ws_kwargs = fake_session.ws_calls[0]
+    assert ws_kwargs["protocols"] == ()
+    assert "x-target-ip" not in ws_kwargs["headers"]
+
+
+@pytest.mark.asyncio
+async def test_aops_ping_uses_json_pong_without_business_dispatch():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._connected_event.set()
+    fake_ws = _FakeWebSocket()
+    adapter._ws = fake_ws
+
+    assert await adapter._handle_ws_control_event(
+        {"event": "ping", "data": {"ts": "2026-07-14T10:00:00Z", "timeoutMs": 30000}}
+    ) is True
+    assert fake_ws.sent == [{"event": "pong"}]
 
 
 @pytest.mark.asyncio
@@ -505,6 +793,130 @@ async def test_aops_send_defaults_message_type_to_common():
     assert end["messageType"] == "common"
     assert start["title"] == ""
     assert end["title"] == ""
+
+
+@pytest.mark.asyncio
+async def test_aops_status_send_ends_bubble_without_ending_conversation():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+
+    result = await adapter.send(
+        "conv-1",
+        "⚡ Interrupting current task.",
+        reply_to="msg-2",
+        metadata={"kind": "status", "conversation_ended": False},
+    )
+
+    assert result.success is True
+    start = adapter.send_reply_event.await_args_list[0].args[0]
+    end = adapter.send_reply_event.await_args_list[1].args[0]
+    assert start["kind"] == "status"
+    assert start["conversationEnded"] is False
+    assert end["phase"] == "end"
+    assert end["kind"] == "status"
+    assert end["replyToId"] == "msg-2"
+    assert end["conversationEnded"] is False
+
+
+@pytest.mark.asyncio
+async def test_aops_active_steer_and_queue_acknowledgements_are_non_terminal():
+    for command in ("/steer 几点了", "/queue 下一轮处理"):
+        runner = _make_runner(extra={"dm_policy": "open"})
+        runner._draining = False
+        runner._busy_input_mode = "interrupt"
+        runner._busy_text_mode = "interrupt"
+        adapter = MagicMock()
+        adapter._pending_messages = {}
+        runner.adapters = {Platform.AOPS: adapter}
+
+        event = _make_aops_event(command)
+        session_key = gateway_run.build_session_key(event.source)
+        running_agent = MagicMock()
+        running_agent.steer.return_value = True
+        runner._running_agents[session_key] = running_agent
+
+        result = await runner._handle_message(event)
+
+        assert getattr(result, "metadata", {})["kind"] == "status"
+        assert getattr(result, "metadata", {})["conversation_ended"] is False
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    runner._draining = False
+    adapter = MagicMock()
+    adapter._pending_messages = {}
+    runner.adapters = {Platform.AOPS: adapter}
+    silent_event = _make_silent_aops_event("/steer 静默注入")
+    session_key = gateway_run.build_session_key(silent_event.source)
+    running_agent = MagicMock()
+    running_agent.steer.return_value = True
+    runner._running_agents[session_key] = running_agent
+
+    silent_result = await runner._handle_message(silent_event)
+    assert silent_result.metadata["kind"] == "status"
+    assert silent_result.metadata["conversation_ended"] is False
+    assert silent_result.metadata["silent"] is True
+    assert silent_result.metadata["title"] == ""
+
+
+@pytest.mark.asyncio
+async def test_aops_interrupt_followup_suppresses_redundant_busy_ack():
+    runner = _make_runner(extra={"dm_policy": "open"})
+    runner._draining = False
+    runner._busy_input_mode = "interrupt"
+    runner._busy_text_mode = "interrupt"
+    runner._busy_ack_ts = {}
+    adapter = MagicMock()
+    adapter._pending_messages = {}
+    adapter._send_with_retry = AsyncMock()
+    runner.adapters = {Platform.AOPS: adapter}
+
+    event = _make_aops_event("第二条消息")
+    session_key = gateway_run.build_session_key(event.source)
+    running_agent = SimpleNamespace(interrupt=MagicMock(), _active_children=[])
+    runner._running_agents[session_key] = running_agent
+
+    assert await runner._handle_active_session_busy_message(event, session_key) is True
+    running_agent.interrupt.assert_called_once_with("第二条消息")
+    adapter._send_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_aops_allows_only_one_terminal_message_id_per_reply_to():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter._connected_event.set()
+    adapter._ws = _FakeWebSocket()
+    assert adapter._build_message_event({
+        "id": "msg-2",
+        "userId": "user-1",
+        "channelId": "conv-1",
+        "text": "second",
+    }) is not None
+
+    terminal = {
+        "messageId": "botmsg-final-1",
+        "seq": 2,
+        "phase": "end",
+        "kind": "final",
+        "channelId": "conv-1",
+        "replyToId": "msg-2",
+        "conversationEnded": True,
+        "text": "done",
+    }
+    first = await adapter.send_reply_event(dict(terminal))
+    same_id_retry = await adapter.send_reply_event(dict(terminal))
+    conflicting = await adapter.send_reply_event({
+        **terminal,
+        "messageId": "botmsg-final-2",
+        "text": "duplicate",
+    })
+
+    assert first.success is True
+    assert same_id_retry.success is True
+    assert conflicting.success is False
+    assert conflicting.retryable is False
+    assert adapter._terminal_outbound_by_reply_to == {"msg-2": "botmsg-final-1"}
+    assert len(adapter._ws.sent) == 2
+    assert adapter._task_states["msg-2"]["terminalOutboundMessageId"] == "botmsg-final-1"
 
 
 @pytest.mark.asyncio
@@ -1528,7 +1940,7 @@ async def test_aops_read_events_replies_to_server_ping(monkeypatch, tmp_path):
 
     assert len(fake_ws.sent) == 1
     assert fake_ws.sent[0]["event"] == "pong"
-    assert fake_ws.sent[0]["data"]["ts"].endswith("Z")
+    assert fake_ws.sent[0] == {"event": "pong"}
     adapter._dispatch_payload.assert_not_awaited()
     lines = _read_aops_log_lines(tmp_path)
     assert [_aops_log_field(line, "io") for line in lines] == ["recv", "send"]
@@ -1610,6 +2022,7 @@ async def test_aops_read_events_dispatches_message_posted_after_ping_support(mon
     fake_ws.on_receive = lambda: setattr(adapter, "_running", False)
     adapter._ws = fake_ws
     adapter._running = True
+    adapter._connection_state = "READY"
     adapter.handle_message = AsyncMock()
 
     await adapter._read_events()
@@ -1676,6 +2089,7 @@ async def test_aops_command_message_is_written_to_unified_log(monkeypatch, tmp_p
     fake_ws.on_receive = lambda: setattr(adapter, "_running", False)
     adapter._ws = fake_ws
     adapter._running = True
+    adapter._connection_state = "READY"
     adapter.handle_message = AsyncMock()
 
     await adapter._read_events()
@@ -1746,6 +2160,7 @@ async def test_aops_read_events_keeps_ping_pong_while_message_dispatch_is_slow(m
     fake_ws.on_receive = on_receive
     adapter._ws = fake_ws
     adapter._running = True
+    adapter._set_connection_state("READY")
     adapter._dispatch_payload = slow_dispatch
 
     await adapter._read_events()
@@ -1890,6 +2305,7 @@ async def test_aops_common_silent_messages_are_dispatched_in_receive_order(monke
     adapter._connected_event.set()
     adapter._ws = fake_ws
     adapter._running = True
+    adapter._set_connection_state("READY")
     adapter.handle_message = AsyncMock()
 
     await adapter._read_events()
@@ -1915,6 +2331,10 @@ async def test_aops_silent_help_returns_command_tree(monkeypatch):
     assert payload["ok"] is True
     assert payload["command"] == "/help"
     assert any(item["fullCommand"] == "/model" for item in payload["items"])
+    memory_node = next(item for item in payload["items"] if item["fullCommand"] == "/memory")
+    assert any(child["fullCommand"] == "/memory get" for child in memory_node["children"])
+    assert any(child["fullCommand"] == "/memory memory_char_limit" for child in memory_node["children"])
+    assert any(child["fullCommand"] == "/memory user_char_limit" for child in memory_node["children"])
 
 
 @pytest.mark.asyncio
@@ -1985,6 +2405,82 @@ def test_aops_log_keeps_recent_seven_days(monkeypatch, tmp_path):
     assert "channel=conv-1" in current
     assert "replyTo=msg-1" in current
     assert _aops_log_raw(current)["data"]["text"] == "完整正文"
+
+
+def test_aops_log_suppresses_successful_stream_deltas_and_summarizes_end(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("AOPS_LOG_STREAM_DELTAS", raising=False)
+    config = PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"})
+
+    def write(data, **kwargs):
+        aops_mod._write_aops_log_line(
+            direction="out",
+            action="message_reply",
+            data=data,
+            raw={"event": "message_reply", "data": data},
+            config=config,
+            **kwargs,
+        )
+
+    base = {"messageId": "stream-1", "kind": "final", "channelId": "conv-1", "replyToId": "user-1"}
+    write({**base, "seq": 1, "phase": "start"})
+    write({**base, "seq": 2, "phase": "delta", "delta": "你好", "text": "你好"}, status="ok")
+    write({**base, "seq": 3, "phase": "delta", "delta": "世界", "text": "你好世界"}, status="ok")
+    write({**base, "seq": 4, "phase": "end", "text": "你好世界", "conversationEnded": True})
+
+    lines = _read_aops_log_lines(tmp_path)
+    assert len(lines) == 2
+    assert "phase=start" in lines[0]
+    assert "phase=end" in lines[1]
+    assert "streamDeltaCount=2" in lines[1]
+    assert "streamChars=4" in lines[1]
+    assert "streamDurationMs=" in lines[1]
+    assert _aops_log_raw(lines[1])["data"]["text"] == "你好世界"
+
+
+def test_aops_log_records_failed_delta_and_last_successful_chunk(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("AOPS_LOG_STREAM_DELTAS", raising=False)
+    config = PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"})
+    base = {"messageId": "stream-fail", "kind": "final", "channelId": "conv-1"}
+
+    success = {**base, "seq": 7, "phase": "delta", "delta": "最后成功", "text": "最后成功"}
+    failed = {**base, "seq": 8, "phase": "delta", "delta": "发送失败", "text": "最后成功发送失败"}
+    aops_mod._write_aops_log_line(
+        direction="out", action="message_reply", data=success,
+        raw={"event": "message_reply", "data": success}, status="ok", config=config,
+    )
+    aops_mod._write_aops_log_line(
+        direction="out", action="message_reply", data=failed,
+        raw={"event": "message_reply", "data": failed}, status="failed",
+        error="websocket disconnected", config=config,
+    )
+
+    lines = _read_aops_log_lines(tmp_path)
+    assert len(lines) == 1
+    assert "status=failed" in lines[0]
+    assert "lastSuccessfulSeq=7" in lines[0]
+    assert 'lastSuccessfulDelta="最后成功"' in lines[0]
+    assert 'failedDelta="发送失败"' in lines[0]
+    assert "websocket disconnected" in lines[0]
+
+
+def test_aops_log_stream_delta_debug_mode_restores_per_chunk_log(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AOPS_LOG_STREAM_DELTAS", "true")
+    data = {
+        "messageId": "stream-debug", "seq": 2, "phase": "delta", "kind": "final",
+        "channelId": "conv-1", "delta": "调试内容", "text": "调试内容",
+    }
+    aops_mod._write_aops_log_line(
+        direction="out", action="message_reply", data=data,
+        raw={"event": "message_reply", "data": data}, status="ok",
+        config=PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}),
+    )
+
+    lines = _read_aops_log_lines(tmp_path)
+    assert len(lines) == 1
+    assert _aops_log_raw(lines[0])["data"]["delta"] == "调试内容"
 
 
 def test_aops_log_retention_days_can_be_overridden_by_config(monkeypatch, tmp_path):
@@ -2095,10 +2591,7 @@ def test_message_posted_maps_to_message_event_and_agent_route():
     assert event is not None
     assert event.source.chat_type == "dm"
     assert event.source.user_id == "user-001"
-    assert event.route_overrides == {
-        "model": "openrouter/anthropic/claude-sonnet-4",
-        "provider": "openrouter",
-    }
+    assert not hasattr(event, "route_overrides")
     assert event.channel_prompt == "You are the DevOps-focused Hermes route."
 
 
@@ -2376,6 +2869,123 @@ async def test_aops_bridge_emits_segmented_stream_events():
 
 
 @pytest.mark.asyncio
+async def test_aops_bridge_emits_structured_interrupted_terminal_on_original_stream():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    adapter.create_message_id = MagicMock(return_value="botmsg-original")
+    bridge = AopsLiveReplyBridge(adapter, chat_id="conv-1", reply_to_id="msg-1", run_id="run-1")
+
+    task = asyncio.create_task(bridge.run())
+    bridge.on_delta("partial")
+    bridge.send_final(
+        "当前任务已中断，正在处理新消息。",
+        conversation_ended=True,
+        interrupted=True,
+        finish_reason="interrupted",
+    )
+    bridge.finish()
+    await task
+
+    events = [call.args[0] for call in adapter.send_reply_event.await_args_list]
+    assert [event["messageId"] for event in events] == [
+        "botmsg-original",
+        "botmsg-original",
+        "botmsg-original",
+    ]
+    terminal = events[-1]
+    assert terminal["replyToId"] == "msg-1"
+    assert terminal["conversationEnded"] is True
+    assert terminal["interrupted"] is True
+    assert terminal["finishReason"] == "interrupted"
+    assert "Operation interrupted" not in terminal["text"]
+
+
+@pytest.mark.asyncio
+async def test_aops_bridge_steer_handoff_closes_old_owner_and_routes_future_output_to_new_owner():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    adapter.create_message_id = MagicMock(side_effect=["botmsg-old", "botmsg-new"])
+    bridge = AopsLiveReplyBridge(adapter, chat_id="conv-1", reply_to_id="msg-old", run_id="run-1")
+
+    task = asyncio.create_task(bridge.run())
+    bridge.on_tool_progress("tool.completed", "aops-cli", "old result", {}, result="old result")
+    bridge.request_handoff({"reply_to_id": "msg-new", "channel_id": "conv-1"})
+    bridge.on_tool_progress("tool.started", "date", "date", {})
+    bridge.on_tool_progress("tool.completed", "date", "20:00", {}, result="20:00")
+    bridge.send_final("现在是 20:00", conversation_ended=True)
+    bridge.finish()
+    await task
+
+    events = [call.args[0] for call in adapter.send_reply_event.await_args_list]
+    old_events = [event for event in events if event.get("replyToId") == "msg-old"]
+    new_events = [event for event in events if event.get("replyToId") == "msg-new"]
+
+    assert any(event.get("tool", {}).get("name") == "aops-cli" for event in old_events)
+    old_terminal = [event for event in old_events if event.get("conversationEnded") is True]
+    assert len(old_terminal) == 1
+    assert old_terminal[0]["messageId"] == "botmsg-old"
+    assert old_terminal[0]["finishReason"] == "steered"
+    assert old_terminal[0]["superseded"] is True
+    assert old_terminal[0]["continuedByReplyToId"] == "msg-new"
+
+    assert all(event.get("tool", {}).get("name") != "aops-cli" for event in new_events)
+    assert any(event.get("tool", {}).get("name") == "date" for event in new_events)
+    assert new_events[0]["phase"] == "start"
+    assert new_events[0]["steeredFromReplyToId"] == "msg-old"
+    new_terminal = [event for event in new_events if event.get("conversationEnded") is True]
+    assert len(new_terminal) == 1
+    assert new_terminal[0]["text"] == "现在是 20:00"
+    assert new_terminal[0]["messageId"] == "botmsg-new"
+
+
+@pytest.mark.asyncio
+async def test_aops_bridge_multiple_steers_close_each_owner_in_order():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    adapter.create_message_id = MagicMock(side_effect=["stream-1", "stream-2", "stream-3"])
+    bridge = AopsLiveReplyBridge(adapter, chat_id="conv-1", reply_to_id="msg-1")
+
+    task = asyncio.create_task(bridge.run())
+    bridge.on_delta("working")
+    bridge.request_handoff([
+        {"reply_to_id": "msg-2", "channel_id": "conv-1"},
+        {"reply_to_id": "msg-3", "channel_id": "conv-1"},
+    ])
+    bridge.send_final("latest", conversation_ended=True)
+    bridge.finish()
+    await task
+
+    events = [call.args[0] for call in adapter.send_reply_event.await_args_list]
+    terminals = [event for event in events if event.get("conversationEnded") is True]
+    assert [event["replyToId"] for event in terminals] == ["msg-1", "msg-2", "msg-3"]
+    assert [event.get("finishReason") for event in terminals] == ["steered", "steered", None]
+    assert terminals[-1]["text"] == "latest"
+
+
+@pytest.mark.asyncio
+async def test_aops_bridge_ignores_subagent_stream_and_lifecycle_events():
+    adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    bridge = AopsLiveReplyBridge(adapter, chat_id="user-001", reply_to_id="msg-1", run_id="run-1")
+
+    for event_type, preview in (
+        ("subagent.start", "计算 1+1"),
+        ("subagent.thinking", "reflecting"),
+        ("subagent.text", "2"),
+        ("subagent.progress", "working"),
+        ("subagent.complete", "done"),
+    ):
+        await bridge._emit_tool({
+            "event_type": event_type,
+            "tool_name": None,
+            "preview": preview,
+            "args": None,
+        })
+
+    adapter.send_reply_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_aops_bridge_final_uses_latest_title():
     adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
     adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
@@ -2413,13 +3023,7 @@ async def test_aops_bridge_drops_internal_thinking_progress(monkeypatch, tmp_pat
     })
 
     adapter.send_reply_event.assert_not_awaited()
-    lines = _read_aops_log_lines(tmp_path)
-    assert [_aops_log_field(line, "io") for line in lines] == ["send", "send"]
-    assert [_aops_log_field(line, "messageType") for line in lines] == ["filtered", "filtered"]
-    assert [_aops_log_field(line, "status") for line in lines] == ["skipped", "skipped"]
-    assert _aops_log_raw(lines[0])["data"]["event_type"] == "reasoning.available"
-    assert _aops_log_raw(lines[0])["data"]["preview"] == "测试收到。我是 数智运维专家。"
-    assert 'text="filtered reason=internal_thinking tool=_thinking"' in lines[0]
+    assert _read_aops_log_lines(tmp_path) == []
 
 
 @pytest.mark.asyncio
@@ -2506,6 +3110,7 @@ async def test_send_exec_approval_puts_approval_in_end_content(monkeypatch):
     approval = action_payload["content"][0]
     assert action_payload["phase"] == "actions"
     assert action_payload["kind"] == "approval"
+    assert action_payload["conversationEnded"] is False
     assert action_payload["text"] == ""
     assert action_payload["replyToId"] == "msg-1"
     assert approval["type"] == "approval"
@@ -2535,6 +3140,7 @@ async def test_send_exec_approval_without_permanent_uses_session_action():
     approval = action_payload["content"][0]
     assert action_payload["phase"] == "actions"
     assert action_payload["kind"] == "approval"
+    assert action_payload["conversationEnded"] is False
     assert _approval_commands(approval["allowedActions"]) == ["/approve", "/approve session", "/deny"]
     assert _approval_displays(approval["allowedActions"]) == ["仅本次允许", "本会话允许", "拒绝"]
     assert approval["allowPermanent"] is False
@@ -2562,6 +3168,7 @@ async def test_send_slash_confirm_puts_approval_actions_in_content():
     approval = action_payload["content"][0]
     assert action_payload["phase"] == "actions"
     assert action_payload["kind"] == "approval"
+    assert action_payload["conversationEnded"] is False
     assert action_payload["text"] == ""
     assert action_payload["replyToId"] == "msg-1"
     assert approval["type"] == "approval"
@@ -3366,6 +3973,158 @@ async def test_aops_run_agent_uses_dashboard_toolset_state(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_aops_run_agent_streams_main_agent_over_native_reply_bridge(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"provider": "openai", "api_key": "key", "base_url": "https://example.com", "api_mode": "responses"},
+    )
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _AopsStreamingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = AopsAdapter(
+        PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"})
+    )
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    runner = _make_runner(platform=Platform.AOPS, extra={"base_url": "https://aops.example.com"})
+    runner.adapters = {Platform.AOPS: adapter}
+    # AOPS native websocket streaming is enabled by its platform default even
+    # when the generic edit-based gateway stream is disabled.
+    runner.config.streaming = StreamingConfig(enabled=False, transport="auto")
+    source = SessionSource(
+        platform=Platform.AOPS,
+        chat_id="conv-stream",
+        chat_name="AOPS",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    result = await runner._run_agent(
+        message="请流式回答",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="session-stream",
+        session_key="agent:main:aops:dm:conv-stream",
+    )
+
+    assert result["final_response"] == "主代理流式回复"
+    events = [call.args[0] for call in adapter.send_reply_event.await_args_list]
+    assert [event["phase"] for event in events] == ["start", "delta", "delta", "end"]
+    assert [event.get("delta") for event in events[1:3]] == ["主代理", "流式回复"]
+    assert events[-1]["text"] == "主代理流式回复"
+    assert events[-1]["conversationEnded"] is True
+
+
+@pytest.mark.asyncio
+async def test_aops_run_agent_commits_steer_handoff_before_future_tool_and_final(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"provider": "openai", "api_key": "key", "base_url": "https://example.com", "api_mode": "responses"},
+    )
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _AopsSteerHandoffStreamingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = AopsAdapter(
+        PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"})
+    )
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    runner = _make_runner(platform=Platform.AOPS, extra={"base_url": "https://aops.example.com"})
+    runner.adapters = {Platform.AOPS: adapter}
+    runner.config.streaming = StreamingConfig(enabled=False, transport="auto")
+    source = SessionSource(
+        platform=Platform.AOPS,
+        chat_id="conv-steer",
+        chat_name="AOPS",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    result = await runner._run_agent(
+        message="first",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="session-steer",
+        session_key="agent:main:aops:dm:conv-steer",
+        event_message_id="msg-old",
+    )
+
+    assert result["final_response"] == "new answer"
+    events = [call.args[0] for call in adapter.send_reply_event.await_args_list]
+    old_events = [event for event in events if event.get("replyToId") == "msg-old"]
+    new_events = [event for event in events if event.get("replyToId") == "msg-steer"]
+    assert any(event.get("tool", {}).get("name") == "old-tool" for event in old_events)
+    assert len([event for event in old_events if event.get("conversationEnded")]) == 1
+    assert old_events[-1]["finishReason"] == "steered"
+    assert any(event.get("tool", {}).get("name") == "new-tool" for event in new_events)
+    assert new_events[-1]["conversationEnded"] is True
+    assert new_events[-1]["text"] == "new answer"
+
+
+@pytest.mark.asyncio
+async def test_aops_run_agent_replaces_internal_interrupt_text_with_structured_terminal(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"provider": "openai", "api_key": "key", "base_url": "https://example.com", "api_mode": "responses"},
+    )
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _AopsInterruptedStreamingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = AopsAdapter(
+        PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"})
+    )
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    runner = _make_runner(platform=Platform.AOPS, extra={"base_url": "https://aops.example.com"})
+    runner.adapters = {Platform.AOPS: adapter}
+    runner.config.streaming = StreamingConfig(enabled=False, transport="auto")
+    source = SessionSource(
+        platform=Platform.AOPS,
+        chat_id="conv-interrupted",
+        chat_name="AOPS",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    result = await runner._run_agent(
+        message="first",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="session-interrupted",
+        session_key="agent:main:aops:dm:conv-interrupted",
+    )
+
+    assert result["interrupted"] is True
+    events = [call.args[0] for call in adapter.send_reply_event.await_args_list]
+    assert [event["phase"] for event in events] == ["start", "delta", "end"]
+    assert len({event["messageId"] for event in events}) == 1
+    terminal = events[-1]
+    assert terminal["conversationEnded"] is True
+    assert terminal["interrupted"] is True
+    assert terminal["finishReason"] == "interrupted"
+    assert terminal["text"] == "当前任务已中断，正在处理新消息。"
+    assert "Operation interrupted" not in terminal["text"]
+
+
+@pytest.mark.asyncio
 async def test_aops_toolsets_unknown_name_returns_structured_error(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     runner = _make_runner(extra={"dm_policy": "open"})
@@ -3806,6 +4565,218 @@ async def test_aops_busy_command_rejects_invalid_mode(monkeypatch, tmp_path):
 
     assert payload["ok"] is False
     assert payload["error"]["code"] == "AOPS_BUSY_INVALID_MODE"
+
+
+@pytest.mark.asyncio
+async def test_aops_memory_status_reset_and_independent_limits(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text("old memory\n", encoding="utf-8")
+    (memory_dir / "USER.md").write_text("old user\n", encoding="utf-8")
+    runner = _make_runner(extra={"dm_policy": "open"})
+    runner._agent_cache = {"aops:user-001": (gateway_run._AGENT_PENDING_SENTINEL, None)}
+
+    result = await runner._handle_message(_make_aops_event("/memory memory_char_limit 3000"))
+    payload = json.loads(result.text)
+    assert payload["type"] == "memory.updated"
+    assert payload["memory"]["charLimit"] == 3000
+    assert payload["userProfile"]["charLimit"] == 1375
+    assert runner._agent_cache == {}
+
+    result = await runner._handle_message(_make_aops_event("/memory user_char_limit"))
+    payload = json.loads(result.text)
+    assert payload["userProfile"]["charLimit"] == 1375
+
+    result = await runner._handle_message(_make_aops_event("/memory reset memory"))
+    payload = json.loads(result.text)
+    assert payload["type"] == "memory.reset"
+    assert payload["remoteDataRetained"] is True
+    assert (memory_dir / "MEMORY.md").read_text(encoding="utf-8") == ""
+    assert (memory_dir / "USER.md").read_text(encoding="utf-8") == "old user\n"
+
+
+@pytest.mark.asyncio
+async def test_aops_memory_get_returns_complete_profile_content_without_cache_effect(monkeypatch, tmp_path):
+    profile_home = tmp_path / ".hermes" / "profiles" / "ops-1"
+    memory_dir = profile_home / "memories"
+    memory_dir.mkdir(parents=True)
+    content = "用户偏好使用中文回答。\n\n## 项目\n- 保留 Markdown\n"
+    memory_path = memory_dir / "MEMORY.md"
+    memory_path.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    runner = _make_runner(extra={"dm_policy": "open"})
+    cached = {"aops:user-001": (gateway_run._AGENT_PENDING_SENTINEL, None)}
+    runner._agent_cache = dict(cached)
+
+    result = await runner._handle_message(_make_aops_event("/memory get"))
+    payload = json.loads(result.text)
+    assert payload["type"] == "memory.content"
+    assert payload["ok"] is True
+    assert payload["path"] == str(memory_path)
+    assert payload["content"] == content
+    assert payload["contentLength"] == len(content)
+    assert payload["exists"] is True
+    assert isinstance(payload["updatedAtMs"], int)
+    assert payload["enabled"] is True
+    assert payload["charLimit"] == 2200
+    assert payload["effectiveImmediately"] is True
+    assert payload["restartRequired"] is False
+    assert runner._agent_cache == cached
+
+    equivalent = await runner._handle_message(_make_aops_event("/memory get memory"))
+    assert json.loads(equivalent.text)["content"] == content
+
+
+@pytest.mark.asyncio
+async def test_aops_memory_get_missing_file_and_read_error(monkeypatch, tmp_path):
+    from gateway import aops_commands
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    missing = await runner._handle_message(_make_aops_event("/memory get"))
+    missing_payload = json.loads(missing.text)
+    assert missing_payload["ok"] is True
+    assert missing_payload["content"] == ""
+    assert missing_payload["contentLength"] == 0
+    assert missing_payload["exists"] is False
+    assert missing_payload["updatedAtMs"] is None
+
+    memory_path = tmp_path / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True, exist_ok=True)
+    memory_path.write_text("unreadable", encoding="utf-8")
+    monkeypatch.setattr(aops_commands, "_read_text_file", lambda _path: (_ for _ in ()).throw(PermissionError("denied")))
+    failed = await runner._handle_message(_make_aops_event("/memory get"))
+    failed_payload = json.loads(failed.text)
+    assert failed_payload["type"] == "memory.content"
+    assert failed_payload["ok"] is False
+    assert failed_payload["error"]["code"] == "AOPS_MEMORY_READ_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_aops_memory_get_rejects_extra_arguments(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/memory get memory extra"))
+    payload = json.loads(result.text)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "AOPS_MEMORY_INVALID_SUBCOMMAND"
+
+
+@pytest.mark.asyncio
+async def test_aops_memory_toggles_and_provider_restore(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/memory disable memory"))
+    payload = json.loads(result.text)
+    assert payload["memory"]["enabled"] is False
+
+    result = await runner._handle_message(_make_aops_event("/memory provider enable hindsight"))
+    payload = json.loads(result.text)
+    assert payload["provider"]["name"] == "hindsight"
+
+    result = await runner._handle_message(_make_aops_event("/memory provider disable"))
+    payload = json.loads(result.text)
+    assert payload["provider"]["enabled"] is False
+    assert (tmp_path / "aops-memory-state.json").exists()
+
+    result = await runner._handle_message(_make_aops_event("/memory provider enable"))
+    payload = json.loads(result.text)
+    assert payload["provider"]["name"] == "hindsight"
+
+
+@pytest.mark.asyncio
+async def test_aops_memory_rejects_invalid_limit_and_target(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/memory memory_char_limit 0"))
+    assert json.loads(result.text)["error"]["code"] == "AOPS_MEMORY_INVALID_LIMIT"
+
+    result = await runner._handle_message(_make_aops_event("/memory reset nope"))
+    assert json.loads(result.text)["error"]["code"] == "AOPS_MEMORY_INVALID_TARGET"
+
+
+def test_aops_profile_delete_preview_and_one_time_confirm(monkeypatch, tmp_path):
+    from gateway import aops_commands
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "ops-1"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    event = _make_aops_event("/profile delete")
+
+    preview = aops_commands.maybe_local_command(event)
+    payload = json.loads(preview.text)
+    assert payload["type"] == "profile.delete.preview"
+    assert payload["ok"] is True
+    assert payload["profile"]["name"] == "ops-1"
+    assert payload["deletion"]["remoteHindsightRetained"] is True
+    token = payload["deletion"]["confirmationToken"]
+
+    confirm = aops_commands.maybe_local_command(
+        _make_aops_event(f"/profile delete confirm {token}")
+    )
+    confirmed = json.loads(confirm.text)
+    assert confirmed["type"] == "profile.delete.accepted"
+    assert confirmed["deletion"]["status"] == "scheduled"
+    assert confirm.metadata["effects"]["deleteProfile"]["profile"] == "ops-1"
+
+    replay = aops_commands.maybe_local_command(
+        _make_aops_event(f"/profile delete confirm {token}")
+    )
+    assert json.loads(replay.text)["error"]["code"] == "PROFILE_DELETE_CONFIRMATION_INVALID"
+
+
+def test_aops_profile_delete_protects_default(monkeypatch, tmp_path):
+    from gateway import aops_commands
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    event = _make_aops_event("/profile delete")
+    result = aops_commands.maybe_local_command(event)
+    payload = json.loads(result.text)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "PROFILE_DEFAULT_PROTECTED"
+
+
+@pytest.mark.asyncio
+async def test_aops_profile_delete_does_not_require_slash_admin(monkeypatch, tmp_path):
+    profile_home = tmp_path / ".hermes" / "profiles" / "ops-admin-test"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    runner = _make_runner(extra={"allow_admin_from": ["another-user"]})
+    event = _make_aops_event("/profile delete")
+    result = await runner._handle_message(event)
+    payload = json.loads(result.text)
+    assert payload["ok"] is True
+    assert payload["type"] == "profile.delete.preview"
+
+
+def test_aops_profile_delete_tokens_are_redacted_from_wire_logs():
+    from gateway.platforms.aops import _redact_profile_delete_log_value
+
+    payload = {
+        "data": {
+            "text": '{"command":"/profile delete confirm secret-token","confirmationToken":"secret-token"}',
+            "confirmationToken": "secret-token",
+        }
+    }
+    redacted = _redact_profile_delete_log_value(payload)
+    encoded = json.dumps(redacted)
+    assert "secret-token" not in encoded
+    assert "[REDACTED]" in encoded
+
+
+@pytest.mark.asyncio
+async def test_aops_help_includes_profile_delete_commands():
+    runner = _make_runner(extra={"dm_policy": "open"})
+    result = await runner._handle_message(_make_aops_event("/help"))
+    payload = json.loads(result)
+    profile = next(item for item in payload["items"] if item["fullCommand"] == "/profile")
+    assert any(child["fullCommand"] == "/profile delete" for child in profile["children"])
+    assert any(child["fullCommand"] == "/profile delete confirm" for child in profile["children"])
 
 
 @pytest.mark.asyncio
@@ -4867,7 +5838,68 @@ async def test_aops_new_uses_actions_slash_confirm(monkeypatch):
     assert _approval_commands(approval["allowedActions"]) == ["/approve", "/always", "/cancel"]
     assert _approval_displays(approval["allowedActions"]) == ["执行本次", "始终执行", "取消"]
     assert "Confirm /new" in approval["message"]
-    assert slash_confirm.get_pending(session_key) is not None
+    pending = slash_confirm.get_pending(session_key)
+    assert pending is not None
+    assert pending["context"]["reply_to_id"] == "msg-1"
+    assert pending["context"]["channel_id"] == "user-001"
+    slash_confirm.clear(session_key)
+
+
+@pytest.mark.asyncio
+async def test_aops_slash_confirm_resolution_closes_original_and_approval_messages():
+    from tools import slash_confirm
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    adapter = AopsAdapter(
+        PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"})
+    )
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    runner.adapters[Platform.AOPS] = adapter
+
+    source = SessionSource(
+        platform=Platform.AOPS,
+        user_id="user-001",
+        chat_id="conv-001",
+        user_name="AOPS User",
+        chat_type="dm",
+    )
+    original = MessageEvent(text="/new", source=source, message_id="843017")
+    approval = MessageEvent(text="/approve", source=source, message_id="843018")
+    session_key = runner._session_key_for_source(source)
+    slash_confirm.clear(session_key)
+
+    async def execute(_choice):
+        return "✨ Session reset! Starting fresh."
+
+    slash_confirm.register(
+        session_key,
+        "confirm-1",
+        "new",
+        execute,
+        context={
+            "platform": "aops",
+            "channel_id": "conv-001",
+            "reply_to_id": original.message_id,
+            "silent": False,
+            "message_type": "common",
+            "title": "",
+        },
+    )
+
+    approval_result = await runner._handle_message(approval)
+
+    assert "执行结果已返回原请求" in approval_result
+    original_events = [
+        call.args[0]
+        for call in adapter.send_reply_event.await_args_list
+        if call.args[0].get("replyToId") == "843017"
+    ]
+    assert [event["phase"] for event in original_events] == ["start", "end"]
+    assert original_events[-1]["conversationEnded"] is True
+    assert original_events[-1]["text"] == "✨ Session reset! Starting fresh."
+    # The returned acknowledgment is delivered by the normal gateway path to
+    # 843018, giving the approval action its own unique terminal.
+    assert all(event.get("replyToId") != "843018" for event in original_events)
     slash_confirm.clear(session_key)
 
 
@@ -5027,7 +6059,7 @@ model:
 
 
 @pytest.mark.asyncio
-async def test_aops_model_use_persists_channel_preference(monkeypatch, tmp_path):
+async def test_aops_model_use_updates_global_config_without_channel_preference(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import hermes_cli.model_switch as model_switch
     from gateway import aops_state
@@ -5052,23 +6084,23 @@ async def test_aops_model_use_persists_channel_preference(monkeypatch, tmp_path)
     runner = _make_runner(extra={"dm_policy": "open"})
 
     event = _make_aops_event_for_channel("/model use openrouter custom-model", channel_id="conv-abc", agent_key="oma")
-    session_key = runner._session_key_for_source(event.source)
-
     result = await runner._handle_message(event)
 
     payload = json.loads(result)
     assert payload["type"] == "model.switch"
     assert payload["ok"] is True
-    assert payload["scope"] == "aops-channel"
+    assert payload["scope"] == "config"
     assert payload["persisted"] is True
+    assert payload["effectiveImmediately"] is True
+    assert payload["restartRequired"] is False
     assert captured["raw_input"] == "custom-model"
     assert captured["explicit_provider"] == "openrouter"
     pref_key = aops_state.preference_key(platform="aops", channel_id="conv-abc", agent_key="oma")
-    pref = aops_state.get_model_preference(pref_key)
-    assert pref["model"] == "custom-model"
-    assert pref["provider"] == "openrouter"
-    runner._load_aops_model_preference_for_event(event, session_key)
-    assert runner._session_model_overrides[session_key]["model"] == "custom-model"
+    assert aops_state.get_model_preference(pref_key) is None
+    assert runner._session_model_overrides == {}
+    saved = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+    assert "default: custom-model" in saved
+    assert "provider: openrouter" in saved
 
 
 @pytest.mark.asyncio
@@ -5090,8 +6122,6 @@ model:
 
     runner = _make_runner(extra={"dm_policy": "open"})
     event = _make_aops_event_for_channel("/model use custom qwen35-122b", channel_id="conv-abc", agent_key="main")
-    session_key = runner._session_key_for_source(event.source)
-
     result = await runner._handle_message(event)
 
     payload = json.loads(result)
@@ -5101,17 +6131,53 @@ model:
     assert payload["provider"] == "custom"
     assert payload["baseUrl"] == "http://model-gateway.internal/v1"
     assert payload["apiKeyConfigured"] is True
+    assert payload["scope"] == "config"
     pref_key = aops_state.preference_key(platform="aops", channel_id="conv-abc", agent_key="main")
-    pref = aops_state.get_model_preference(pref_key)
-    assert pref["model"] == "qwen35-122b"
-    assert pref["api_key"] == "key-from-env"
-    assert runner._session_model_overrides[session_key]["model"] == "qwen35-122b"
-    assert runner._session_model_overrides[session_key]["base_url"] == "http://model-gateway.internal/v1"
+    assert aops_state.get_model_preference(pref_key) is None
+    assert runner._session_model_overrides == {}
     assert payload["configUpdated"] is True
     saved = (tmp_path / "config.yaml").read_text(encoding="utf-8")
     assert "default: qwen35-122b" in saved
     assert "model: qwen35-122b" in saved
     assert "api_key: ${AOPS_MODEL_GATEWAY_KEY}" in saved
+
+
+@pytest.mark.asyncio
+async def test_aops_model_switch_is_visible_to_other_channels(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        """
+model:
+  provider: custom
+  default: old-model
+  base_url: http://model-gateway.internal/v1
+""",
+        encoding="utf-8",
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+    legacy_key = "agent:main:aops:dm:conv-old"
+    runner._session_model_overrides[legacy_key] = {"model": "legacy-model"}
+    runner._pending_model_notes[legacy_key] = "legacy note"
+    runner._last_resolved_model = {legacy_key: "legacy-model", "*": "legacy-model"}
+
+    switched = await runner._handle_message(
+        _make_aops_event_for_channel("/model use custom new-model", channel_id="conv-a", agent_key="main")
+    )
+    status = await runner._handle_message(
+        _make_aops_event_for_channel("/model status", channel_id="conv-b", agent_key="main")
+    )
+
+    switched_payload = json.loads(switched)
+    status_payload = json.loads(status)
+    assert switched_payload["scope"] == "config"
+    assert switched_payload["preferenceKey"] is None
+    assert status_payload["model"] == "new-model"
+    assert status_payload["scope"] == "config"
+    assert status_payload["preferenceKey"] is None
+    assert status_payload["statePath"] == ""
+    assert legacy_key not in runner._session_model_overrides
+    assert legacy_key not in runner._pending_model_notes
+    assert runner._last_resolved_model == {}
 
 
 @pytest.mark.asyncio
@@ -5308,7 +6374,7 @@ model:
 
 
 @pytest.mark.asyncio
-async def test_aops_model_status_ignores_stale_reserved_channel_preference(monkeypatch, tmp_path):
+async def test_aops_model_status_ignores_and_clears_legacy_channel_preference(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
         """
@@ -5327,7 +6393,7 @@ model:
     aops_state.set_model_preference(
         pref_key,
         {
-            "model": "status]",
+            "model": "legacy-channel-model",
             "provider": "custom",
             "base_url": "http://model-gateway.internal/v1",
             "api_key_ref": "MODEL_GATEWAY_API_KEY",
@@ -5347,12 +6413,12 @@ model:
 
 
 @pytest.mark.asyncio
-async def test_aops_model_preference_loader_drops_stale_reserved_model(monkeypatch, tmp_path):
+async def test_aops_model_preference_loader_clears_all_legacy_preferences(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from gateway import aops_state
 
     pref_key = aops_state.preference_key(platform="aops", channel_id="conv-abc", agent_key="main")
-    aops_state.set_model_preference(pref_key, {"model": "status]", "provider": "custom"})
+    aops_state.set_model_preference(pref_key, {"model": "legacy-channel-model", "provider": "custom"})
     runner = _make_runner(extra={"dm_policy": "open"})
     event = _make_aops_event_for_channel("/model current", channel_id="conv-abc", agent_key="main")
     session_key = runner._session_key_for_source(event.source)
@@ -6063,3 +7129,137 @@ async def test_run_agent_route_overrides_apply_to_agent_init(monkeypatch):
     assert _CapturingAgent.last_init["command"] == "codex"
     assert _CapturingAgent.last_init["args"] == ["--fast"]
     assert _CapturingAgent.last_init["credential_pool"] == "pool-a"
+
+
+@pytest.mark.asyncio
+async def test_aops_run_agent_ignores_route_and_session_model_overrides(monkeypatch, caplog):
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"model": {"default": "config-model", "provider": "custom"}},
+    )
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "custom",
+            "api_key": "key",
+            "base_url": "https://model.example.com/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    runner = _make_runner(platform=Platform.AOPS, extra={})
+    session_key = "agent:main:aops:dm:conv-model"
+    runner._session_model_overrides[session_key] = {
+        "model": "session-model",
+        "provider": "openrouter",
+        "api_key": "old-key",
+    }
+    source = SessionSource(
+        platform=Platform.AOPS,
+        chat_id="conv-model",
+        chat_name="AOPS",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        result = await runner._run_agent(
+            message="ping",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-aops-model",
+            session_key=session_key,
+            route_overrides={
+                "model": "route-model",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "command": "codex",
+            },
+        )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init["model"] == "config-model"
+    assert _CapturingAgent.last_init["provider"] == "custom"
+    assert _CapturingAgent.last_init["api_mode"] == "chat_completions"
+    assert _CapturingAgent.last_init.get("command") != "codex"
+    assert session_key not in runner._session_model_overrides
+    runtime_logs = [record.message for record in caplog.records if "AOPS runtime selected" in record.message]
+    assert len(runtime_logs) == 1
+    assert "model=config-model" in runtime_logs[0]
+    assert "provider=custom" in runtime_logs[0]
+    assert "baseHost=model.example.com" in runtime_logs[0]
+
+
+@pytest.mark.asyncio
+async def test_aops_rebuilds_cached_agent_after_runtime_fallback_drift(monkeypatch, caplog):
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"model": {"default": "config-model", "provider": "custom"}},
+    )
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "custom",
+            "api_key": "key",
+            "base_url": "https://model.example.com/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    runner = _make_runner(platform=Platform.AOPS, extra={})
+    session_key = "agent:main:aops:dm:conv-fallback-drift"
+    source = SessionSource(
+        platform=Platform.AOPS,
+        chat_id="conv-fallback-drift",
+        chat_name="AOPS",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    await runner._run_agent(
+        message="first",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="session-aops-fallback-drift",
+        session_key=session_key,
+    )
+    original = runner._agent_cache[session_key][0]
+    # Mirror the in-place mutation performed by AIAgent fallback handling.
+    original.model = "old-fallback-model"
+    original.provider = "openrouter"
+    original.base_url = "https://fallback.example.com/v1"
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        await runner._run_agent(
+            message="second",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-aops-fallback-drift",
+            session_key=session_key,
+        )
+
+    rebuilt = runner._agent_cache[session_key][0]
+    assert rebuilt is not original
+    assert rebuilt.model == "config-model"
+    assert rebuilt.provider == "custom"
+    assert rebuilt.base_url == "https://model.example.com/v1"
+    runtime_logs = [record.message for record in caplog.records if "AOPS runtime selected" in record.message]
+    assert runtime_logs
+    assert "model=config-model" in runtime_logs[-1]
+    assert "provider=custom" in runtime_logs[-1]
+    assert "cacheHit=false" in runtime_logs[-1]

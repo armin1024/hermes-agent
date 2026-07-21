@@ -2895,8 +2895,9 @@ class AIAgent:
         if _steer_lock is not None:
             with _steer_lock:
                 self._pending_steer = None
+                self._pending_steer_contexts = []
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, context: Any = None) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -2924,13 +2925,71 @@ class AIAgent:
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            if context is not None:
+                contexts = list(getattr(self, "_pending_steer_contexts", []) or [])
+                contexts.append(context)
+                self._pending_steer_contexts = contexts
             return True
         with _lock:
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
+            if context is not None:
+                contexts = getattr(self, "_pending_steer_contexts", None)
+                if contexts is None:
+                    contexts = []
+                    self._pending_steer_contexts = contexts
+                contexts.append(context)
         return True
+
+    def _drain_pending_steer_with_context(self) -> tuple[Optional[str], list[Any]]:
+        """Atomically drain pending steer text and opaque routing envelopes."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            text = getattr(self, "_pending_steer", None)
+            contexts = list(getattr(self, "_pending_steer_contexts", []) or [])
+            self._pending_steer = None
+            self._pending_steer_contexts = []
+            return text, contexts
+        with _lock:
+            text = self._pending_steer
+            contexts = list(getattr(self, "_pending_steer_contexts", []) or [])
+            self._pending_steer = None
+            self._pending_steer_contexts = []
+        return text, contexts
+
+    def _restash_pending_steer(self, text: str, contexts: Optional[list[Any]] = None) -> None:
+        """Put a drained steer back without losing its routing envelopes."""
+        if not text:
+            return
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            existing = getattr(self, "_pending_steer", None)
+            self._pending_steer = (existing + "\n" + text) if existing else text
+            existing_contexts = list(getattr(self, "_pending_steer_contexts", []) or [])
+            self._pending_steer_contexts = list(contexts or []) + existing_contexts
+            return
+        with _lock:
+            if self._pending_steer:
+                self._pending_steer = text + "\n" + self._pending_steer
+            else:
+                self._pending_steer = text
+            if contexts:
+                self._pending_steer_contexts = (
+                    list(contexts)
+                    + list(getattr(self, "_pending_steer_contexts", []) or [])
+                )
+
+    def _notify_steer_applied(self, contexts: Optional[list[Any]] = None) -> None:
+        """Notify an integration that steer ownership may now be handed off."""
+        callback = getattr(self, "steer_applied_callback", None)
+        if callback is None or not contexts:
+            return
+        try:
+            callback(list(contexts))
+        except Exception as exc:
+            logger.warning("steer_applied_callback failed: %s", exc)
 
     def _drain_pending_steer(self) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
@@ -2938,14 +2997,7 @@ class AIAgent:
         Safe to call from the agent execution thread after appending tool
         results. Returns None when no steer is pending.
         """
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            text = getattr(self, "_pending_steer", None)
-            self._pending_steer = None
-            return text
-        with _lock:
-            text = self._pending_steer
-            self._pending_steer = None
+        text, _contexts = self._drain_pending_steer_with_context()
         return text
 
     def _record_file_mutation_result(

@@ -22,7 +22,9 @@ def _bare_agent() -> AIAgent:
     """
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
+    agent._pending_steer_contexts = []
     agent._pending_steer_lock = threading.Lock()
+    agent.steer_applied_callback = None
     return agent
 
 
@@ -73,6 +75,41 @@ class TestSteerDrain:
 
 
 class TestSteerInjection:
+    def test_context_callback_fires_only_after_actual_injection(self):
+        agent = _bare_agent()
+        delivered = []
+        agent.steer_applied_callback = lambda contexts: delivered.extend(contexts)
+        context = {"reply_to_id": "new-message"}
+        agent.steer("new request", context=context)
+
+        # No tool result means no handoff and the envelope is retained.
+        agent._apply_pending_steer_to_tool_results(
+            [{"role": "assistant", "content": "working"}],
+            num_tool_msgs=1,
+        )
+        assert delivered == []
+        assert agent._pending_steer_contexts == [context]
+
+        messages = [{"role": "tool", "content": "done", "tool_call_id": "tc1"}]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        assert delivered == [context]
+        assert agent._pending_steer_contexts == []
+
+    def test_multiple_steer_contexts_keep_arrival_order(self):
+        agent = _bare_agent()
+        delivered = []
+        agent.steer_applied_callback = lambda contexts: delivered.extend(contexts)
+        first = {"reply_to_id": "msg-2"}
+        second = {"reply_to_id": "msg-3"}
+        agent.steer("first", context=first)
+        agent.steer("second", context=second)
+
+        messages = [{"role": "tool", "content": "done", "tool_call_id": "tc1"}]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        assert delivered == [first, second]
+        assert "first\nsecond" in messages[0]["content"]
+
     def test_appends_to_last_tool_result(self):
         agent = _bare_agent()
         agent.steer("please also check auth.log")

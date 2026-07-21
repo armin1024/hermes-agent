@@ -11,6 +11,8 @@ import logging
 import mimetypes
 import os
 import queue
+import random
+import re
 import socket
 import subprocess
 import threading
@@ -46,18 +48,62 @@ from hermes_constants import get_default_hermes_root, get_hermes_home
 
 logger = logging.getLogger(__name__)
 
-_RECONNECT_BACKOFF = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
+_RECONNECT_INITIAL_DELAY = 0.5
+_RECONNECT_MAX_DELAY = 30.0
+_RECONNECT_JITTER_MAX = 0.5
+_AOPS_AUTH_TIMEOUT_SECS_DEFAULT = 30.0
+_AOPS_MAX_REDIRECTS = 3
+_AOPS_REDIRECT_COOLDOWN_MS = 30_000
 _AOPS_LOG_RETENTION_DAYS_DEFAULT = 7
 _AOPS_LOG_LOCK = threading.Lock()
+_AOPS_STREAM_LOG_STATE: dict[tuple[str, str], dict[str, Any]] = {}
+_AOPS_STREAM_LOG_STATE_MAX = 1024
+_AOPS_STREAM_LOG_STATE_TTL_SECS = 3600.0
+_AOPS_STREAM_LOG_CHUNK_LIMIT = 4096
 _DONE = object()
 _SEGMENT_BREAK = object()
 _COMMENTARY = object()
 _TOOL = object()
 _FINAL = object()
 _ERROR = object()
+_HANDOFF = object()
 _AOPS_CLIENT_ID_CACHE: dict[str, str] = {}
 _AOPS_MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 _AOPS_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
+_AOPS_AGENT_ROUTE_RUNTIME_FIELDS = frozenset(
+    {"model", "provider", "base_url", "api_key", "api_mode", "command", "args", "credential_pool"}
+)
+
+
+class _AopsAuthTimeout(RuntimeError):
+    """The server did not acknowledge the WebSocket auth handshake."""
+
+
+def _valid_target_ip(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return ""
+    return candidate
+
+
+def _target_ip_subprotocol(value: Any) -> str:
+    """Return an IPv4 target suitable for ``Sec-WebSocket-Protocol``.
+
+    WebSocket subprotocol values use the HTTP ``token`` grammar.  A raw IPv4
+    literal is a valid token, while an IPv6 literal contains ``:`` and cannot
+    be sent verbatim.  Tec01 currently routes redirect targets by IPv4 Pod IP.
+    """
+    candidate = _valid_target_ip(value)
+    if not candidate:
+        return ""
+    try:
+        return candidate if ipaddress.ip_address(candidate).version == 4 else ""
+    except ValueError:
+        return ""
 
 
 def check_aops_requirements() -> bool:
@@ -405,7 +451,13 @@ def _build_ws_url(base_url: str) -> str:
         ws_scheme = scheme
     else:
         ws_scheme = "wss"
-    return urlunparse(parsed._replace(scheme=ws_scheme, path="/api/v1/ws", params="", query="", fragment=""))
+    # AOPS_BOT_URL may point at a reverse-proxy prefix, for example
+    # ``https://aops.example.com/aops/tec01``.  Preserve that prefix when
+    # constructing the WebSocket endpoint; replacing the path with
+    # ``/api/v1/ws`` would incorrectly bypass the proxy and produce a 404.
+    base_path = parsed.path.rstrip("/")
+    ws_path = f"{base_path}/api/v1/ws" if base_path else "/api/v1/ws"
+    return urlunparse(parsed._replace(scheme=ws_scheme, path=ws_path, params="", query="", fragment=""))
 
 
 def _now_ms() -> int:
@@ -723,6 +775,83 @@ def _aops_log_retention_days(config: PlatformConfig | None = None) -> int:
     return parsed
 
 
+def _aops_log_stream_deltas(config: PlatformConfig | None = None) -> bool:
+    value: Any = None
+    if config is not None:
+        extra = getattr(config, "extra", None)
+        if isinstance(extra, dict) and "log_stream_deltas" in extra:
+            value = extra.get("log_stream_deltas")
+    if value is None:
+        value = os.getenv("AOPS_LOG_STREAM_DELTAS", "").strip()
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _bounded_stream_log_chunk(value: Any) -> str:
+    text = str(value or "")
+    if len(text) <= _AOPS_STREAM_LOG_CHUNK_LIMIT:
+        return text
+    return text[: _AOPS_STREAM_LOG_CHUNK_LIMIT - 1] + "…"
+
+
+def _stream_log_key(data: dict[str, Any]) -> tuple[str, str] | None:
+    message_id = str(data.get("messageId") or "").strip()
+    if not message_id:
+        return None
+    return str(get_hermes_home()), message_id
+
+
+def _update_stream_log_state(
+    data: dict[str, Any],
+    *,
+    successful_delta: bool = False,
+    terminal: bool = False,
+) -> dict[str, Any] | None:
+    """Update bounded per-message stream logging state.
+
+    Successful deltas stay in memory until the segment ends.  This lets the
+    file log retain useful totals and the last successful chunk without doing
+    disk I/O for every token.
+    """
+    key = _stream_log_key(data)
+    if key is None:
+        return None
+    now = time.monotonic()
+    with _AOPS_LOG_LOCK:
+        expired = [
+            item_key
+            for item_key, item in _AOPS_STREAM_LOG_STATE.items()
+            if now - float(item.get("updatedAt", now)) > _AOPS_STREAM_LOG_STATE_TTL_SECS
+        ]
+        for item_key in expired:
+            _AOPS_STREAM_LOG_STATE.pop(item_key, None)
+        if terminal:
+            return _AOPS_STREAM_LOG_STATE.pop(key, None)
+        state = _AOPS_STREAM_LOG_STATE.setdefault(
+            key,
+            {
+                "startedAt": now,
+                "updatedAt": now,
+                "deltaCount": 0,
+                "chars": 0,
+                "lastSuccessfulSeq": None,
+                "lastSuccessfulDelta": "",
+            },
+        )
+        state["updatedAt"] = now
+        if successful_delta:
+            delta = str(data.get("delta") or "")
+            state["deltaCount"] = int(state.get("deltaCount", 0)) + 1
+            state["chars"] = int(state.get("chars", 0)) + len(delta)
+            state["lastSuccessfulSeq"] = data.get("seq")
+            state["lastSuccessfulDelta"] = _bounded_stream_log_chunk(delta)
+        while len(_AOPS_STREAM_LOG_STATE) > _AOPS_STREAM_LOG_STATE_MAX:
+            oldest = next(iter(_AOPS_STREAM_LOG_STATE))
+            _AOPS_STREAM_LOG_STATE.pop(oldest, None)
+        return dict(state)
+
+
 def _aops_local_command_send_timeout() -> float:
     raw = os.getenv("AOPS_LOCAL_COMMAND_SEND_TIMEOUT", "2").strip()
     try:
@@ -772,6 +901,30 @@ def _quote_aops_log_value(value: Any, *, limit: int = 500) -> str:
 
 def _aops_log_raw_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+_PROFILE_DELETE_CONFIRM_RE = re.compile(r"(/profile\s+delete\s+confirm\s+)(\S+)", re.IGNORECASE)
+_PROFILE_DELETE_TOKEN_JSON_RE = re.compile(r'("confirmationToken"\s*:\s*")([^"]+)(")', re.IGNORECASE)
+
+
+def _redact_profile_delete_log_value(value: Any) -> Any:
+    """Redact one-time profile deletion tokens from AOPS logs."""
+    if isinstance(value, str):
+        redacted = _PROFILE_DELETE_CONFIRM_RE.sub(r"\1[REDACTED]", value)
+        return _PROFILE_DELETE_TOKEN_JSON_RE.sub(r"\1[REDACTED]\3", redacted)
+    if isinstance(value, list):
+        return [_redact_profile_delete_log_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_profile_delete_log_value(item) for item in value)
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            if str(key).lower() in {"confirmationtoken", "confirmation_token"}:
+                result[key] = "[REDACTED]"
+            else:
+                result[key] = _redact_profile_delete_log_value(item)
+        return result
+    return value
 
 
 def _aops_action_commands(actions: Any) -> list[str]:
@@ -992,8 +1145,25 @@ def _write_aops_log_line(
 ) -> None:
     now = datetime.now(timezone.utc)
     log_dir = get_hermes_home() / "logs" / "aops"
-    record_data = data if isinstance(data, dict) else {}
-    raw_payload = raw if raw is not None else payload
+    source_payload = raw if raw is not None else payload
+    source_data = data if isinstance(data, dict) else _aops_log_data_from_payload(source_payload)
+    phase = str(source_data.get("phase") or "").strip().lower()
+    status_value = status or ("failed" if error else ("skipped" if filtered else "ok"))
+    is_outbound_delta = direction not in {"in", "recv"} and phase == "delta"
+    stream_state: dict[str, Any] | None = None
+    if is_outbound_delta and status_value == "ok" and not filtered:
+        stream_state = _update_stream_log_state(source_data, successful_delta=True)
+        if not _aops_log_stream_deltas(config):
+            return
+    elif direction not in {"in", "recv"} and phase == "start":
+        _update_stream_log_state(source_data)
+    elif phase in {"end", "error"}:
+        stream_state = _update_stream_log_state(source_data, terminal=True)
+    elif is_outbound_delta:
+        stream_state = _update_stream_log_state(source_data)
+
+    record_data = _redact_profile_delete_log_value(data) if isinstance(data, dict) else {}
+    raw_payload = _redact_profile_delete_log_value(raw if raw is not None else payload)
     if not record_data:
         record_data = _aops_log_data_from_payload(raw_payload)
     metadata = record_data.get("metadata") if isinstance(record_data.get("metadata"), dict) else {}
@@ -1002,11 +1172,12 @@ def _write_aops_log_line(
     message_type = _aops_log_message_type(record_data, action=action, filtered=filtered)
     silent = bool(record_data.get("silent") is True or str(record_data.get("messageType") or "").strip().lower() == "silent")
     text = _aops_log_text(record_data, action=action, error=error, filtered=filtered)
-    status_value = status or ("failed" if error else ("skipped" if filtered else "ok"))
     line_parts = [
         _format_local(now),
         f"io={io}",
         f"event={event or '-'}",
+        f"phase={phase or '-'}",
+        f"seq={record_data.get('seq') if record_data.get('seq') is not None else '-'}",
         f"messageType={message_type or '-'}",
         f"silent={'true' if silent else 'false'}",
         f"channel={record_data.get('channelId') or record_data.get('conversationId') or '-'}",
@@ -1017,8 +1188,26 @@ def _write_aops_log_line(
         f"status={status_value}",
         f"elapsedMs={elapsed_ms if elapsed_ms is not None else '-'}",
         f"sendElapsedMs={send_elapsed_ms if send_elapsed_ms is not None else '-'}",
-        f"raw={_aops_log_raw_json(raw_payload if raw_payload is not None else record_data)}",
     ]
+    if stream_state:
+        duration_ms = max(0, int((time.monotonic() - float(stream_state.get("startedAt", time.monotonic()))) * 1000))
+        if phase in {"end", "error"}:
+            line_parts.extend(
+                [
+                    f"streamDeltaCount={int(stream_state.get('deltaCount', 0))}",
+                    f"streamChars={int(stream_state.get('chars', 0))}",
+                    f"streamDurationMs={duration_ms}",
+                ]
+            )
+        elif is_outbound_delta and status_value != "ok":
+            line_parts.extend(
+                [
+                    f"lastSuccessfulSeq={stream_state.get('lastSuccessfulSeq') if stream_state.get('lastSuccessfulSeq') is not None else '-'}",
+                    f"lastSuccessfulDelta={_quote_aops_log_value(stream_state.get('lastSuccessfulDelta'), limit=_AOPS_STREAM_LOG_CHUNK_LIMIT)}",
+                    f"failedDelta={_quote_aops_log_value(record_data.get('delta'), limit=_AOPS_STREAM_LOG_CHUNK_LIMIT)}",
+                ]
+            )
+    line_parts.append(f"raw={_aops_log_raw_json(raw_payload if raw_payload is not None else record_data)}")
     try:
         with _AOPS_LOG_LOCK:
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -1036,6 +1225,7 @@ class _ReplyContext:
     reply_to_id: Optional[str]
     run_id: Optional[str]
     title: Optional[str] = None
+    steered_from_reply_to_id: Optional[str] = None
 
 
 class AopsLiveReplyBridge:
@@ -1054,6 +1244,7 @@ class AopsLiveReplyBridge:
     ):
         self.adapter = adapter
         self.context = _ReplyContext(channel_id=str(chat_id), reply_to_id=reply_to_id, run_id=run_id, title=title)
+        self._context_lock = threading.Lock()
         self._queue: queue.Queue = queue.Queue()
         self._message_id: Optional[str] = None
         self._seq = 0
@@ -1072,12 +1263,33 @@ class AopsLiveReplyBridge:
         return self._final_response_sent
 
     def bind_run_id(self, run_id: str | None) -> None:
-        self.context.run_id = run_id
+        with self._context_lock:
+            self.context.run_id = run_id
 
     def update_title(self, title: str | None) -> None:
         normalized = str(title or "").strip()
         if normalized:
-            self.context.title = normalized
+            with self._context_lock:
+                self.context.title = normalized
+
+    def route_snapshot(self) -> dict[str, Any]:
+        """Return the currently committed AOPS delivery owner."""
+        with self._context_lock:
+            return {
+                "channel_id": self.context.channel_id,
+                "reply_to_id": self.context.reply_to_id,
+                "run_id": self.context.run_id,
+                "title": self.context.title,
+                "steered_from_reply_to_id": self.context.steered_from_reply_to_id,
+            }
+
+    def request_handoff(self, contexts: list[Any] | Any) -> None:
+        """Serially transfer this live stream to one or more steer owners."""
+        if not isinstance(contexts, list):
+            contexts = [contexts]
+        for context in contexts:
+            if isinstance(context, dict) and str(context.get("reply_to_id") or "").strip():
+                self._queue.put((_HANDOFF, dict(context)))
 
     def _reset_segment(self) -> None:
         self._message_id = None
@@ -1120,8 +1332,25 @@ class AopsLiveReplyBridge:
         }
         self._queue.put((_TOOL, payload))
 
-    def send_final(self, text: str, *, conversation_ended: bool = True, content: Optional[list[dict[str, Any]]] = None) -> None:
-        self._queue.put((_FINAL, {"text": text or "", "conversation_ended": conversation_ended, "content": content or []}))
+    def send_final(
+        self,
+        text: str,
+        *,
+        conversation_ended: bool = True,
+        content: Optional[list[dict[str, Any]]] = None,
+        interrupted: bool = False,
+        finish_reason: str | None = None,
+    ) -> None:
+        self._queue.put((
+            _FINAL,
+            {
+                "text": text or "",
+                "conversation_ended": conversation_ended,
+                "content": content or [],
+                "interrupted": bool(interrupted),
+                "finish_reason": finish_reason,
+            },
+        ))
 
     def send_error(self, message: str, *, conversation_ended: bool = True) -> None:
         self._queue.put((_ERROR, {"message": message or "Unknown error", "conversation_ended": conversation_ended}))
@@ -1140,7 +1369,12 @@ class AopsLiveReplyBridge:
         tool: Optional[dict[str, Any]] = None,
         error: Optional[dict[str, Any]] = None,
         content: Optional[list[dict[str, Any]]] = None,
+        interrupted: bool = False,
+        finish_reason: str | None = None,
+        superseded: bool = False,
+        continued_by_reply_to_id: str | None = None,
     ) -> None:
+        route = self.route_snapshot()
         if not self._message_id:
             self._message_id = self.adapter.create_message_id()
         self._seq += 1
@@ -1149,16 +1383,18 @@ class AopsLiveReplyBridge:
             "seq": self._seq,
             "phase": phase,
             "kind": kind,
-            "channelId": self.context.channel_id,
+            "channelId": route["channel_id"],
             "conversationEnded": conversation_ended,
             "ts": _now_ms(),
         }
-        if self.context.reply_to_id:
-            data["replyToId"] = self.context.reply_to_id
-        if self.context.run_id:
-            data["runId"] = self.context.run_id
-        if self.context.title:
-            data["title"] = self.context.title
+        if route["reply_to_id"]:
+            data["replyToId"] = route["reply_to_id"]
+        if route["run_id"]:
+            data["runId"] = route["run_id"]
+        if route["title"]:
+            data["title"] = route["title"]
+        if route["steered_from_reply_to_id"]:
+            data["steeredFromReplyToId"] = route["steered_from_reply_to_id"]
         if delta is not None:
             data["delta"] = delta
         if text is not None:
@@ -1169,6 +1405,14 @@ class AopsLiveReplyBridge:
             data["error"] = error
         if content:
             data["content"] = content
+        if interrupted:
+            data["interrupted"] = True
+        if finish_reason:
+            data["finishReason"] = str(finish_reason)
+        if superseded:
+            data["superseded"] = True
+        if continued_by_reply_to_id:
+            data["continuedByReplyToId"] = str(continued_by_reply_to_id)
         await self.adapter.send_reply_event(data)
         self._already_sent = True
 
@@ -1247,16 +1491,19 @@ class AopsLiveReplyBridge:
     async def _emit_tool(self, payload: dict[str, Any]) -> None:
         event_type = str(payload.get("event_type") or "").strip()
         if event_type in ("reasoning.available", "_thinking"):
-            raw = {"event": "message_reply", "data": payload}
-            _write_aops_log_line(
-                direction="out",
-                action="message_reply",
-                data=payload,
-                raw=raw,
-                filtered=True,
-                status="skipped",
-                config=self.adapter.config,
-            )
+            # AOPS does not expose model scratch reasoning.  Ignore it before
+            # constructing a wire message or touching the file logger.
+            return
+        # The delegate tool relays its own lifecycle and streamed child text
+        # through the parent's progress callback (``subagent.start``,
+        # ``subagent.text``, ``subagent.progress``, ...).  Those are not tool
+        # lifecycle events.  Treating an unknown event as a tool start made
+        # every streamed child token look like a separate tool invocation in
+        # Tec01.  AOPS exposes only the parent tool's canonical start/result
+        # pair; richer subagent progress needs a separate protocol if added in
+        # the future.
+        if event_type not in {"tool.started", "tool.completed"}:
+            logger.debug("AOPS native reply ignored unsupported progress event: %s", event_type or "-")
             return
         tool_name = str(payload.get("tool_name") or "").strip() or None
         preview = str(payload.get("preview") or "").strip() or None
@@ -1297,6 +1544,42 @@ class AopsLiveReplyBridge:
             tool=tool_payload,
         )
 
+    async def _handoff(self, context: dict[str, Any]) -> None:
+        """Close the current owner, then commit the next steer owner."""
+        next_reply_to = str(context.get("reply_to_id") or "").strip()
+        route = self.route_snapshot()
+        old_reply_to = str(route.get("reply_to_id") or "").strip()
+        if not next_reply_to or next_reply_to == old_reply_to:
+            return
+
+        # Tool/result events queued before this marker have already been sent
+        # to the old owner.  Close that logical turn before changing routing.
+        await self._ensure_started()
+        handoff_text = "后续回复已转到新消息。"
+        await self._send_event(
+            phase="end",
+            kind="final",
+            text=handoff_text,
+            conversation_ended=True,
+            finish_reason="steered",
+            superseded=True,
+            continued_by_reply_to_id=next_reply_to,
+        )
+        self._terminal = True
+        self._reset_segment()
+
+        with self._context_lock:
+            self.context.channel_id = str(context.get("channel_id") or self.context.channel_id)
+            self.context.reply_to_id = next_reply_to
+            self.context.title = str(context.get("title") or "").strip() or self.context.title
+            self.context.steered_from_reply_to_id = old_reply_to or None
+
+        logger.info(
+            "AOPS steer ownership transferred replyToId=%s -> %s",
+            old_reply_to or "-",
+            next_reply_to,
+        )
+
     async def run(self) -> None:
         while True:
             item = await asyncio.to_thread(self._queue.get)
@@ -1312,6 +1595,9 @@ class AopsLiveReplyBridge:
             if isinstance(item, tuple) and item and item[0] is _TOOL:
                 await self._emit_tool(item[1])
                 continue
+            if isinstance(item, tuple) and item and item[0] is _HANDOFF:
+                await self._handoff(item[1])
+                continue
             if isinstance(item, tuple) and item and item[0] is _FINAL:
                 payload = item[1]
                 final_text = payload.get("text", "")
@@ -1323,6 +1609,8 @@ class AopsLiveReplyBridge:
                     text=final_text,
                     conversation_ended=bool(payload.get("conversation_ended", True)),
                     content=payload.get("content") or None,
+                    interrupted=bool(payload.get("interrupted")),
+                    finish_reason=payload.get("finish_reason"),
                 )
                 self._terminal = True
                 self._final_response_sent = True
@@ -1382,6 +1670,22 @@ class AopsAdapter(BasePlatformAdapter):
             default=["*"],
         )
         self._agent_routes = extra.get("agent_routes") if isinstance(extra.get("agent_routes"), dict) else {}
+        ignored_route_fields = sorted(
+            {
+                field
+                for route in self._agent_routes.values()
+                if isinstance(route, dict)
+                for field in route
+                if field in _AOPS_AGENT_ROUTE_RUNTIME_FIELDS
+            }
+        )
+        if ignored_route_fields:
+            logger.warning(
+                "[%s] Ignoring AOPS agent_routes runtime override fields; "
+                "config.yaml model is profile-global: %s",
+                self.name,
+                ", ".join(ignored_route_fields),
+            )
         self._session: Optional["aiohttp.ClientSession"] = None
         self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
         self._listen_task: Optional[asyncio.Task] = None
@@ -1389,6 +1693,13 @@ class AopsAdapter(BasePlatformAdapter):
         self._dispatch_queue: asyncio.Queue[dict[str, Any] | None] | None = None
         self._dispatch_worker_task: asyncio.Task | None = None
         self._connected = False
+        self._connection_state = "DISCONNECTED"
+        self._auth_event: asyncio.Event | None = None
+        self._connection_request_kwargs: dict[str, Any] = {}
+        self._pending_redirect_target = ""
+        self._pending_redirect_delay_ms = 200
+        self._redirect_count = 0
+        self._target_ip: Optional[str] = None
         self._asyncio_loop: asyncio.AbstractEventLoop | None = None
         self._connected_event: asyncio.Event | None = None
         self._send_lock: asyncio.Lock | None = None
@@ -1400,6 +1711,12 @@ class AopsAdapter(BasePlatformAdapter):
         self._title_resolver = None
         self._bot_id: Optional[str] = None
         self._bot_name: Optional[str] = None
+        self._owner_user_id: Optional[str] = None
+        self._task_states: dict[str, dict[str, Any]] = {}
+        self._completed_message_ids: set[str] = set()
+        self._pending_outbound: dict[str, dict[str, Any]] = {}
+        self._terminal_outbound_by_reply_to: dict[str, str] = {}
+        self._terminal_claims_by_reply_to: dict[str, str] = {}
         try:
             self._ensure_loop_primitives()
         except RuntimeError:
@@ -1419,6 +1736,7 @@ class AopsAdapter(BasePlatformAdapter):
         was_connected = self._connected
         self._asyncio_loop = loop
         self._connected_event = asyncio.Event()
+        self._auth_event = asyncio.Event()
         if was_connected:
             self._connected_event.set()
         self._send_lock = asyncio.Lock()
@@ -1453,6 +1771,30 @@ class AopsAdapter(BasePlatformAdapter):
             event.set()
         else:
             event.clear()
+
+    def _set_connection_state(self, state: str, *, error: str | None = None) -> None:
+        normalized = str(state or "DISCONNECTED").strip().upper()
+        self._connection_state = normalized
+        action = {
+            "CONNECTING": "ws.connecting",
+            "READY": "ws.ready",
+            "REDIRECTING": "ws.redirect",
+            "REDIRECT_COOLDOWN": "ws.redirect_cooldown",
+            "AUTH_FAILED": "ws.auth_failed",
+        }.get(normalized)
+        if action:
+            self._log_wire(
+                "warning" if normalized in {"AUTH_FAILED", "REDIRECT_COOLDOWN"} else "info",
+                direction="state",
+                action=action,
+                payload={
+                    "event": normalized.lower(),
+                    "botId": self._bot_id or "unknown",
+                    "targetIp": self._pending_redirect_target or None,
+                    "redirectCount": self._redirect_count,
+                },
+                error=error,
+            )
 
     @property
     def push_tool_calls(self) -> bool:
@@ -1556,18 +1898,35 @@ class AopsAdapter(BasePlatformAdapter):
             )
             return False
         try:
-            await self._open_connection()
-            self._mark_connected()
+            self._running = True
+            self._set_connection_state("CONNECTING")
+            self._set_connected_signal(False)
+            self._auth_event = asyncio.Event()
             self._listen_task = asyncio.create_task(self._listen_loop())
-            return True
+            await asyncio.wait_for(self._auth_event.wait(), timeout=_AOPS_AUTH_TIMEOUT_SECS_DEFAULT)
+            ready = self._connection_state == "READY"
+            if not ready:
+                self._running = False
+                if self._listen_task:
+                    self._listen_task.cancel()
+                    await asyncio.gather(self._listen_task, return_exceptions=True)
+                    self._listen_task = None
+                await self._cleanup()
+            return ready
         except Exception as exc:
             self._set_fatal_error("aops_connect_error", f"AOPS startup failed: {exc}", retryable=True)
             logger.error("[%s] Failed to connect: %s", self.name, exc, exc_info=True)
+            self._running = False
+            if self._listen_task:
+                self._listen_task.cancel()
+                await asyncio.gather(self._listen_task, return_exceptions=True)
+                self._listen_task = None
             await self._cleanup()
             return False
 
     async def disconnect(self) -> None:
         self._running = False
+        self._set_connection_state("STOPPED")
         self._set_connected_signal(False)
         if self._listen_task:
             self._listen_task.cancel()
@@ -1599,41 +1958,63 @@ class AopsAdapter(BasePlatformAdapter):
             await self._session.close()
         self._session = None
 
-    async def _open_connection(self) -> None:
+    async def _open_connection(self, *, target_ip: str | None = None) -> None:
         await self._cleanup()
+        self._set_connection_state("CONNECTING")
+        normalized_target = _valid_target_ip(target_ip)
+        target_protocol = _target_ip_subprotocol(normalized_target)
+        if normalized_target and not target_protocol:
+            raise RuntimeError("AOPS redirect target must be an IPv4 address for WebSocket subprotocol routing")
         session_kwargs, request_kwargs = self._request_kwargs()
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self._connect_timeout or None),
             trust_env=True,
             **session_kwargs,
         )
+        self._target_ip = normalized_target or self._target_ip
+        self._connection_request_kwargs = request_kwargs
         timeout_label = f"{self._connect_timeout:g}"
-        logger.info("[%s] Opening AOPS connection (timeout=%ss, base_url=%s)", self.name, timeout_label, self._base_url)
-        bot_info = await self._fetch_bot_me(request_kwargs=request_kwargs)
-        self._bot_id = str(bot_info.get("id") or "").strip() or None
-        self._bot_name = str(bot_info.get("name") or "").strip() or None
+        logger.info(
+            "[%s] Opening AOPS connection (timeout=%ss, base_url=%s, targetIp=%s)",
+            self.name,
+            timeout_label,
+            self._base_url,
+            normalized_target or "-",
+        )
         ws = await self._session.ws_connect(
             _build_ws_url(self._base_url),
             headers=self._headers(),
+            protocols=[target_protocol] if target_protocol else (),
             heartbeat=30,
             **request_kwargs,
         )
+        negotiated_protocol = str(getattr(ws, "protocol", "") or "")
+        if target_protocol and negotiated_protocol != target_protocol:
+            logger.warning(
+                "[%s] AOPS target subprotocol was not echoed (offered=%s negotiated=%s)",
+                self.name,
+                target_protocol,
+                negotiated_protocol or "-",
+            )
+            await ws.close()
+            raise RuntimeError("AOPS target subprotocol negotiation failed")
+        self._log_wire(
+            "info",
+            direction="state",
+            action="ws.subprotocol_negotiated",
+            payload={"targetIp": normalized_target or None, "protocol": negotiated_protocol or None},
+        )
         self._ws = ws
+        self._set_connection_state("AUTHENTICATING")
+        if self._auth_event is None:
+            self._auth_event = asyncio.Event()
+        self._auth_event.clear()
         await self._ws.send_json({"action": "auth", "token": self.config.token})
         self._log_wire(
             "info",
             direction="out",
             action="ws.auth_sent",
-            payload={"event": "auth", "authSent": True},
-        )
-        self._set_connected_signal(True)
-        await self._report_agents(request_kwargs=request_kwargs)
-        logger.info("[%s] Connected to %s as %s", self.name, self._base_url, self._bot_id or "unknown")
-        self._log_wire(
-            "info",
-            direction="state",
-            action="ws.connected",
-            payload={"event": "connected", "baseUrl": self._base_url, "botId": self._bot_id or "unknown"},
+            payload={"event": "auth", "authSent": True, "targetIp": normalized_target or None},
         )
 
     async def _fetch_bot_me(self, *, request_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -1723,23 +2104,77 @@ class AopsAdapter(BasePlatformAdapter):
 
     async def _listen_loop(self) -> None:
         attempt = 0
+        target_ip = ""
         while self._running:
             try:
+                # A redirect target is a one-shot routing hint for exactly the
+                # next WebSocket handshake.  Consume it before awaiting the
+                # connection so a handshake/subprotocol failure cannot leak
+                # the same Sec-WebSocket-Protocol into ordinary retries.
+                connect_target = target_ip
+                target_ip = ""
+                await self._open_connection(target_ip=connect_target or None)
                 await self._read_events()
-                attempt = 0
+                if self._connection_state in {"REDIRECTING", "REDIRECT_COOLDOWN"}:
+                    target_ip = self._pending_redirect_target
+                    delay_ms = self._pending_redirect_delay_ms
+                    self._pending_redirect_target = ""
+                    self._pending_redirect_delay_ms = 200
+                    self._set_connection_state("REDIRECTING")
+                    logger.info(
+                        "[%s] Redirect reconnect scheduled targetIp=%s delayMs=%s count=%s",
+                        self.name,
+                        target_ip,
+                        delay_ms,
+                        self._redirect_count,
+                    )
+                    self._log_wire(
+                        "info",
+                        direction="state",
+                        action="ws.reconnect_scheduled",
+                        payload={
+                            "event": "reconnect_scheduled",
+                            "targetIp": target_ip,
+                            "retryAfterMs": delay_ms,
+                            "redirectCount": self._redirect_count,
+                        },
+                    )
+                    await asyncio.sleep(max(0, delay_ms) / 1000)
+                    continue
+                raise RuntimeError("AOPS websocket closed")
             except asyncio.CancelledError:
                 return
             except Exception as exc:
                 if not self._running:
                     return
+                if self._connection_state in {"AUTH_FAILED", "STOPPED"}:
+                    return
+                if self._connection_state == "READY":
+                    attempt = 0
                 self._set_connected_signal(False)
                 logger.warning("[%s] AOPS socket error: %s", self.name, exc)
-                delay = _RECONNECT_BACKOFF[min(attempt, len(_RECONNECT_BACKOFF) - 1)]
+                self._set_connection_state("DISCONNECTED", error=str(exc))
+                delay = min(
+                    _RECONNECT_MAX_DELAY,
+                    _RECONNECT_INITIAL_DELAY * (2 ** min(attempt, 10)),
+                ) + random.uniform(0, _RECONNECT_JITTER_MAX)
                 attempt += 1
+                self._log_wire(
+                    "info",
+                    direction="state",
+                    action="ws.reconnect_scheduled",
+                    payload={"event": "reconnect_scheduled", "delayMs": int(delay * 1000), "retryCount": attempt},
+                    error=str(exc),
+                )
                 await asyncio.sleep(delay)
                 try:
-                    await self._open_connection()
-                    attempt = 0
+                    logger.info("[%s] Reconnect attempt=%s", self.name, attempt)
+                    self._log_wire(
+                        "info",
+                        direction="state",
+                        action="ws.reconnect_attempt",
+                        payload={"event": "reconnect_attempt", "retryCount": attempt},
+                    )
                 except Exception as reconnect_exc:
                     logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)
 
@@ -1748,7 +2183,14 @@ class AopsAdapter(BasePlatformAdapter):
             raise RuntimeError("AOPS websocket not connected")
         self._ensure_dispatch_worker()
         while self._running and self._ws and not self._ws.closed:
-            msg = await self._ws.receive()
+            receive = self._ws.receive()
+            if self._connection_state == "AUTHENTICATING":
+                try:
+                    msg = await asyncio.wait_for(receive, timeout=_AOPS_AUTH_TIMEOUT_SECS_DEFAULT)
+                except asyncio.TimeoutError as exc:
+                    raise _AopsAuthTimeout("AOPS auth handshake timed out") from exc
+            else:
+                msg = await receive
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
                 if payload:
@@ -1757,11 +2199,22 @@ class AopsAdapter(BasePlatformAdapter):
                     if await self._handle_ws_control_event(payload):
                         continue
                     if payload.get("event") == "message_posted":
+                        if self._connection_state != "READY":
+                            logger.warning(
+                                "[%s] Ignoring business message before auth_ok (state=%s)",
+                                self.name,
+                                self._connection_state,
+                            )
+                            continue
                         self._schedule_dispatch_payload(payload)
                     else:
                         await self._dispatch_payload(payload)
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                 close_code = getattr(self._ws, "close_code", None)
+                try:
+                    close_code_int = int(close_code) if close_code is not None else None
+                except (TypeError, ValueError):
+                    close_code_int = None
                 close_error = None
                 try:
                     close_error = self._ws.exception() if self._ws else None
@@ -1780,6 +2233,19 @@ class AopsAdapter(BasePlatformAdapter):
                         "closeError": str(close_error or ""),
                     },
                 )
+                if close_code_int == 4001:
+                    self._set_connected_signal(False)
+                    self._set_connection_state("AUTH_FAILED", error="AOPS token rejected")
+                    self._set_fatal_error(
+                        "aops_auth_failed",
+                        "AOPS token is invalid",
+                        retryable=False,
+                    )
+                    if self._auth_event is not None:
+                        self._auth_event.set()
+                    return
+                if self._connection_state == "REDIRECTING":
+                    return
                 raise RuntimeError("AOPS websocket closed")
 
     def _schedule_dispatch_payload(self, payload: dict[str, Any]) -> None:
@@ -1855,16 +2321,95 @@ class AopsAdapter(BasePlatformAdapter):
     async def _handle_ws_control_event(self, payload: dict[str, Any]) -> bool:
         event = str(payload.get("event") or "").strip().lower()
         action = str(payload.get("action") or "").strip().lower()
+        if event == "auth_ok":
+            if self._connection_state != "AUTHENTICATING":
+                logger.debug("[%s] Ignoring duplicate auth_ok in state=%s", self.name, self._connection_state)
+                return True
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            bot_id = str(data.get("botId") or "").strip()
+            if not bot_id:
+                logger.warning("[%s] Ignoring malformed auth_ok without botId", self.name)
+                return True
+            self._bot_id = bot_id
+            self._bot_name = str(data.get("botName") or "").strip() or None
+            self._owner_user_id = str(data.get("ownerUserId") or "").strip() or None
+            server_target = _valid_target_ip(data.get("targetIp"))
+            self._target_ip = server_target or self._target_ip
+            self._redirect_count = 0
+            self._set_connection_state("READY")
+            self._set_connected_signal(True)
+            self._mark_connected()
+            if self._auth_event is None:
+                self._auth_event = asyncio.Event()
+            self._auth_event.set()
+            self._log_wire(
+                "info",
+                direction="in",
+                action="ws.auth_ok",
+                payload={
+                    "event": "auth_ok",
+                    "botId": self._bot_id,
+                    "botName": self._bot_name,
+                    "ownerUserId": self._owner_user_id,
+                    "targetIp": server_target or None,
+                },
+            )
+            try:
+                await self._report_agents(request_kwargs=self._connection_request_kwargs)
+            except Exception as exc:
+                logger.warning("[%s] agent report after auth_ok failed: %s", self.name, exc)
+            return True
+        if event == "redirect":
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            target_ip = _valid_target_ip(data.get("targetIp"))
+            if not target_ip or not _target_ip_subprotocol(target_ip):
+                logger.warning(
+                    "[%s] Redirect event missing valid IPv4 targetIp; falling back to normal reconnect",
+                    self.name,
+                )
+                self._set_connected_signal(False)
+                if self._ws and not self._ws.closed:
+                    await self._ws.close()
+                return True
+            self._redirect_count += 1
+            if self._redirect_count > _AOPS_MAX_REDIRECTS:
+                self._set_connected_signal(False)
+                # A target Pod may be temporarily unavailable (for example a
+                # 502 during rollout).  The old behaviour made the fourth
+                # redirect permanently stop the listener until the gateway
+                # was restarted.  Treat the limit as a circuit breaker:
+                # discard the target, cool down, then retry the ordinary
+                # entry endpoint without Sec-WebSocket-Protocol.
+                logger.warning(
+                    "[%s] Redirect limit reached; cooling down for %sms before ordinary reconnect",
+                    self.name,
+                    _AOPS_REDIRECT_COOLDOWN_MS,
+                )
+                self._pending_redirect_target = ""
+                self._pending_redirect_delay_ms = _AOPS_REDIRECT_COOLDOWN_MS
+                self._set_connection_state(
+                    "REDIRECT_COOLDOWN",
+                    error="redirect limit reached; ordinary reconnect scheduled",
+                )
+                self._redirect_count = 0
+                if self._ws and not self._ws.closed:
+                    await self._ws.close()
+                return True
+            self._pending_redirect_target = target_ip
+            try:
+                self._pending_redirect_delay_ms = max(0, int(data.get("retryAfterMs", 200)))
+            except (TypeError, ValueError):
+                self._pending_redirect_delay_ms = 200
+            self._set_connected_signal(False)
+            self._set_connection_state("REDIRECTING")
+            if self._ws and not self._ws.closed:
+                await self._ws.close()
+            return True
         if event != "ping" and action != "ping":
             return False
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        pong = {
-            "action" if action == "ping" and event != "ping" else "event": "pong",
-            "data": {
-                **data,
-                "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            },
-        }
+        del data
+        pong = {"event": "pong"}
         async with self._send_guard():
             if not self._ws or self._ws.closed:
                 raise RuntimeError("AOPS websocket not connected")
@@ -2125,6 +2670,18 @@ class AopsAdapter(BasePlatformAdapter):
         channel_id = str(data.get("channelId") or "").strip()
         if not message_id or not user_id or not channel_id:
             return None
+        self._task_states.setdefault(
+            message_id,
+            {
+                "messageId": message_id,
+                "replyToId": message_id,
+                "channelId": channel_id,
+                "phase": "start",
+                "terminal": False,
+                "lastOutboundMessageId": None,
+                "updatedAtMs": _now_ms(),
+            },
+        )
         if self._bot_id and user_id == self._bot_id:
             return None
         channel_type = str(data.get("channelType") or "direct").strip().lower()
@@ -2138,14 +2695,11 @@ class AopsAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
         )
-        route_overrides = None
         channel_prompt = None
         agent_key = str(data.get("agentKey") or "").strip()
         if agent_key and _entry_matches(self._trusted_agent_key_from, user_id):
             route = self._agent_routes.get(agent_key)
             if isinstance(route, dict):
-                allowed_fields = ("model", "provider", "api_mode", "command", "args", "credential_pool")
-                route_overrides = {key: route[key] for key in allowed_fields if key in route}
                 prompt = str(route.get("prompt") or "").strip()
                 if prompt:
                     channel_prompt = prompt
@@ -2199,8 +2753,6 @@ class AopsAdapter(BasePlatformAdapter):
             timestamp=_iso_to_datetime(data.get("timestamp")),
             channel_prompt=channel_prompt,
         )
-        if route_overrides:
-            setattr(event, "route_overrides", route_overrides)
         return event
 
     async def _attach_inbound_attachments(self, event: MessageEvent) -> None:
@@ -2311,16 +2863,34 @@ class AopsAdapter(BasePlatformAdapter):
         return cache_document_from_bytes(data, file_name), media_type
 
     async def _send_payload(self, payload: dict[str, Any], *, channel_id: str, timeout: float = 15.0) -> SendResult:
-        try:
-            await asyncio.wait_for(self._connected_signal().wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return SendResult(success=False, error="AOPS websocket is not connected", retryable=True)
-        async with self._channel_send_guard(str(channel_id)):
-            async with self._send_guard():
-                if not self._ws or self._ws.closed:
-                    return SendResult(success=False, error="AOPS websocket is not connected", retryable=True)
-                await self._ws.send_json(payload)
-        return SendResult(success=True, message_id=((payload.get("data") or {}).get("messageId")))
+        deadline = time.monotonic() + max(0.1, timeout)
+        last_error = "AOPS websocket is not connected"
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return SendResult(success=False, error=last_error, retryable=True)
+            try:
+                await asyncio.wait_for(self._connected_signal().wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return SendResult(success=False, error=last_error, retryable=True)
+            try:
+                async with self._channel_send_guard(str(channel_id)):
+                    async with self._send_guard():
+                        # In production the event is set only in READY.  Keep
+                        # the websocket/event check independent so test and
+                        # embedding adapters that establish the signal
+                        # themselves remain compatible.
+                        if not self._ws or self._ws.closed:
+                            self._set_connected_signal(False)
+                            continue
+                        await self._ws.send_json(payload)
+                return SendResult(success=True, message_id=((payload.get("data") or {}).get("messageId")))
+            except Exception as exc:
+                last_error = str(exc) or last_error
+                self._set_connected_signal(False)
+                if time.monotonic() >= deadline:
+                    return SendResult(success=False, error=last_error, retryable=True)
+                await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
     async def send_reply_event(
         self,
@@ -2351,21 +2921,47 @@ class AopsAdapter(BasePlatformAdapter):
             }
         data = _aops_normalize_outbound_protocol_fields(data)
         payload = {"event": "message_reply", "data": data}
-        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         if _aops_is_internal_thinking_payload(data):
-            _write_aops_log_line(
-                direction="out",
-                action="message_reply",
-                data=data,
-                raw=payload,
-                session_key=metadata.get("sessionKey"),
-                session_id=data.get("runId") or metadata.get("sessionId"),
-                filtered=True,
-                status="skipped",
-                config=self.config,
-            )
+            # Internal reasoning is neither part of the Tec01 wire protocol
+            # nor useful operational output.  Drop it before terminal claims,
+            # websocket I/O, and file-log serialization.
             return SendResult(success=True, message_id=str(data.get("messageId") or ""))
+        outbound_message_id = str(data.get("messageId") or "").strip()
+        terminal_requested = bool(data.get("conversationEnded")) and bool(reply_to_id)
+        if terminal_requested:
+            committed_id = self._terminal_outbound_by_reply_to.get(reply_to_id)
+            claimed_id = self._terminal_claims_by_reply_to.get(reply_to_id)
+            conflicting_id = committed_id or claimed_id
+            if conflicting_id and conflicting_id != outbound_message_id:
+                error = (
+                    f"AOPS terminal reply already assigned for replyToId={reply_to_id} "
+                    f"messageId={conflicting_id}"
+                )
+                logger.error("[%s] %s; rejected messageId=%s", self.name, error, outbound_message_id or "-")
+                _write_aops_log_line(
+                    direction="out",
+                    action="message_reply",
+                    data=data,
+                    raw=payload,
+                    status="failed",
+                    error=error,
+                    config=self.config,
+                )
+                return SendResult(success=False, error=error, retryable=False)
+            if outbound_message_id:
+                self._terminal_claims_by_reply_to[reply_to_id] = outbound_message_id
+        if outbound_message_id:
+            self._pending_outbound[outbound_message_id] = payload
+        if reply_to_id and reply_to_id in self._task_states:
+            task = self._task_states[reply_to_id]
+            task["phase"] = str(data.get("phase") or data.get("kind") or task.get("phase") or "start")
+            task["lastOutboundMessageId"] = outbound_message_id or task.get("lastOutboundMessageId")
+            task["updatedAtMs"] = _now_ms()
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         result = await self._send_payload(payload, channel_id=str(data.get("channelId") or ""), timeout=send_timeout)
+        if terminal_requested and not result.success:
+            if self._terminal_claims_by_reply_to.get(reply_to_id) == outbound_message_id:
+                self._terminal_claims_by_reply_to.pop(reply_to_id, None)
         send_elapsed_ms = int((time.monotonic() - send_started) * 1000)
         _write_aops_log_line(
             direction="out",
@@ -2380,6 +2976,18 @@ class AopsAdapter(BasePlatformAdapter):
             send_elapsed_ms=send_elapsed_ms,
             config=self.config,
         )
+        if result.success and outbound_message_id:
+            self._pending_outbound.pop(outbound_message_id, None)
+            if terminal_requested:
+                self._terminal_outbound_by_reply_to[reply_to_id] = outbound_message_id
+                self._terminal_claims_by_reply_to.pop(reply_to_id, None)
+            if reply_to_id and reply_to_id in self._task_states:
+                task = self._task_states[reply_to_id]
+                if terminal_requested:
+                    task["terminal"] = True
+                    task["terminalOutboundMessageId"] = outbound_message_id
+                    task["updatedAtMs"] = _now_ms()
+                    self._completed_message_ids.add(reply_to_id)
         return result
 
     async def send(
@@ -2514,7 +3122,7 @@ class AopsAdapter(BasePlatformAdapter):
             "kind": "approval",
             "channelId": chat_id,
             "text": "",
-            "conversationEnded": True,
+            "conversationEnded": False,
             "ts": _now_ms(),
             "messageType": _aops_message_type(
                 metadata={**metadata, "silent": outbound_silent} if outbound_silent is not None else metadata,
@@ -2571,7 +3179,7 @@ class AopsAdapter(BasePlatformAdapter):
             "kind": "approval",
             "channelId": chat_id,
             "text": "",
-            "conversationEnded": True,
+            "conversationEnded": False,
             "ts": _now_ms(),
             "messageType": _aops_message_type(
                 metadata={**metadata, "silent": outbound_silent} if outbound_silent is not None else metadata,

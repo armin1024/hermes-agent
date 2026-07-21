@@ -595,7 +595,13 @@ def init_agent(
     # iteration. Message-role alternation is preserved (we modify an
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
+    # Optional opaque routing envelopes associated with pending steer text.
+    # Gateway integrations use these to transfer reply ownership only when
+    # the steer is actually injected.  The agent core deliberately treats
+    # them as opaque objects so non-gateway callers remain decoupled.
+    agent._pending_steer_contexts: list[Any] = []
     agent._pending_steer_lock = threading.Lock()
+    agent.steer_applied_callback = None
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
     # runs each tool on its own ThreadPoolExecutor worker — those worker
