@@ -633,7 +633,11 @@ def run_conversation(
         # iteration, no tools yet), the steer stays pending for the next
         # tool batch — injecting into a user message would break role
         # alternation, and there's no tool output to piggyback on.
-        _pre_api_steer = agent._drain_pending_steer()
+        _drain_with_context = getattr(agent, "_drain_pending_steer_with_context", None)
+        if callable(_drain_with_context):
+            _pre_api_steer, _pre_api_steer_contexts = _drain_with_context()
+        else:
+            _pre_api_steer, _pre_api_steer_contexts = agent._drain_pending_steer(), []
         if _pre_api_steer:
             _injected = False
             for _si in range(len(messages) - 1, -1, -1):
@@ -653,6 +657,9 @@ def run_conversation(
                         except Exception:
                             pass
                     _injected = True
+                    _notify = getattr(agent, "_notify_steer_applied", None)
+                    if callable(_notify):
+                        _notify(_pre_api_steer_contexts)
                     logger.debug(
                         "Pre-API-call steer drain: injected into tool msg at index %d",
                         _si,
@@ -661,13 +668,9 @@ def run_conversation(
             if not _injected:
                 # No tool message to inject into — put it back so
                 # the post-tool-execution drain picks it up later.
-                _lock = getattr(agent, "_pending_steer_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        if agent._pending_steer:
-                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
-                        else:
-                            agent._pending_steer = _pre_api_steer
+                _restash = getattr(agent, "_restash_pending_steer", None)
+                if callable(_restash):
+                    _restash(_pre_api_steer, _pre_api_steer_contexts)
                 else:
                     existing = getattr(agent, "_pending_steer", None)
                     agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer

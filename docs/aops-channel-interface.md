@@ -5,7 +5,7 @@
 ## 功能总览
 
 - AOPS gateway 使用 `AOPS_BOT_TOKEN` 鉴权，`AOPS_BOT_URL` 作为上游地址；`tec-client-ip` 请求头为同一系统用户共享的持久 UUID。
-- Gateway 连接后会上报 agent 列表和 runtime 信息，包括宿主机 IPv4 集合、系统用户、Hermes profile、模型、模型网关和模型授权码。
+- Gateway 完成 WebSocket `auth_ok` 后会上报 agent 列表和 runtime 信息，包括宿主机 IPv4 集合、系统用户、Hermes profile、模型、模型网关和模型授权码。
 - 支持普通对话、native streaming reply、审批卡片、附件下载、多模态消息、cron 投递和本地 slash 命令。
 - 支持 silent 消息链路，AOPS 上游可通过静默 slash 命令读取或修改模型、技能、工具集、cron、安全策略等状态。
 - 支持 Tec01 curl 执行式一键安装：新用户首个 agent 使用 default agent，后续同一系统用户多 agent 使用 named profile。
@@ -63,6 +63,29 @@ Content-Type: application/json
 }
 ```
 
+终态规则：同一个入站 `replyToId` 最多只能成功发送一条
+`conversationEnded=true`。`phase=end` 只表示当前 outbound 消息段已经发送完成；
+busy、queue、steer、长任务通知、审批、工具和其他过程状态均使用
+`kind=status|approval|tool` 与 `conversationEnded=false`，最终 assistant 回复或
+中断终态才结束该 turn。被新消息打断的旧流使用原 `messageId` 返回
+`interrupted=true`、`finishReason=interrupted` 的唯一终态，不下发内部
+`Operation interrupted: ...` 文本。
+
+其中 `/steer` 注入确认、`/queue` 排队确认和 `/background` 启动确认虽然使用
+`phase=end` 关闭各自的提示气泡，但必须返回 `kind=status`、
+`conversationEnded=false`。AOPS interrupt 模式不再发送额外的
+`Interrupting current task` 提示；旧流中断终态与新消息正式回复分别绑定各自
+的 `replyToId`。
+
+`steer` 采用实际注入时的消息所有权交接：确认气泡先绑定新消息且保持非终态；
+当前工具的 start/result 仍绑定旧消息。steer marker 真正写入工具结果后，旧流先
+返回唯一终态：`finishReason=steered`、`superseded=true`、
+`continuedByReplyToId=<新消息ID>`，随后新流以新的 `messageId`、
+`replyToId=<新消息ID>` 启动，并带 `steeredFromReplyToId=<旧消息ID>`。交接后的
+tool、approval、clarify、commentary、error 和最终回复均归新消息。若本轮没有
+可注入的工具结果，旧消息正常结束，steer 原始事件按独立 FIFO turn 执行，不做
+所有权交接。
+
 字段规则：
 
 - `runtime.host.ips` 只包含非 localhost 的 IPv4 地址；过滤 `127.0.0.1`、loopback、IPv6 和重复 IP。
@@ -70,9 +93,47 @@ Content-Type: application/json
 - `runtime.model.apiKey` 解析优先级为 `config.yaml model.api_key/apiKey`、`model.api_key_env/apiKeyEnv` 指向的环境变量、provider runtime credentials。
 - agent report 日志只用于排障，日志 payload 会脱敏 `runtime.model.apiKey`。
 
-## WebSocket 消息协议
+## WebSocket 连接、重连与消息协议
 
-AOPS WebSocket 地址由 `AOPS_BOT_URL` 转换为 `/api/v1/ws`，例如 `https://aops.example.com` -> `wss://aops.example.com/api/v1/ws`。
+AOPS WebSocket 地址由 `AOPS_BOT_URL` 追加 `/api/v1/ws` 生成；如果 URL 包含反向代理路径前缀，该前缀会保留。例如 `https://aops.example.com` -> `wss://aops.example.com/api/v1/ws`，`https://aops.example.com/aops/tec01` -> `wss://aops.example.com/aops/tec01/api/v1/ws`。
+
+首次连接不携带目标 Pod 请求头或子协议。连接建立后必须发送：
+
+```json
+{"action":"auth","token":"<AOPS_BOT_TOKEN>"}
+```
+
+只有收到 `auth_ok` 后才进入 `READY` 状态，并开始 agent report 和业务消息处理：
+
+```json
+{
+  "event": "auth_ok",
+  "data": {
+    "botId": "bot_xxx",
+    "botName": "Tec01",
+    "ownerUserId": "user_xxx",
+    "targetIp": "10.244.1.23"
+  }
+}
+```
+
+服务端发送 JSON 心跳时，Bot 回复：
+
+```json
+{"event":"pong"}
+```
+
+收到 `redirect` 后，Bot 读取 `data.targetIp`，关闭当前连接，等待 `retryAfterMs`（缺省 200ms），再使用同一个 `/api/v1/ws` 地址重连，并通过 WebSocket 子协议传递目标 Pod：
+
+```http
+Sec-WebSocket-Protocol: 10.244.1.23
+```
+
+服务端必须在 `101 Switching Protocols` 响应中回显同一子协议。目标 IP 是一次性路由提示，仅用于收到该次 `redirect` 后的下一次握手；无论定向握手成功、失败或连接随后断开，后续普通重连都不再携带子协议，除非服务端再次发送新的 `redirect.targetIp`。首次连接不携带目标子协议。重连后必须重新发送 `auth`。Token 仍只通过 JSON `auth` 和 Authorization 头传递，不放入子协议。目标 IP 只使用服务端提供的合法 IPv4，不通过查询参数、本机地址或 DNS 推断。连续3次定向仍未成功后，第4次 redirect 会触发30秒冷却并清空目标，随后自动从普通入口恢复连接；冷却后可继续接受新的 redirect，不需要重启 gateway。普通断线使用500ms起步、30s封顶并附加0～500ms抖动的指数退避。
+
+关闭码处理：`4001` 停止自动重连并提示 Token 无效；`4002` 鉴权超时重连；`4004` 心跳超时重连；`4006` 没有目标 IP 时按普通断线处理。
+
+每个入站 `messageId` 都在当前 gateway 进程内维护任务状态。已发送终态的任务重连后不重复发送；未完成任务复用原 `replyToId` 和出站 `messageId`，不重新执行已经开始的 agent/tool turn。
 
 入站支持：
 
@@ -216,7 +277,7 @@ AOPS 上游统一通过 `send_message` 静默消息调用本地命令：
 - `/help`：返回 `local-command-tree.v2` 命令树，`usage` 用于展示，`completions[].required` 表示必填参数，`completions[].choices` 表示枚举候选。
 - `/model list`：从当前模型网关 `/models` 读取可用模型。
 - `/model status`、`/model current`：返回当前生效模型，不请求模型网关。
-- `/model use <provider> <model>`：切换当前 AOPS channel + agent 的模型偏好，并同步更新当前 profile 的 `config.yaml`。
+- `/model use <provider> <model>`：更新当前 profile 的 `config.yaml` 全局模型配置；该 profile 下所有会话从下一轮开始统一使用新模型，不保存 channel 级偏好。
 - `/toolsets list`：返回当前 profile 的工具集开关状态，与 dashboard 默认 Toolsets 页面使用同一状态源。
 - `/toolsets enable <name>`、`/toolsets disable <name>`、`/toolsets set <name> <true|false>`：修改当前 profile 的 `config.yaml platform_toolsets.cli`，并同步镜像到历史兼容键 `platform_toolsets.aops`，立即影响后续新任务。
 - `/skills`、`/skills list`：返回已安装技能，字段与 dashboard 技能状态保持一致。
@@ -372,6 +433,10 @@ SkillHub 桥接响应统一使用：
 ```
 
 模型密钥不会通过 `/model status` 或 `/model list` 返回明文，只返回 `apiKeyConfigured` 和 `apiKeyPreview`。
+
+模型配置以当前 profile 的 `config.yaml` 为唯一状态源。AOPS 不再读取或写入 `aops/channel-state.json` 中的会话模型偏好；升级后首次执行模型命令会清理旧 `modelPreferences`。模型切换无需重启 gateway，正在执行的 turn 不被中断，所有会话的后续 turn 使用新配置。
+
+`platforms.aops.extra.agent_routes` 只用于 agent 身份、workspace、default 和 prompt；其中历史遗留的 `model`、`provider`、`base_url`、`api_key`、`api_mode`、`command`、`args`、`credential_pool` 字段不会覆盖顶层 `model` 配置。每个 AOPS turn 会在 gateway journal 中记录一条不含密钥的 `AOPS runtime selected` 日志，展示实际 model/provider/apiMode、base host 和 cache hit 状态。
 
 ## Toolsets 接口
 
@@ -574,7 +639,7 @@ skills:
     "channelId": "conv_xxx",
     "replyToId": "545200",
     "messageType": "common",
-    "conversationEnded": true,
+    "conversationEnded": false,
     "content": [
       {
         "type": "approval",
@@ -596,6 +661,13 @@ skills:
 ```
 
 前端可直接把 `allowedActions[].command` 作为用户消息回发。Hermes 兼容文本 `/approve`、`/approve session`、`/approve always`、`/deny`、`/always`、`/cancel`，也兼容 metadata/content 中的结构化 `approvalId/action`。
+审批是 turn 内的等待状态，不是最终回复；UI 应以 `phase=actions` 渲染卡片，并继续等待同一 `replyToId` 后续唯一的终态回复。
+
+对于 `/new`、`/reset`、`/undo` 等 slash-confirm，审批卡片绑定原始指令并保持
+`conversationEnded=false`。用户随后发送 `/approve`、`/always` 或 `/cancel`
+时，Hermes 会把执行/取消结果作为唯一终态返回原始指令的 `replyToId`；审批操作
+消息本身也会收到一条简短终态确认。两个入站消息分别闭环，执行结果不会只绑定到
+审批操作消息。
 
 ## 附件和日志
 
@@ -603,6 +675,8 @@ skills:
 - 静默 SkillHub 命令跳过附件处理，避免附件干扰命令执行。
 - AOPS wire 日志位于 `~/.hermes/logs/aops/aops-YYYY-MM-DD.log`，默认保留 7 天，可通过 `platforms.aops.extra.log_retention_days` 或 `AOPS_LOG_RETENTION_DAYS` 覆盖。
 - 日志会记录 Tec01/AOPS 上游交互摘要和 raw payload；敏感字段如 `runtime.model.apiKey` 在日志中脱敏。
+- 成功的流式 `phase=delta` 默认不逐 chunk 落盘；`phase=end` 保留完整最终 payload，并记录 delta 数、字符数和持续时间。delta 失败会记录失败 chunk 及最后成功 chunk。
+- 排障时可设置 `platforms.aops.extra.log_stream_deltas: true` 或 `AOPS_LOG_STREAM_DELTAS=true` 恢复逐 delta raw 日志；配置项优先于环境变量。
 
 ## Curl One-Click Profile 安装
 
@@ -627,7 +701,7 @@ curl -fsSL "http://tec01.internal/hermes/install-oneclick.sh" | sudo bash -s -- 
 - Markdown 字段 `soul`、`userMemory`、`config.soul`、`config.userMemory`、`config.userInstructions` 支持字面量 `\n` 转换为真实换行，例如 `--set soul="# Rules \n- 使用中文回复"`。
 - `--skills-zip <path_or_url>` 支持本地或 URL zip，可重复；只接受 zip，安全解压到目标 profile `skills/`。
 - 模板来源优先级为 `--template-file`、`--template-url`、脚本内置模板。
-
+- `--sync-other-profiles true|false` 默认关闭；也可通过 `options.syncOtherProfiles` 配置，CLI 显式值优先。该参数只支持更新已有 profile。
 Profile 策略：
 
 - 同一系统用户下可以有多个 AOPS agent，`AOPS_BOT_TOKEN` 是唯一身份键。
@@ -636,9 +710,11 @@ Profile 策略：
 - 相同 token 重新执行时更新原 default/profile；多个 profile 命中相同 token 时失败。
 - 已安装 runtime 会比较 `~/hermes-agent/.aops_bundle_sha256` 与模板 `bundle.sha256`，不一致则下载新 bundle 并升级。
 - 任意 profile 触发 runtime 升级后，会重启同一系统用户下其他已运行或已有 systemd user service 的 default/named profile gateway；不主动启动从未运行过的 profile。
+- 开启 `syncOtherProfiles` 后，不再使用上述“只重启运行中网关”的策略：脚本按 `overwriteFields` 将受管配置同步到全部已有 profile，过滤所有 AOPS Token 字段，并启动或重启全部配置成功的 profile。技能只安装到当前 profile。
 - 一键脚本创建 default profile 且未手动指定 bank 时，在下载 bundle 前调用 `POST {AOPS_BOT_URL}/other/aops/bot-token/owner-user`，以请求体中的 `AOPS_BOT_TOKEN` 查询 `owner_user_id`；该创建请求单次超时 5 秒，失败、为空或非法时立即终止，不使用旧 bank 兜底。最终 Hindsight bank 固定为 `aops-tec01-{owner_user_id}`，并清空 `bank_id_template`。
 - 可通过 `--set hindsight.bank_id=<bank>` 直接指定最终 bank。手动值与 API 获取结果等效，会跳过 owner API 并写入静态 bank；命中 default 时会同步至同一系统用户下所有含 AOPS Token 的 profile。
-- 新建 named profile 且未手动指定 bank 时不调用 owner API，直接复用 default 的 `hindsight/config.json`：优先顶层 `bank_id`，其次 `banks.hermes.bankId`；default bank 缺失或非法时终止创建。更新非 default profile 时仍只同步当前 profile，并按现有 Token 查询逻辑处理；default 更新会扫描所有含 AOPS Token 的 profile，但只查询 default 的 owner，并将 default bank 同步给全部 profile。default 更新的 owner API 不可用且没有手动 bank 时，回退 default 已有 bank；兜底值不存在或非法才终止。bank 发生变化的运行中 profile 会重启；未运行 profile 保持停止，下次启动使用新 bank。旧 bank 记忆不自动迁移。
+- named profile 无论新建还是更新，未手动指定 bank 时都不调用 owner API，直接复用 default 的 `hindsight/config.json`：优先顶层 `bank_id`，其次 `banks.hermes.bankId`；default bank 缺失或非法时终止当前操作。default 更新会扫描所有含 AOPS Token 的 profile，但只查询 default 的 owner，并将 default bank 同步给全部 profile。default 更新的 owner API 不可用且没有手动 bank 时，回退 default 已有 bank；兜底值不存在或非法才终止。bank 发生变化的运行中 profile 会重启；未运行 profile 保持停止，下次启动使用新 bank。旧 bank 记忆不自动迁移。
+- 批量更新脚本每个系统用户只调用一次一键脚本，使用 default profile 的 Token 并开启 `syncOtherProfiles`。default profile 或其 Token 缺失时跳过该用户，不使用 named profile Token 兜底。
 
 模板默认能力：
 
@@ -654,3 +730,41 @@ Profile 策略：
 - 上游 UI 依赖的 JSON 字段不得静默改名；如需调整，先新增字段并保留旧字段兼容。
 - 新增 silent command 时，应同时更新 `/help` 命令树、相关测试和本文档。
 - 打内网包时，`install-oneclick.sh` 和对应离线包统一存放在 `dist/tec01-hermes-oneclick/` 目录，便于留档和清理。
+
+## Memory 即时管理命令
+
+面向 Tec01/Anyi UI 的完整字段、响应示例和错误码见：[AOPS Memory 管理接口](aops-memory-management-interface.md)。
+
+AOPS 支持通过本地 `/memory` 指令管理当前 profile 的内置记忆、用户画像和外部 memory provider。配置写入后无需重启网关；当前正在执行的 turn 不热替换，命令返回后的下一轮生效。
+
+```text
+/memory
+/memory status
+/memory get
+/memory get memory
+/memory reset memory|user|all
+/memory memory_char_limit [chars]
+/memory user_char_limit [chars]
+/memory enable memory|user|all
+/memory disable memory|user|all
+/memory provider status
+/memory provider enable [name]
+/memory provider disable
+```
+
+其中 `memory_char_limit` 对应 `memory.memory_char_limit`，`user_char_limit` 对应 `memory.user_char_limit`，参数必须是 `1..100000` 的正整数。`user` 和 `profile` 均表示用户画像。
+
+文件位置为当前 profile 的：
+
+```text
+<profile-home>/memories/MEMORY.md
+<profile-home>/memories/USER.md
+```
+
+`/memory get` 与 `/memory get memory` 等价，只读返回当前 profile 的完整 `MEMORY.md`，响应类型为 `memory.content`。文件不存在时仍返回成功和空内容；读取失败返回 `AOPS_MEMORY_READ_FAILED`。该读取操作不驱逐 agent cache、不重启 gateway，并支持 AOPS `silent=true` 透传。
+
+`reset` 只原子清空本地文件，不删除 Hindsight 服务端历史，响应会带 `remoteDataRetained=true`。内置记忆开关（`memory_enabled`、`user_profile_enabled`）与 `memory.provider` 开关相互独立。关闭 provider 会保留最近一次 provider，之后执行 `/memory provider enable` 可恢复；也可显式传入 provider 名称。provider 变化会重新初始化后续 agent，但不会重启 gateway。
+
+## Profile 删除
+
+AOPS channel 的 profile 删除接口、权限、确认码和响应示例见：[AOPS Profile 删除接口](aops-profile-delete-interface.md)。删除仅支持当前 named profile，`default` 永远保留。

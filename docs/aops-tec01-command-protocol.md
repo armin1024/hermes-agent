@@ -20,7 +20,7 @@
     "replyToId": "545200",
     "messageType": "common",
     "text": "",
-    "conversationEnded": true,
+    "conversationEnded": false,
     "content": [
       {
         "type": "approval",
@@ -51,6 +51,38 @@
 - `content[].allowedActions[].command` 是可直接回发执行的文本指令。
 - `content[].allowedActions[].display` 是按钮展示文案，UI 直接渲染该字段，不需要再转换。
 - `replyToId` 对应用户触发审批的消息 ID。
+- `conversationEnded` 固定为 `false`；审批卡片只暂停 turn，不结束对话。
+
+## 1.1 回复终态唯一性
+
+- 每个入站 `replyToId` 最多一条成功发送的 `conversationEnded=true`。
+- 主动状态消息使用独立 `messageId`、`phase=end`、`kind=status`、`conversationEnded=false`。
+- `phase=end` 结束状态气泡自身；最终 assistant 回复才结束对应用户 turn。
+- `/steer` 注入确认、`/queue` 排队确认、`/background` 启动确认以及 gateway
+  draining/busy 通知都属于状态消息，固定使用 `kind=status`、
+  `conversationEnded=false`。
+- AOPS interrupt 模式不再额外发送 `Interrupting current task` 确认气泡；旧
+  turn 的结构化中断终态和新 turn 的正式回复已经完整表达状态。
+- 转写回显、压缩/重试提示、长任务心跳、inactivity warning、footer、
+  shutdown/restart/update 等生命周期通知均不得占用用户 turn 的终态。
+- 旧 turn 被打断时，使用旧流原 `messageId` 发送一次带
+  `interrupted=true`、`finishReason=interrupted` 的终态。
+- Tec01 不会收到内部 `Operation interrupted: waiting for model response` 文本。
+- slash-confirm 审批卡片保持非终态；批准、始终批准或取消后，命令结果终结原始
+  slash 指令，审批操作消息另行返回简短终态确认。两者使用各自的 `replyToId`。
+
+### Steer 所有权交接
+
+- `/steer` 或 busy steer 的确认绑定新入站 `replyToId`，但固定为非终态状态消息。
+- 只有 steer 真正注入工具结果时才发生交接；交接前的工具帧仍归旧消息。
+- 旧消息使用原活动流发送唯一终态，并带
+  `finishReason=steered`、`superseded=true`、
+  `continuedByReplyToId=<新消息ID>`。
+- 新流带 `steeredFromReplyToId=<旧消息ID>`；交接后的工具、审批、澄清、过程文本、
+  错误及最终回答均绑定新消息。
+- 多条 steer 按接收顺序逐次交接，每个被替代 owner 都得到一个终态，最终回答归
+  最后一个 owner。
+- 无工具可供注入时不交接；新消息作为独立 FIFO turn 执行并获得自己的终态。
 
 动作含义：
 
@@ -191,20 +223,22 @@ Tec01 可直接发送列表项里的 `command`：
   "baseUrl": "http://model-gateway.internal/v1",
   "apiMode": "chat_completions",
   "apiKeyConfigured": true,
-  "scope": "aops-channel",
+  "scope": "config",
   "persisted": true,
   "configUpdated": true,
   "configPath": "/home/hermes/.hermes/config.yaml",
-  "preferenceKey": "aops:conv_xxx:main",
+  "preferenceKey": null,
+  "effectiveImmediately": true,
+  "restartRequired": false,
   "error": null
 }
 ```
 
 切换范围：
 
-- 当前 AOPS channel + agentKey 会立即切换，无需重启网关。
-- 会话偏好持久保存到 `~/.hermes/aops/channel-state.json`，网关重启后仍生效。
-- 同时同步更新 `~/.hermes/config.yaml` 的 `model.provider`、`model.default`、`model.base_url`、`model.api_mode` 和已有的密钥字段。
+- 当前 profile 的全局模型配置会立即切换，无需重启网关。
+- 不保存 AOPS channel 或 agentKey 级模型偏好；同一 profile 下所有会话从下一轮开始使用新模型。
+- 唯一持久状态是 `~/.hermes/config.yaml` 的 `model.provider`、`model.default`、`model.base_url`、`model.api_mode` 和已有密钥字段。
 - 如果原配置使用 `${ENV}` 或 `api_key_env`，保存时优先保留原模板，不把解析后的密钥明文写回配置。
 - `/model status`、`/model current` 是只读状态接口，不会把 `status/current/list` 误写成模型名。
 
@@ -240,10 +274,10 @@ Tec01 可发送：
   "apiMode": "chat_completions",
   "apiKeyConfigured": true,
   "apiKeyPreview": "sk-1...abcd",
-  "source": "aops.channelPreference",
-  "scope": "aops-channel",
-  "preferenceKey": "aops:conv_xxx:main",
-  "statePath": "/home/hermes/.hermes/aops/channel-state.json",
+  "source": "config.model",
+  "scope": "config",
+  "preferenceKey": null,
+  "statePath": "",
   "configPath": "/home/hermes/.hermes/config.yaml",
   "commands": {
     "list": "/model list",
@@ -257,9 +291,11 @@ Tec01 可发送：
 字段说明：
 
 - `modelId` 与 `model` 均为当前生效模型 ID，前端优先使用 `modelId`。
-- `source=config.model` 表示来自 `config.yaml`；`source=aops.channelPreference` 表示当前 AOPS 会话已有模型偏好。
-- `scope=config` 表示当前使用用户默认配置；`scope=aops-channel` 表示当前 channel + agentKey 有覆盖偏好。
+- `source` 表示模型配置在 `config.yaml` 中的解析来源，例如 `config.model`、`config.custom_providers`。
+- `scope` 固定为 `config`；AOPS 不支持 channel + agentKey 模型覆盖。
 - `apiKeyPreview` 只用于排查是否读到密钥，前端不要展示完整密钥。
+
+旧版本写入 `~/.hermes/aops/channel-state.json` 的 `modelPreferences` 不再生效，并会在首次执行模型命令时清理。
 
 ## 6. 安全策略
 
@@ -349,7 +385,7 @@ Hermes 将所有 AOPS channel 上游交互写入统一日志：
 单行格式示例：
 
 ```text
-2026-06-05T15:12:01.234+08:00 io=recv event=message_posted messageType=silent silent=true channel=conv-1 msg=545201 replyTo=- title="CPU告警排查" text="/model list" status=ok elapsedMs=- raw={"event":"message_posted","data":{...}}
+2026-06-05T15:12:01.234+08:00 io=recv event=message_posted phase=- seq=- messageType=silent silent=true channel=conv-1 msg=545201 replyTo=- title="CPU告警排查" text="/model list" status=ok elapsedMs=- raw={"event":"message_posted","data":{...}}
 ```
 
 字段顺序固定：
@@ -357,7 +393,8 @@ Hermes 将所有 AOPS channel 上游交互写入统一日志：
 - 本地时间：带时区，位于行首。
 - `io`：`recv` 表示从 Tec01 上游收到，`send` 表示发给 Tec01 上游。
 - `event`：如 `message_posted`、`message_reply`、`ping`、`pong`、`http.agent_report.request`、`http.agent_report.response`、`http.attachment.request`、`http.attachment.response`。
-- `messageType`：优先使用 payload 中的 `messageType`；审批为 `approval`，工具为 `tool`，websocket 控制帧为 `ws`，HTTP 为 `http`，被过滤的内部思考为 `filtered`。
+- `phase`、`seq`：流式回复阶段与序号；非回复事件为 `-`。
+- `messageType`：优先使用 payload 中的 `messageType`；审批为 `approval`，工具为 `tool`，websocket 控制帧为 `ws`，HTTP 为 `http`。
 - `silent`：是否为静默消息。
 - `channel`：Tec01 会话或频道 ID。
 - `msg`：Tec01 消息 ID。
@@ -373,16 +410,50 @@ Hermes 将所有 AOPS channel 上游交互写入统一日志：
 - 用户普通消息写 `io=recv event=message_posted text="<用户文本>"`。
 - 用户指令消息写 `io=recv event=message_posted text="/xxx ..."`。
 - Hermes 普通回复写 `io=send event=message_reply text="<回复摘要>"`，长文本截断到 500 字符。
+- 成功的 `phase=delta` 默认不逐 chunk 落盘；`phase=end` 保留完整最终 raw，并增加 `streamDeltaCount`、`streamChars`、`streamDurationMs`。
+- delta 发送失败立即记录 `lastSuccessfulSeq`、`lastSuccessfulDelta`、`failedDelta` 和错误详情。
 - 审批卡片写 `messageType=approval text="approval kind=exec actions=/approve,/approve always,/deny command=<待执行命令摘要>"`。
 - 工具进度写 `messageType=tool text="tool phase=start name=xxx text=..."`。
-- 被过滤的内部思考写 `io=send event=message_reply messageType=filtered status=skipped text="filtered reason=internal_thinking tool=_thinking"`，不会发送给 Tec01。
+- 内部思考（`_thinking` / `reasoning.available`）既不会发送给 Tec01，也不会写入 AOPS 文件日志。
 - 静默消息写 `messageType=silent silent=true`，便于解释“日志里有但前端普通消息通道没消息”的情况。
-- bot/me、agent 注册上报、websocket ping/pong、附件下载 HTTP 请求/响应等上游交互写对应的 `event`，并在 `raw=` 保留请求或响应数据。
+- auth/auth_ok、agent 注册上报、websocket ping/pong、redirect/重连、附件下载 HTTP 请求/响应等上游交互写对应的 `event`，并在 `raw=` 保留请求或响应数据。
 - 普通 session 状态、busy handler、agent 内部状态、附件本地缓存 start/success 等非上游交互不写 AOPS 日志。
 
 日志默认保留 7 天，可配置覆盖：
 
 - `platforms.aops.extra.log_retention_days`
 - `AOPS_LOG_RETENTION_DAYS`
+- `platforms.aops.extra.log_stream_deltas` / `AOPS_LOG_STREAM_DELTAS`：显式设为 true 时恢复成功 delta 的逐帧 raw 日志，默认关闭，配置项优先于环境变量。
 
 配置值小于 1 或无法解析时回退为 7。清理范围包括新日志 `aops-*.log`，以及旧日志 `aops-wire-*.log`、`aops-messages-*.log`。
+
+## 9. Memory 管理协议
+
+AOPS 本地命令支持对当前 profile 的 Hermes 内置记忆和外部 memory provider 做即时管理：
+
+```text
+/memory status
+/memory reset memory|user|all
+/memory memory_char_limit [chars]
+/memory user_char_limit [chars]
+/memory enable memory|user|all
+/memory disable memory|user|all
+/memory provider status
+/memory provider enable [name]
+/memory provider disable
+```
+
+预算指令分别对应 `memory.memory_char_limit` 与 `memory.user_char_limit`，不会互相覆盖。文件路径为 `<profile-home>/memories/MEMORY.md` 和 `<profile-home>/memories/USER.md`。reset 只清空本地文件，不删除 Hindsight 远端数据；响应中的 `remoteDataRetained` 为 `true`。
+
+所有变更均通过原子配置/文件写入完成，无需重启网关。网关会驱逐当前 profile 的缓存 agent，下一轮重新加载配置；正在执行的 turn 保持原有 system prompt。内置记忆开关与 `memory.provider` 开关独立，provider 关闭时保留最近一次 provider 供无参数 enable 恢复。
+
+## 10. Profile 删除协议
+
+Profile 删除采用两阶段 AOPS 指令：
+
+```text
+/profile delete
+/profile delete confirm <token>
+```
+
+仅当前 named profile 可删除，`default` 永远受保护；删除通过一次性确认码授权，不需要额外的 AOPS slash admin 配置。完整响应、确认码绑定、错误码和本地/远端数据语义见：[AOPS Profile 删除接口](aops-profile-delete-interface.md)。

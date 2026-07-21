@@ -257,6 +257,8 @@ fi
 mkdir -p "$BUNDLE_DIR/docs"
 cp "$REPO_ROOT/docs/aops-channel-interface.md" "$BUNDLE_DIR/docs/aops-channel-interface.md"
 cp "$REPO_ROOT/docs/aops-tec01-command-protocol.md" "$BUNDLE_DIR/docs/aops-tec01-command-protocol.md"
+cp "$REPO_ROOT/docs/aops-memory-management-interface.md" "$BUNDLE_DIR/docs/aops-memory-management-interface.md"
+cp "$REPO_ROOT/docs/aops-profile-delete-interface.md" "$BUNDLE_DIR/docs/aops-profile-delete-interface.md"
 
 CONTENT_SHA="$(
   cd "$BUNDLE_DIR"

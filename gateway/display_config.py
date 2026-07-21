@@ -120,6 +120,12 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "mattermost":      _TIER_MEDIUM,
     "matrix":          _TIER_MEDIUM,
     "feishu":          _TIER_MEDIUM,
+    # AOPS has a native websocket start/delta/end reply protocol.  It does
+    # not depend on editing an already-sent platform message, so streaming is
+    # safe by default even though the generic gateway streaming switch is off.
+    # Users can still disable it explicitly with
+    # display.platforms.aops.streaming=false.
+    "aops":            {**_TIER_MEDIUM, "streaming": True},
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,

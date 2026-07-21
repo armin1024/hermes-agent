@@ -212,6 +212,30 @@ class TestBusySessionAck:
         agent.interrupt.assert_called_once_with("Are you working?")
 
     @pytest.mark.asyncio
+    async def test_aops_busy_ack_is_non_terminal_status(self):
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="aops")
+        event = _make_event(text="second", platform_val="aops")
+        sk = build_session_key(event.source)
+
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 1,
+            "max_iterations": 90,
+            "current_tool": None,
+        }
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time()
+        runner.adapters[event.source.platform] = adapter
+
+        assert await runner._handle_active_session_busy_message(event, sk) is True
+
+        metadata = adapter._send_with_retry.await_args.kwargs["metadata"]
+        assert metadata["kind"] == "status"
+        assert metadata["conversation_ended"] is False
+
+    @pytest.mark.asyncio
     async def test_queue_mode_suppresses_interrupt_and_updates_ack(self):
         """When busy_input_mode is 'queue', message is queued WITHOUT interrupt."""
         runner, sentinel = _make_runner()

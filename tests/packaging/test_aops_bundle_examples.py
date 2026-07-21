@@ -6,6 +6,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+
 
 def _embedded_python(script: str, function_name: str) -> str:
     start = script.index(f"{function_name}() {{")
@@ -90,8 +92,12 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "default_create_lookup = selected_action == \"create\" and selected_profile == \"default\"" in script
     assert "timeout = 5.0 if default_create_lookup" in script
     assert "attempts = 1 if default_create_lookup" in script
-    assert "new-profile-default-bank" in script
+    assert "named-profile-default-bank" in script
     assert "default-config-bank" in script
+    assert "--sync-other-profiles true|false" in script
+    assert "syncOtherProfiles is only supported when updating an existing profile" in script
+    assert "build_profile_sync_payload" in script
+    assert "profile-sync-summary.json" in script
     assert "restart_other_profiles_after_owner_bank_sync" in script
     preflight_call = script.index("resolve_aops_owner_bank_plan | tee")
     assert "resolve_aops_owner_bank_plan | tee \"$OWNER_BANK_PLAN_LOG_JSON\"" in script
@@ -117,6 +123,14 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "hermes-gateway.service" in script
     assert "controlled_gateway_lifecycle" in script
     assert "skip SIGUSR1 restart" in script
+    assert "--bundle-cache-dir DIR" in script
+    assert "HERMES_BUNDLE_CACHE_DIR" in script
+    assert "install-timings.json" in script
+    assert "[TIMING] stage=%s durationMs=%s" in script
+    assert "wait_for_replacement" in script
+    assert "active_agents = int(before.get(\"active_agents\") or 0)" in script
+    assert "drain_timeout = 185 if active_agents > 0 else 30" in script
+    assert "AOPS not connected within 15s" in script
     assert "runtime did not become ready within" in script
     assert "startup is blocked by a lazy dependency install" in script
     assert "systemd is active with MainPID" in script
@@ -182,6 +196,78 @@ def test_dist_oneclick_aops_validation_matches_source_script():
     dist = Path("dist-aops-latest/install-oneclick.sh").read_text(encoding="utf-8")
 
     assert dist == source
+
+
+def test_tec01_multiuser_update_caches_inputs_reports_timings_and_limits_parallelism():
+    script = Path("packaging/offline/tec01_multiuser_update.sh").read_text(encoding="utf-8")
+
+    assert "--jobs N" in script
+    assert 'JOBS="${HERMES_MULTIUSER_JOBS:-1}"' in script
+    assert "--jobs must be an integer from 1 to 8" in script
+    assert "prefetch_inputs" in script
+    assert 'CACHED_INSTALLER="$RUN_DIR/install-oneclick.sh"' in script
+    assert 'CACHED_TEMPLATE="$RUN_DIR/template.yaml"' in script
+    assert 'bash "$UPDATE_INSTALLER_FILE" "${args[@]}"' in script
+    assert '--sync-other-profiles true' in script
+    assert "default_token_missing" in script
+    assert 'process_profile "$user" "default" "$env_path"' in script
+    assert 'process_profile "$user" "$profile"' not in script
+    assert '--bundle-cache-dir "$UPDATE_BUNDLE_CACHE_DIR"' in script
+    assert "run_user_worker" in script
+    assert "merge_worker_results" in script
+    assert "durationMs" in script
+    assert "totalDurationMs" in script
+    assert 'if [[ "$JOBS" -eq 1 ]]' in script
+
+
+@pytest.mark.parametrize("overwrite_all", [False, True])
+def test_oneclick_profile_sync_payload_filters_tokens_and_skips_skills(tmp_path, overwrite_all):
+    script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
+    builder = tmp_path / "builder.py"
+    builder.write_text(_embedded_python(script, "build_profile_sync_payload"), encoding="utf-8")
+    home = tmp_path / "home"
+    (home / ".hermes" / "profiles" / "ops-1").mkdir(parents=True)
+    payload = tmp_path / "payload.json"
+    payload.write_text(json.dumps({
+        "config": {
+            "env": {"AOPS_BOT_TOKEN": "secret", "AOPS_BOT_URL": "https://new.example"},
+            "configYaml": {
+                "model": {"model": "gpt-test"},
+                "platforms": {"aops": {"token": "yaml-secret"}},
+                "gateway": {"platforms": {"aops": {"token": "gateway-secret"}}},
+            },
+            "soul": "shared soul",
+            "hindsight": {"bank_id": "shared-bank"},
+        },
+        "skills": {"preinstall": ["must-not-sync"]},
+        "options": {
+            "overwriteExistingConfig": overwrite_all,
+            "overwriteFields": [
+                "env.AOPS_BOT_TOKEN", "env.AOPS_BOT_URL",
+                "configYaml.model", "configYaml.platforms.aops.token",
+                "configYaml.gateway.platforms.aops.token", "soul", "hindsight",
+            ],
+        },
+    }), encoding="utf-8")
+    output = tmp_path / "sync.json"
+    profiles = tmp_path / "profiles.json"
+    summary = tmp_path / "summary.json"
+    subprocess.run(
+        [sys.executable, str(builder), str(payload), str(output), str(profiles), str(summary), "default", str(home)],
+        check=True,
+    )
+    sync = json.loads(output.read_text(encoding="utf-8"))
+    assert sync["config"]["env"] == {"AOPS_BOT_URL": "https://new.example"}
+    assert "token" not in sync["config"]["configYaml"].get("platforms", {}).get("aops", {})
+    assert "token" not in sync["config"]["configYaml"].get("gateway", {}).get("platforms", {}).get("aops", {})
+    assert sync["config"]["soul"] == "shared soul"
+    assert sync["config"]["hindsight"]["bank_id"] == "shared-bank"
+    assert "skills" not in sync
+    assert json.loads(profiles.read_text(encoding="utf-8")) == ["default", "ops-1"]
+    protected = json.loads(summary.read_text(encoding="utf-8"))["protectedFields"]
+    assert "env.AOPS_BOT_TOKEN" in protected
+    assert "configYaml.platforms.aops.token" in protected
+    assert "configYaml.gateway.platforms.aops.token" in protected
 
 
 def test_aops_profile_template_defaults_to_terminal_linux_toolsets():
@@ -329,7 +415,8 @@ def test_oneclick_default_owner_api_failure_uses_existing_default_bank(tmp_path)
     ]
 
 
-def test_oneclick_new_named_profile_reuses_default_bank_without_owner_api(tmp_path):
+@pytest.mark.parametrize("action", ["create", "update"])
+def test_oneclick_named_profile_reuses_default_bank_without_owner_api(tmp_path, action):
     script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
     resolver = tmp_path / "resolver.py"
     resolver.write_text(_embedded_python(script, "resolve_aops_owner_bank_plan"), encoding="utf-8")
@@ -351,7 +438,7 @@ def test_oneclick_new_named_profile_reuses_default_bank_without_owner_api(tmp_pa
         encoding="utf-8",
     )
     profile = tmp_path / "profile.json"
-    profile.write_text(json.dumps({"profile": "ops-2", "action": "create"}), encoding="utf-8")
+    profile.write_text(json.dumps({"profile": "ops-2", "action": action}), encoding="utf-8")
     output = tmp_path / "plan.json"
     env = os.environ | {
         "HOME": str(tmp_path),
@@ -361,7 +448,7 @@ def test_oneclick_new_named_profile_reuses_default_bank_without_owner_api(tmp_pa
     }
     completed = subprocess.run([sys.executable, str(resolver)], check=True, env=env, capture_output=True, text=True)
     plan = json.loads(output.read_text(encoding="utf-8"))
-    assert plan["mode"] == "new-profile-default-bank"
+    assert plan["mode"] == "named-profile-default-bank"
     assert plan["profiles"] == [{
         "profile": "ops-2",
         "hermesHome": str(hermes / "profiles" / "ops-2"),

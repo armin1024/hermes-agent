@@ -18,6 +18,7 @@
 - AOPS 工具进度回传增强：`tool.completed` 中间帧包含 `data.tool.result.text/length/truncated`、`durationMs`、`isError`，默认最多 4K 字符；`AOPS_PUSH_TOOL_CALLS=false` 时不发送工具中间帧。
 - tec01 一键安装支持新装/更新、目标用户创建、配置下发、预装技能、Hindsight 和 USER.md 初始化。
 - 离线包安装后会执行自检，确认实际导入的 overlay 不会创建旧 `image_cache/audio_cache` 目录。
+- AOPS WebSocket 严格使用 `auth -> auth_ok -> READY` 握手；支持服务端 ping/pong、redirect 定向重连和 `Sec-WebSocket-Protocol` 目标 Pod 路由。连续重定向达到 4 次时进入 30 秒冷却，随后自动从普通入口恢复连接。
 
 ## 配置
 
@@ -62,7 +63,15 @@ platforms:
 
 `agent_routes.devops` 不再作为默认示例配置生成；如内网确实需要额外 agent，可自行添加。
 
-## 身份上报
+AOPS 的主模型始终来自当前 profile 顶层 `config.yaml.model`。`agent_routes` 中的模型、provider、endpoint、credential 或 command 类字段仅作为旧配置保留，运行时会忽略；agent route 仍可使用 `enabled`、`default`、`workspace` 和 `prompt`。
+
+## WebSocket 重连与身份上报
+
+首次连接使用 `{AOPS_BOT_URL}/api/v1/ws`，不携带目标 Pod。连接建立后发送 `auth`，收到 `auth_ok` 后才进入 READY 并执行 agent report。服务端 `ping` 必须回复 `{"event":"pong"}`。
+
+收到 `redirect` 时，读取服务端提供的 `targetIp`，关闭当前连接并在 `retryAfterMs` 后使用 `Sec-WebSocket-Protocol: <targetIp>` 定向重连；该目标只用于下一次握手，握手失败或连接再次断开后的普通重连不携带子协议，只有收到新的 redirect 才再次定向。服务端必须在 101 响应中回显该子协议，每次重连都重新发送 `auth`。首次连接不携带目标子协议，Token 不放入子协议。`4001` 停止自动重连，`4002`/`4004` 普通退避重连，只有带有效 IPv4 的 redirect 才使用定向重连。
+
+普通断线重连采用 500ms 起步、30s 封顶并附加 0～500ms 抖动的指数退避。业务任务保留原始 `replyToId` 和出站 `messageId`，已完成终态不会重复投递。
 
 所有 AOPS HTTP/WebSocket 鉴权请求继续使用请求头 `tec-client-ip`，但值改为“当前系统用户唯一 UUID”。
 
@@ -210,6 +219,7 @@ CLAWHUB_REGISTRY=http://clawhub.internal
 
 AOPS 本地命令入口继续支持 `/skills`、`/skills list`、`/cron` 等结构化结果。
 
+- `/profile delete` 先返回当前 named profile 的删除预览和一次性确认码；`/profile delete confirm <token>` 确认后由独立 worker 停止服务并永久清理本地 profile。`default` 永远不可删除，删除不需要额外的 AOPS slash admin 配置。完整协议见 `docs/aops-profile-delete-interface.md`。
 - `/skills` 和 `/skills list` 会刷新 skill command 缓存后返回，避免新安装技能缺少 `command`。
 - `/skills uninstall <name>` / `/skills remove <name>` 先尝试 hub 卸载；若目标不是 hub-installed，则安全删除当前 profile 的本地技能目录。
 - `/soul get|set|append` 读写当前 profile 的 `SOUL.md`；`/user get|set|append` 读写当前 profile 的 `memories/USER.md`。写入入口使用 threat-pattern 扫描，命中注入/泄露模式会拒绝写入；成功写入后驱逐 idle agent cache，后续新 turn 立即加载新指令。
@@ -238,6 +248,8 @@ AOPS 入站 `attachments` 会由 Bot 侧下载并缓存：
 - `http.attachment.response`
 
 日志写入 `~/.hermes/logs/aops/aops-YYYY-MM-DD.log`，每行包含时间、收发方向、上游事件、`messageType`、关键摘要和 `raw=` 原始 payload。普通 session 状态、busy handler、agent 内部状态和附件本地缓存过程不写入 AOPS 日志。
+
+成功的流式 delta 默认只在内存累计统计，不逐 chunk 写文件；segment 的 end 日志保留完整最终 payload 和 `streamDeltaCount`、`streamChars`、`streamDurationMs`。delta 失败会立即写入错误、失败 chunk 和最后成功 chunk。设置 `platforms.aops.extra.log_stream_deltas: true` 或 `AOPS_LOG_STREAM_DELTAS=true` 可临时恢复完整逐帧日志。
 
 默认保留 7 天，可通过 `platforms.aops.extra.log_retention_days` 或 `AOPS_LOG_RETENTION_DAYS` 覆盖。清理范围包括新日志和旧版 `aops-wire-*.log`、`aops-messages-*.log`。
 
@@ -322,9 +334,13 @@ curl -fsSL "http://tec01.internal/hermes/install-oneclick.sh" | sudo bash -s -- 
 - `options.overwriteExistingConfig=true`: 覆盖任务 JSON 中提供的所有配置字段。
 - `options.overwriteFields`: 只覆盖指定字段，例如 `["userInstructions", "aops.AOPS_BOT_URL"]`。
 
+已有 profile 更新可使用 `--sync-other-profiles true`，也可在模板中设置 `options.syncOtherProfiles=true`。开启后，`overwriteFields` 明确指定的 env、configYaml、USER/SOUL 和 Hindsight 字段会同步到该系统用户的全部已有 profile；`overwriteExistingConfig=true` 时同步全部受管配置。各 profile 的 `AOPS_BOT_TOKEN` 永远保留，不会被当前 profile 的 Token 覆盖。preinstall skill 和 `--skills-zip` 仍只作用当前 profile。同步模式不支持创建新 profile；全部配置成功的 profile（包括原先停止的网关）都会安装/刷新 service 并启动或重启。
+
+`tec01_multiuser_update.sh` 每个系统用户只使用 default profile Token 调用一次一键脚本，并自动开启跨 profile 同步；没有 default `.env` 或 default Token 的用户会跳过，不回退 named profile Token。
+
 脚本会根据是否已存在 Hermes 安装判断新装或更新；新装后可自动 `hermes gateway start`，更新后可自动 `hermes gateway restart`。
 
-Hindsight bank 默认以 default AOPS Bot 所属人为权威来源：新建 default 且未手动指定 bank 时，脚本调用 `POST {AOPS_BOT_URL}/other/aops/bot-token/owner-user`（单次超时 5 秒）查询 default 的 `AOPS_BOT_TOKEN`，并写入 `bank_id=aops-tec01-{owner_user_id}`、清空 `bank_id_template`；API 失败会终止新建。新建 named profile 不调用 owner API，直接复用 default `hindsight/config.json` 中的 `bank_id`（兼容 `banks.hermes.bankId`）。命中 default 更新时所有带 AOPS Token 的 profile 同步为同一个 default bank；更新 default 的 API 不可用时回退 default 已有 bank。可通过 `--set hindsight.bank_id=<bank>` 手动指定同等的最终 bank，并跳过 API 查询。更新非 default profile 时只同步当前 profile；owner 变化时旧 bank 保留，不自动迁移记忆。
+Hindsight bank 默认以 default AOPS Bot 所属人为权威来源：新建 default 且未手动指定 bank 时，脚本调用 `POST {AOPS_BOT_URL}/other/aops/bot-token/owner-user`（单次超时 5 秒）查询 default 的 `AOPS_BOT_TOKEN`，并写入 `bank_id=aops-tec01-{owner_user_id}`、清空 `bank_id_template`；API 失败会终止新建。named profile 无论新建还是更新都不调用 owner API，直接复用 default `hindsight/config.json` 中的 `bank_id`（兼容 `banks.hermes.bankId`）。命中 default 更新时所有带 AOPS Token 的 profile 同步为同一个 default bank；更新 default 的 API 不可用时回退 default 已有 bank。可通过 `--set hindsight.bank_id=<bank>` 手动指定同等的最终 bank，并跳过 API 查询。旧 bank 记忆不自动迁移。
 
 ## 排障
 
@@ -357,6 +373,26 @@ curl "$CLAWHUB_REGISTRY/api/v1/skills?limit=1"
 ```
 
 如果 gateway 进程由 systemd 启动，确保 `CLAWHUB_REGISTRY` 在服务环境中可见，或写入运行用户的 `.bashrc` / `.profile`。
+
+## `/memory` 即时配置
+
+当前 profile 可通过 AOPS 本地指令管理记忆：
+
+```text
+/memory status
+/memory reset memory|user|all
+/memory memory_char_limit [chars]
+/memory user_char_limit [chars]
+/memory enable memory|user|all
+/memory disable memory|user|all
+/memory provider status
+/memory provider enable [name]
+/memory provider disable
+```
+
+`memory_char_limit` 和 `user_char_limit` 分别写入 `config.yaml` 的 `memory.memory_char_limit` 与 `memory.user_char_limit`，不会互相覆盖。命令会按 profile 驱逐缓存 agent，使下一轮立即读取新配置，不调用 gateway restart。
+
+内置文件位于 `<profile-home>/memories/MEMORY.md` 和 `<profile-home>/memories/USER.md`。reset 只清本地文件，Hindsight 远端历史保留。关闭内置记忆不会关闭 Hindsight；关闭 Hindsight provider 也不会删除本地 MEMORY/USER 文件。
 
 ### SkillHub 安装返回 `SKILLHUB_RATE_LIMITED`
 

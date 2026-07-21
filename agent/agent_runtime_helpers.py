@@ -2490,7 +2490,11 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
-    steer_text = agent._drain_pending_steer()
+    drain = getattr(agent, "_drain_pending_steer_with_context", None)
+    if callable(drain):
+        steer_text, steer_contexts = drain()
+    else:
+        steer_text, steer_contexts = agent._drain_pending_steer(), []
     if not steer_text:
         return
     # Find the last tool-role message in the recent tail. Skipping
@@ -2506,13 +2510,9 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # No tool result in this batch (e.g. all skipped by interrupt);
         # put the steer back so the caller's fallback path can deliver
         # it as a normal next-turn user message.
-        _lock = getattr(agent, "_pending_steer_lock", None)
-        if _lock is not None:
-            with _lock:
-                if agent._pending_steer:
-                    agent._pending_steer = agent._pending_steer + "\n" + steer_text
-                else:
-                    agent._pending_steer = steer_text
+        restash = getattr(agent, "_restash_pending_steer", None)
+        if callable(restash):
+            restash(steer_text, steer_contexts)
         else:
             existing = getattr(agent, "_pending_steer", None)
             agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
@@ -2536,6 +2536,9 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
     )
+    notify = getattr(agent, "_notify_steer_applied", None)
+    if callable(notify):
+        notify(steer_contexts)
 
 
 

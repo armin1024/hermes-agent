@@ -75,3 +75,17 @@ def delete_model_preference(key: str) -> Path | None:
         return None
     prefs.pop(key, None)
     return save_state(state)
+
+
+def clear_model_preferences() -> Path | None:
+    """Remove legacy per-channel model preferences.
+
+    AOPS model selection is profile-global and persisted in config.yaml.  This
+    migration helper keeps unrelated channel state while removing preferences
+    written by older releases.
+    """
+    state = load_state()
+    if "modelPreferences" not in state:
+        return None
+    state.pop("modelPreferences", None)
+    return save_state(state)
