@@ -70,6 +70,7 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
+_AOPS_TIMESTAMP_SKEW_WARN_SECS = 300.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _AOPS_RESERVED_MODEL_TOKENS = {"status", "current", "list", "use", "stutus", "stauts", "stattus", "statsu", "curent"}
 
@@ -992,6 +993,49 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
         return bool(mt.get("enabled", False))
     # Allow a bare ``message_timestamps: true`` shorthand.
     return bool(mt)
+
+
+def _warn_on_aops_timestamp_skew(
+    source: Any,
+    event: Any,
+    event_epoch: Optional[float],
+    *,
+    received_epoch: Optional[float] = None,
+    warned_sessions: Optional[set[str]] = None,
+) -> bool:
+    """Log large AOPS clock skew without exposing message content.
+
+    Platform timestamps remain useful metadata, but are deliberately not used
+    to sequence transcript rows.  This diagnostic makes upstream timezone or
+    clock issues visible without mutating the original timestamp.
+    """
+    if event_epoch is None:
+        return False
+    platform = getattr(source, "platform", None)
+    platform_value = getattr(platform, "value", platform)
+    if platform_value != "aops":
+        return False
+    received = time.time() if received_epoch is None else float(received_epoch)
+    skew = float(event_epoch) - received
+    if abs(skew) <= _AOPS_TIMESTAMP_SKEW_WARN_SECS:
+        return False
+    session_key = str(getattr(source, "chat_id", None) or "-")
+    if warned_sessions is not None:
+        if session_key in warned_sessions:
+            return False
+        # Bound process-lifetime diagnostic state for gateways that see many
+        # one-off conversations.  Clearing only affects warning suppression.
+        if len(warned_sessions) >= 1024:
+            warned_sessions.clear()
+        warned_sessions.add(session_key)
+    logger.warning(
+        "AOPS inbound timestamp skew session=%s messageId=%s skewSeconds=%.1f; "
+        "preserving platform timestamp as metadata; transcript order uses insertion id",
+        session_key,
+        getattr(event, "message_id", None) or "-",
+        skew,
+    )
+    return True
 
 
 def _build_gateway_agent_history(
@@ -2558,6 +2602,17 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
             f"[The user sent a text document: '{display_name}'. "
             f"Its content has been included below. "
             f"The file is also saved at: {agent_path}]"
+        )
+    if mtype == "application/pdf" or display_name.lower().endswith(".pdf"):
+        return (
+            f"[The user sent a PDF document: '{display_name}'. It is saved at: {agent_path}. "
+            f"Its content is not inlined here. If the user's request involves the PDF's "
+            f"contents, call read_file on that path. read_file extracts text and returns "
+            f"rendered image paths for scanned or graphics-heavy pages; call vision_analyze "
+            f"on the relevant rendered pages and combine those results with the page-numbered "
+            f"text. If PDF parsing reports dependency_missing, explain that the AOPS PDF "
+            f"runtime is unavailable. Do not claim the PDF was parsed; continue without "
+            f"requesting pasted contents.]"
         )
     return (
         f"[The user sent a document: '{display_name}'. It is saved at: {agent_path}. "
@@ -14077,6 +14132,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
                 persist_user_timestamp = (
                     _event_epoch if _event_epoch is not None else _embedded_ts
+                )
+                _timestamp_warned_sessions = getattr(
+                    self, "_aops_timestamp_skew_warned_sessions", None,
+                )
+                if _timestamp_warned_sessions is None:
+                    _timestamp_warned_sessions = set()
+                    self._aops_timestamp_skew_warned_sessions = _timestamp_warned_sessions
+                _warn_on_aops_timestamp_skew(
+                    source,
+                    event,
+                    persist_user_timestamp,
+                    warned_sessions=_timestamp_warned_sessions,
                 )
                 if _message_timestamps_enabled(_load_gateway_config()):
                     message_text = _render_msg_ts(

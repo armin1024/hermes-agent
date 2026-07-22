@@ -24,7 +24,7 @@ import logging
 import os
 import posixpath
 from contextvars import ContextVar
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional
 from hermes_cli.config import cfg_get
 
@@ -521,5 +521,3 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
-

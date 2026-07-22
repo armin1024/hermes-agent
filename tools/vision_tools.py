@@ -1126,7 +1126,6 @@ async def vision_analyze_tool(
 
         logger.info("Analyzing image: %s", image_url[:60])
         logger.info("User prompt: %s", user_prompt[:100])
-
         # Resolve the source to raw bytes through the single resolver (unifies
         # data:/http/file/local/container and enforces terminal-backend
         # confinement). Materialize to a temp file so the existing path-based
@@ -1663,6 +1662,9 @@ async def video_analyze_tool(
         resolved_url = video_url
         if resolved_url.startswith("file://"):
             resolved_url = resolved_url[len("file://"):]
+        from tools.credential_files import from_agent_visible_cache_path
+
+        resolved_url = from_agent_visible_cache_path(resolved_url)
         local_path = Path(os.path.expanduser(resolved_url))
 
         if local_path.is_file():

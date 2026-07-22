@@ -988,6 +988,9 @@ write_default_template() {
     "noBundledSkills": true,
     "setActive": false
   },
+  "skills": {
+    "preinstall": ["builtin:ocr-and-documents"]
+  },
   "config": {
     "env": {
       "AOPS_BOT_TOKEN": "${env.AOPS_BOT_TOKEN}",
@@ -1006,7 +1009,8 @@ write_default_template() {
         "default": "${configYaml.model.model}",
         "base_url": "${configYaml.model.base_url}",
         "api_mode": "openai",
-        "api_key_env": "MODEL_GATEWAY_API_KEY"
+        "api_key_env": "MODEL_GATEWAY_API_KEY",
+        "supports_vision": true
       },
       "memory": {"provider": "hindsight"},
       "approvals": {"mode": "off"},
@@ -1032,7 +1036,8 @@ write_default_template() {
           "clarify",
           "delegation",
           "cronjob",
-          "messaging"
+          "messaging",
+          "vision"
         ],
         "aops": [
           "terminal",
@@ -1045,14 +1050,14 @@ write_default_template() {
           "clarify",
           "delegation",
           "cronjob",
-          "messaging"
+          "messaging",
+          "vision"
         ]
       },
       "aops": {
         "toolsets": {
           "disabled": [
             "browser",
-            "vision",
             "video",
             "image_gen",
             "video_gen",
@@ -2061,6 +2066,14 @@ profile_home_for() {
   fi
 }
 
+ensure_aops_pdf_capabilities_for_profile() {
+  local profile="$1"
+  local profile_dir
+  profile_dir="$(profile_home_for "$profile")"
+  log "Enabling bundled PDF capabilities for profile $profile" >&2
+  run_as_target "$(shell_quote "$INSTALL_DIR/venv/bin/python") -m tools.aops_pdf_setup --config $(shell_quote "$profile_dir/config.yaml")"
+}
+
 ensure_gateway_lazy_installs_disabled_for_profile() {
   local profile="$1"
   if json_bool options.allowGatewayLazyInstalls false || json_bool options.allowLazyInstalls false; then
@@ -2834,6 +2847,18 @@ apply_other_profile_configs() {
     lazy_path="$WORK_DIR/gateway-lazy-installs-${profile//[^A-Za-z0-9_.-]/_}.json"
     ensure_gateway_lazy_installs_disabled_for_profile "$profile" > "$lazy_path" || true
     record_lazy_installs_change_if_needed "$profile" "$lazy_path"
+    if ! ensure_aops_pdf_capabilities_for_profile "$profile" > "$WORK_DIR/pdf-capabilities-${profile//[^A-Za-z0-9_.-]/_}.json"; then
+      duration=$(($(now_ms) - started))
+      warn "PDF capability migration failed for profile $profile; continuing"
+      record_profile_sync_result "$profile" "failed" "" "" "$duration" "PDF capability migration failed"
+      continue
+    fi
+    if ! install_preinstall_skills "$profile" > "$WORK_DIR/pdf-skill-${profile//[^A-Za-z0-9_.-]/_}.json"; then
+      duration=$(($(now_ms) - started))
+      warn "Bundled PDF skill installation failed for profile $profile; continuing"
+      record_profile_sync_result "$profile" "failed" "" "" "$duration" "bundled PDF skill installation failed"
+      continue
+    fi
     set +e
     validate_aops_gateway_config_for_profile "$profile" > "$WORK_DIR/aops-gateway-config-check-${profile//[^A-Za-z0-9_.-]/_}.json" 2>&1
     status=$?
@@ -3007,6 +3032,7 @@ import inspect
 import io
 import json
 import os
+import shutil
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -3035,9 +3061,45 @@ if raw is None:
 if not isinstance(raw, list):
     raise SystemExit('skills.preinstall must be a list')
 slugs = [str(item).strip() for item in raw if str(item or '').strip()]
+if 'builtin:ocr-and-documents' not in slugs:
+    slugs.insert(0, 'builtin:ocr-and-documents')
 
 installed = []
-if slugs:
+builtin_slugs = [slug.split(':', 1)[1] for slug in slugs if slug.startswith('builtin:')]
+remote_slugs = [slug for slug in slugs if not slug.startswith('builtin:')]
+
+if builtin_slugs:
+    from hermes_constants import get_bundled_skills_dir
+
+    bundled_root = get_bundled_skills_dir()
+    for skill_name in builtin_slugs:
+        matches = [
+            skill_md.parent
+            for skill_md in bundled_root.rglob('SKILL.md')
+            if skill_md.parent.name == skill_name
+        ] if bundled_root.is_dir() else []
+        if len(matches) != 1:
+            installed.append({
+                'skill': 'builtin:' + skill_name,
+                'status': 'failed',
+                'source': 'builtin',
+                'output': f'Expected exactly one bundled skill named {skill_name}; found {len(matches)}',
+            })
+            continue
+        source = matches[0]
+        relative = source.relative_to(bundled_root)
+        destination = profile_dir / 'skills' / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+        installed.append({
+            'skill': 'builtin:' + skill_name,
+            'status': 'success',
+            'source': 'builtin',
+            'path': str(destination),
+            'output': 'Installed from the audited AOPS offline bundle.',
+        })
+
+if remote_slugs:
     from rich.console import Console
     from hermes_cli.skills_hub import do_install
     import tools.skills_hub as hub
@@ -3047,7 +3109,7 @@ if slugs:
     hub.create_source_router = lambda auth=None: [ClawHubSource()]
     try:
         params = inspect.signature(do_install).parameters
-        for slug in slugs:
+        for slug in remote_slugs:
             stream = io.StringIO()
             console = Console(file=stream, force_terminal=False, color_system=None, width=120)
             status = 'success'
@@ -3084,6 +3146,8 @@ if slugs:
         hub.create_source_router = original_router
 
 print(json.dumps({'installed': installed}, ensure_ascii=False))
+if any(item.get('source') == 'builtin' and item.get('status') == 'failed' for item in installed):
+    raise SystemExit(1)
 PY"
   if [[ "$(id -u)" -eq 0 ]]; then
     chown -R "$TARGET_USER":"$TARGET_USER" "$profile_dir/skills" 2>/dev/null || true
@@ -3654,6 +3718,31 @@ if [[ "$SYNC_OTHER_PROFILES" == true ]]; then
   apply_other_profile_configs
 fi
 
+PDF_CAPABILITIES_RESULT_JSON="$WORK_DIR/pdf-capabilities.json"
+begin_stage "enable_pdf_capabilities"
+if [[ "$CURRENT_PROFILE_CONFIG_OK" == true ]]; then
+  if ensure_aops_pdf_capabilities_for_profile "$PROFILE_NAME" | tee "$PDF_CAPABILITIES_RESULT_JSON"; then
+    if python3 - "$PDF_CAPABILITIES_RESULT_JSON" <<'PY'
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+raise SystemExit(0 if data.get('changed') else 1)
+PY
+    then
+      APPLY_CHANGED=true
+    fi
+  else
+    CURRENT_PROFILE_CONFIG_OK=false
+    if [[ "$SYNC_OTHER_PROFILES" == true ]]; then
+      record_profile_sync_result "$PROFILE_NAME" "failed" "" "" "0" "PDF capability migration failed"
+    else
+      fail "PDF capability migration failed for profile $PROFILE_NAME"
+    fi
+  fi
+else
+  printf '{"ok":false,"changed":false,"code":"config_invalid"}\n' > "$PDF_CAPABILITIES_RESULT_JSON"
+fi
+
 begin_stage "validate_aops_gateway_config"
 if [[ "$CURRENT_PROFILE_CONFIG_OK" == true ]]; then
   log "Validating AOPS gateway config for profile $PROFILE_NAME"
@@ -3665,6 +3754,23 @@ if [[ "$CURRENT_PROFILE_CONFIG_OK" == true ]]; then
       fail "AOPS config validation failed for profile $PROFILE_NAME"
     fi
   fi
+fi
+
+VISION_PROBE_RESULT_JSON="$WORK_DIR/model-vision-probe.json"
+begin_stage "probe_model_vision"
+if [[ "$CURRENT_PROFILE_CONFIG_OK" == true ]]; then
+  profile_home="$(profile_home_for "$PROFILE_NAME")"
+  log "Probing image input for profile $PROFILE_NAME"
+  set +e
+  run_as_target "HERMES_HOME=$(shell_quote "$profile_home") $(shell_quote "$INSTALL_DIR/venv/bin/python") -m tools.aops_vision_probe" | tee "$VISION_PROBE_RESULT_JSON"
+  vision_probe_status=$?
+  set -e
+  if [[ "$vision_probe_status" -ne 0 ]]; then
+    warn "Qwen image-input probe failed; normal PDF text extraction remains available, but scanned/graphics-heavy PDF pages require a working vision endpoint. See $VISION_PROBE_RESULT_JSON"
+    append_restart_summary "diagnostics" "$PROFILE_NAME" "model vision probe failed; PDF visual pages will report a clear vision error"
+  fi
+else
+  printf '{"ok":false,"code":"config_invalid","error":"AOPS profile config validation failed"}\n' > "$VISION_PROBE_RESULT_JSON"
 fi
 
 begin_stage "skills_preinstall"

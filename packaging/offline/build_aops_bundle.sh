@@ -17,6 +17,7 @@ HINDSIGHT_WHEEL_DIR="${HINDSIGHT_WHEEL_DIR:-/private/tmp/hindsight-linux-wheel-c
 AOPS_WHEEL_CACHE_DIR="${AOPS_WHEEL_CACHE_DIR:-/private/tmp/hermes-aops-linux-wheel-cache}"
 AOPS_WHEEL_REQUIREMENTS=(
   "aiohttp==3.13.4"
+  "PyMuPDF==1.26.0"
 )
 HINDSIGHT_WHEEL_REQUIREMENTS=(
   "hindsight-client==0.6.1"
@@ -206,6 +207,19 @@ while IFS= read -r rel; do
   cp "$src" "$dst"
   printf '%s\n' "$rel" >> "$MANIFEST_PATH"
 done < "$RUNTIME_FILE_LIST"
+
+# The AOPS profile intentionally disables the full bundled skill library, but
+# PDF attachment handling depends on this one audited skill. Stage it as
+# packaged data and install it explicitly from the profile template.
+PDF_SKILL_DIR="skills/productivity/ocr-and-documents"
+while IFS= read -r rel; do
+  [[ -n "$rel" ]] || continue
+  src="$REPO_ROOT/$rel"
+  dst="$BUNDLE_DIR/overlay/$rel"
+  mkdir -p "$(dirname "$dst")"
+  cp "$src" "$dst"
+  printf '%s\n' "$rel" >> "$MANIFEST_PATH"
+done < <(find "$REPO_ROOT/$PDF_SKILL_DIR" -type f ! -path '*/__pycache__/*' -print | sed "s#^$REPO_ROOT/##" | sort)
 
 "$PYTHON_BIN" "$SCRIPT_DIR/web_dist_overlay.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
 "$PYTHON_BIN" "$SCRIPT_DIR/verify_overlay_imports.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
