@@ -71,6 +71,8 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "aops-channel-interface.md" in build
     assert "AOPS_WHEEL_REQUIREMENTS" in build
     assert "aiohttp==3.13.4" in build
+    assert "PyMuPDF==1.26.0" in build
+    assert 'PDF_SKILL_DIR="skills/productivity/ocr-and-documents"' in build
     assert "hindsight-client==0.6.1" in build
     assert "ensure_hindsight_runtime_wheels" in build
     assert "ensure_aops_runtime_wheels" in build
@@ -111,6 +113,13 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "top_level_skills = payload.get(\"skills\")" in script
     assert "config_block[\"skills\"] = deepcopy(top_level_skills)" in script
     assert "install_preinstall_skills" in script
+    assert "builtin:ocr-and-documents" in script
+    assert "get_bundled_skills_dir" in script
+    assert "tools.aops_vision_probe" in script
+    assert "tools.aops_pdf_setup" in script
+    assert "ensure_aops_pdf_capabilities_for_profile" in script
+    assert 'slugs.insert(0, \'builtin:ocr-and-documents\')' in script
+    assert "model-vision-probe.json" in script
     assert "--skip-skills" in script
     assert "skills-preinstall-result.json" in script
     assert "hub.create_source_router = lambda auth=None: [ClawHubSource()]" in script
@@ -189,6 +198,34 @@ def test_tec01_oneclick_aops_validation_is_lightweight():
     assert "AOPS_BOT_URL" in validation
     assert "AOPS_BASE_URL" in validation
     assert "connectedPlatforms" in validation
+
+
+def test_oneclick_installs_bundled_pdf_skill_without_clawhub(tmp_path):
+    script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
+    installer = tmp_path / "install_builtin.py"
+    start = script.index("install_preinstall_skills() {")
+    body_start = script.index("<<'PY'\n", start) + len("<<'PY'\n")
+    body_end = script.index("\nPY\"", body_start)
+    installer.write_text(script[body_start:body_end], encoding="utf-8")
+    profile = tmp_path / "profile"
+    payload = tmp_path / "payload.json"
+    # The audited PDF skill is mandatory even for old/custom payloads that do
+    # not yet contain the new skills.preinstall template entry.
+    payload.write_text(json.dumps({}), encoding="utf-8")
+    env = os.environ.copy()
+    env["HERMES_BUNDLED_SKILLS"] = str(Path("skills").resolve())
+
+    completed = subprocess.run(
+        [sys.executable, str(installer), str(payload), str(profile)],
+        check=True,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    result = json.loads(completed.stdout)
+    assert result["installed"][0]["status"] == "success"
+    assert (profile / "skills" / "productivity" / "ocr-and-documents" / "SKILL.md").is_file()
 
 
 def test_dist_oneclick_aops_validation_matches_source_script():
@@ -277,8 +314,12 @@ def test_aops_profile_template_defaults_to_terminal_linux_toolsets():
     assert "    - file" in template
     assert "    - code_execution" in template
     assert "    - messaging" in template
+    assert "    - vision" in template
+    assert "supports_vision: true" in template
+    assert "builtin:ocr-and-documents" in template
     assert "disabled:" in template
     assert "          - browser" in template
+    assert "          - vision" not in template
     assert "          - web" in template
     assert "unsupportedReasons:" in template
     assert "bank_id_template: users-{user}" not in template

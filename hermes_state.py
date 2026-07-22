@@ -3023,7 +3023,12 @@ class SessionDB:
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
                 f"FROM messages WHERE session_id IN ({placeholders})"
-                f"{active_clause} ORDER BY timestamp, id",
+                # Message timestamps are platform metadata, not a sequencing
+                # primitive.  Remote clocks can be skewed (and local clocks
+                # can move backwards), while the AUTOINCREMENT id records the
+                # actual persistence order and preserves assistant/tool-call
+                # adjacency.
+                f"{active_clause} ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
 

@@ -716,6 +716,9 @@ async def _vision_analyze_native(
         resolved_url = image_url
         if resolved_url.startswith("file://"):
             resolved_url = resolved_url[len("file://"):]
+        from tools.credential_files import from_agent_visible_cache_path
+
+        resolved_url = from_agent_visible_cache_path(resolved_url)
         local_path = Path(os.path.expanduser(resolved_url))
 
         if local_path.is_file():
@@ -869,6 +872,9 @@ async def vision_analyze_tool(
         resolved_url = image_url
         if resolved_url.startswith("file://"):
             resolved_url = resolved_url[len("file://"):]
+        from tools.credential_files import from_agent_visible_cache_path
+
+        resolved_url = from_agent_visible_cache_path(resolved_url)
         local_path = Path(os.path.expanduser(resolved_url))
         if local_path.is_file():
             # Local file path (e.g. from platform image cache) -- skip download
@@ -1371,6 +1377,9 @@ async def video_analyze_tool(
         resolved_url = video_url
         if resolved_url.startswith("file://"):
             resolved_url = resolved_url[len("file://"):]
+        from tools.credential_files import from_agent_visible_cache_path
+
+        resolved_url = from_agent_visible_cache_path(resolved_url)
         local_path = Path(os.path.expanduser(resolved_url))
 
         if local_path.is_file():

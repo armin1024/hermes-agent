@@ -67,6 +67,7 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_AOPS_TIMESTAMP_SKEW_WARN_SECS = 300.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _AOPS_RESERVED_MODEL_TOKENS = {"status", "current", "list", "use", "stutus", "stauts", "stattus", "statsu", "curent"}
 
@@ -794,6 +795,49 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
         return bool(mt.get("enabled", False))
     # Allow a bare ``message_timestamps: true`` shorthand.
     return bool(mt)
+
+
+def _warn_on_aops_timestamp_skew(
+    source: Any,
+    event: Any,
+    event_epoch: Optional[float],
+    *,
+    received_epoch: Optional[float] = None,
+    warned_sessions: Optional[set[str]] = None,
+) -> bool:
+    """Log large AOPS clock skew without exposing message content.
+
+    Platform timestamps remain useful metadata, but are deliberately not used
+    to sequence transcript rows.  This diagnostic makes upstream timezone or
+    clock issues visible without mutating the original timestamp.
+    """
+    if event_epoch is None:
+        return False
+    platform = getattr(source, "platform", None)
+    platform_value = getattr(platform, "value", platform)
+    if platform_value != "aops":
+        return False
+    received = time.time() if received_epoch is None else float(received_epoch)
+    skew = float(event_epoch) - received
+    if abs(skew) <= _AOPS_TIMESTAMP_SKEW_WARN_SECS:
+        return False
+    session_key = str(getattr(source, "chat_id", None) or "-")
+    if warned_sessions is not None:
+        if session_key in warned_sessions:
+            return False
+        # Bound process-lifetime diagnostic state for gateways that see many
+        # one-off conversations.  Clearing only affects warning suppression.
+        if len(warned_sessions) >= 1024:
+            warned_sessions.clear()
+        warned_sessions.add(session_key)
+    logger.warning(
+        "AOPS inbound timestamp skew session=%s messageId=%s skewSeconds=%.1f; "
+        "preserving platform timestamp as metadata; transcript order uses insertion id",
+        session_key,
+        getattr(event, "message_id", None) or "-",
+        skew,
+    )
+    return True
 
 
 def _build_gateway_agent_history(
@@ -2037,6 +2081,17 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
             f"[The user sent a text document: '{display_name}'. "
             f"Its content has been included below. "
             f"The file is also saved at: {agent_path}]"
+        )
+    if mtype == "application/pdf" or display_name.lower().endswith(".pdf"):
+        return (
+            f"[The user sent a PDF document: '{display_name}'. It is saved at: {agent_path}. "
+            f"Its content is not inlined here. If the user's request involves the PDF's "
+            f"contents, call read_file on that path. read_file extracts text and returns "
+            f"rendered image paths for scanned or graphics-heavy pages; call vision_analyze "
+            f"on the relevant rendered pages and combine those results with the page-numbered "
+            f"text. If PDF parsing reports dependency_missing, explain that the AOPS PDF "
+            f"runtime is unavailable. Do not claim the PDF was parsed; continue without "
+            f"requesting pasted contents.]"
         )
     return (
         f"[The user sent a document: '{display_name}'. It is saved at: {agent_path}. "
@@ -10582,6 +10637,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp = (
                     _event_epoch if _event_epoch is not None else _embedded_ts
                 )
+                _timestamp_warned_sessions = getattr(
+                    self, "_aops_timestamp_skew_warned_sessions", None,
+                )
+                if _timestamp_warned_sessions is None:
+                    _timestamp_warned_sessions = set()
+                    self._aops_timestamp_skew_warned_sessions = _timestamp_warned_sessions
+                _warn_on_aops_timestamp_skew(
+                    source,
+                    event,
+                    persist_user_timestamp,
+                    warned_sessions=_timestamp_warned_sessions,
+                )
                 if _message_timestamps_enabled(_load_gateway_config()):
                     message_text = _render_msg_ts(
                         _clean_message_text,
@@ -10687,19 +10754,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _response_time, _api_calls, _resp_len,
             )
 
-            # Re-baseline the cached agent's message_count snapshot now that
-            # this turn has completed and the agent has flushed its rows to
-            # the SessionDB.  The cross-process coherence guard (#45966)
-            # snapshots the count at agent-BUILD time (before this turn's own
-            # writes) and never refreshes it on reuse — so without this, this
-            # process's own turn would grow the count and the next turn would
-            # see a mismatch and rebuild the agent every turn, destroying
-            # prompt caching.  Refreshing here makes the guard fire only on a
-            # DIFFERENT process's writes.  Uses the (possibly compaction-
-            # updated) live session_id.  Fail-safe inside the helper.
-            self._refresh_agent_cache_message_count(
-                session_key, session_entry.session_id
-            )
             self._finish_aops_memory_stale_agent(session_key)
 
             # Successful turn — clear any stuck-loop counter for this session.
@@ -11042,6 +11096,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self.session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+            )
+
+            # Re-baseline only after every write owned by this turn is done.
+            # In particular, a fresh gateway session appends ``session_meta``
+            # above after AIAgent has flushed user/assistant/tool rows.  Taking
+            # the snapshot before that metadata row made the next message see
+            # a false 4 -> 5 "cross-process" change and evict the live agent.
+            # The session id may also have changed during compression, so use
+            # the synchronized entry here rather than the pre-run id.
+            self._refresh_agent_cache_message_count(
+                session_key, session_entry.session_id
             )
 
             # Intentional silence is a delivery decision, not a transcript
@@ -16910,16 +16975,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # history and attached to the current addressed message as
             # API-only context, so persisted history stores only the real
             # addressed user turn.
-            agent_history, observed_group_context = _build_gateway_agent_history(
-                history,
-                channel_prompt=channel_prompt,
-                inject_timestamps=_message_timestamps_enabled(_load_gateway_config()),
+            # A valid AOPS cache entry already owns the canonical live agent
+            # transcript.  Do not rebuild/filter the SessionDB copy first: a
+            # recovery warning on this path is misleading, and malformed DB
+            # ordering must never replace a valid live conversation.  Other
+            # platforms retain the existing builder because Telegram observed
+            # group context is extracted there.
+            _cached_live_history = (
+                _live_agent_conversation_history(agent)
+                if _agent_from_cache and source.platform == Platform.AOPS
+                else []
             )
-            _conversation_history, _conversation_history_source = _select_gateway_conversation_history(
-                agent,
-                agent_history,
-                cached_agent=_agent_from_cache,
-            )
+            if _cached_live_history:
+                agent_history = []
+                observed_group_context = None
+                _conversation_history = _cached_live_history
+                _conversation_history_source = "live_agent"
+            else:
+                agent_history, observed_group_context = _build_gateway_agent_history(
+                    history,
+                    channel_prompt=channel_prompt,
+                    inject_timestamps=_message_timestamps_enabled(_load_gateway_config()),
+                )
+                _conversation_history, _conversation_history_source = _select_gateway_conversation_history(
+                    agent,
+                    agent_history,
+                    cached_agent=_agent_from_cache,
+                )
             logger.debug(
                 "Gateway conversation history for session %s: source=%s count=%d recovered_count=%d",
                 session_key or session_id or "?",

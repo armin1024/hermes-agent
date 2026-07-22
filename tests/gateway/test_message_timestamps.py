@@ -1,4 +1,5 @@
 from datetime import datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from gateway.message_timestamps import (
@@ -115,6 +116,64 @@ def test_message_timestamps_enabled_when_opted_in():
     ) is True
     # Bare shorthand also accepted.
     assert _message_timestamps_enabled({"gateway": {"message_timestamps": True}}) is True
+
+
+def test_aops_timestamp_skew_is_diagnosed_without_message_content(caplog):
+    from gateway.run import _warn_on_aops_timestamp_skew
+
+    source = SimpleNamespace(platform="aops", chat_id="conv-skew")
+    event = SimpleNamespace(message_id="msg-skew")
+
+    with caplog.at_level("WARNING"):
+        warned = _warn_on_aops_timestamp_skew(
+            source,
+            event,
+            1000.0 + (8 * 60 * 60),
+            received_epoch=1000.0,
+        )
+
+    assert warned is True
+    assert "skewSeconds=28800.0" in caplog.text
+    assert "transcript order uses insertion id" in caplog.text
+    assert "secret message body" not in caplog.text
+
+
+def test_non_aops_or_small_timestamp_skew_is_not_logged(caplog):
+    from gateway.run import _warn_on_aops_timestamp_skew
+
+    event = SimpleNamespace(message_id="msg")
+    assert _warn_on_aops_timestamp_skew(
+        SimpleNamespace(platform="aops", chat_id="conv"),
+        event,
+        1120.0,
+        received_epoch=1000.0,
+    ) is False
+    assert _warn_on_aops_timestamp_skew(
+        SimpleNamespace(platform="telegram", chat_id="chat"),
+        event,
+        10000.0,
+        received_epoch=1000.0,
+    ) is False
+    assert not caplog.records
+
+
+def test_aops_timestamp_skew_warning_is_once_per_session(caplog):
+    from gateway.run import _warn_on_aops_timestamp_skew
+
+    warned_sessions = set()
+    source = SimpleNamespace(platform="aops", chat_id="conv-once")
+    event = SimpleNamespace(message_id="msg")
+    with caplog.at_level("WARNING"):
+        assert _warn_on_aops_timestamp_skew(
+            source, event, 30_000.0, received_epoch=1_000.0,
+            warned_sessions=warned_sessions,
+        ) is True
+        assert _warn_on_aops_timestamp_skew(
+            source, event, 31_000.0, received_epoch=1_000.0,
+            warned_sessions=warned_sessions,
+        ) is False
+
+    assert caplog.text.count("AOPS inbound timestamp skew") == 1
 
 
 def test_build_history_injects_only_when_enabled():

@@ -55,3 +55,9 @@ class TestBinaryDocumentNote:
         # The text path claims content is inlined; the binary path must not.
         assert "included below" in text_note
         assert "included below" not in pdf_note
+
+    def test_pdf_note_routes_through_read_file_then_vision(self):
+        note = _build_document_context_note("scan.pdf", "/cache/scan.pdf", "application/pdf")
+        assert "read_file" in note
+        assert "vision_analyze" in note
+        assert "dependency_missing" in note

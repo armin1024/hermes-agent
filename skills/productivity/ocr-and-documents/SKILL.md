@@ -17,7 +17,22 @@ For DOCX: use `python-docx` (parses actual document structure, far better than O
 For PPTX: see the `powerpoint` skill (uses `python-pptx` with full slide/notes support).
 This skill covers **PDFs and scanned documents**.
 
-## Step 1: Remote URL Available?
+## Step 1: Local Hermes/AOPS Attachment
+
+For a local PDF path supplied by Hermes, call `read_file` first. It performs
+bounded page-level extraction and returns:
+
+- page-numbered text for normal PDF pages;
+- `pdf.mode` (`text`, `visual`, or `mixed`);
+- `pdf.rendered_pages[].image_path` for scanned or graphics-heavy pages.
+
+When `rendered_pages` is non-empty, call `vision_analyze` on the pages relevant
+to the user's question, then merge the visual findings with the extracted text.
+Do not claim a visual page was parsed unless `vision_analyze` succeeded. If
+`read_file` returns `code=dependency_missing`, report that the AOPS PDF runtime
+is unavailable; normal text-file reading is not a substitute for PDF parsing.
+
+## Step 2: Remote URL Available?
 
 If the document has a URL, **always try `web_extract` first**:
 
@@ -30,7 +45,7 @@ This handles PDF-to-markdown conversion via Firecrawl with no local dependencies
 
 Only use local extraction when: the file is local, web_extract fails, or you need batch processing.
 
-## Step 2: Choose Local Extractor
+## Step 3: Choose Local Extractor
 
 | Feature | pymupdf (~25MB) | marker-pdf (~3-5GB) |
 |---------|-----------------|---------------------|
@@ -49,7 +64,9 @@ Only use local extraction when: the file is local, web_extract fails, or you nee
 | **Install size** | ~25MB | ~3-5GB (PyTorch + models) |
 | **Speed** | Instant | ~1-14s/page (CPU), ~0.2s/page (GPU) |
 
-**Decision**: Use pymupdf unless you need OCR, equations, forms, or complex layout analysis.
+**Decision**: Use the Hermes PyMuPDF pipeline unless you need offline OCR,
+equations, forms, or advanced layout reconstruction. The normal AOPS path uses
+Qwen vision on rendered pages instead of installing a local OCR model.
 
 If the user needs marker capabilities but the system lacks ~5GB free disk:
 > "This document needs OCR/advanced extraction (marker-pdf), which requires ~5GB for PyTorch and models. Your system has [X]GB free. Options: free up space, provide a URL so I can use web_extract, or I can try pymupdf which works for text-based PDFs but not scanned documents or equations."
@@ -58,29 +75,23 @@ If the user needs marker capabilities but the system lacks ~5GB free disk:
 
 ## pymupdf (lightweight)
 
+The AOPS offline bundle includes `PyMuPDF==1.26.0`. Other installations can use:
+
 ```bash
-pip install pymupdf pymupdf4llm
+pip install PyMuPDF==1.26.0
 ```
 
 **Via helper script**:
 ```bash
-python scripts/extract_pymupdf.py document.pdf              # Plain text
-python scripts/extract_pymupdf.py document.pdf --markdown    # Markdown
-python scripts/extract_pymupdf.py document.pdf --tables      # Tables
-python scripts/extract_pymupdf.py document.pdf --images out/ # Extract images
-python scripts/extract_pymupdf.py document.pdf --metadata    # Title, author, pages
-python scripts/extract_pymupdf.py document.pdf --pages 0-4   # Specific pages
+python scripts/extract_pymupdf.py document.pdf              # Page-numbered text + image paths
+python scripts/extract_pymupdf.py document.pdf --json       # hermes.pdf-extraction.v1
+python scripts/extract_pymupdf.py document.pdf --pages 0-4  # Specific output pages
+python scripts/extract_pymupdf.py document.pdf --dpi 180 --max-pages 50
 ```
 
-**Inline**:
-```bash
-python3 -c "
-import pymupdf
-doc = pymupdf.open('document.pdf')
-for page in doc:
-    print(page.get_text())
-"
-```
+Safety defaults are 50 MiB, 100 pages, 20 rendered pages, 60 million rendered
+pixels, 180 DPI, and 60 seconds. Rendered pages go to the existing Hermes image
+cache and are cleaned by gateway housekeeping.
 
 ---
 
@@ -164,7 +175,9 @@ No extra dependencies needed — pymupdf covers split, merge, search, and text e
 ## Notes
 
 - `web_extract` is always first choice for URLs
-- pymupdf is the safe default — instant, no models, works everywhere
+- pymupdf is the safe default for extraction and full-page rendering
+- `pdfimages` is optional for exporting original embedded bitmaps; it is not the
+  parsing path because it cannot extract text, render complete pages, or perform OCR
 - marker-pdf is for OCR, scanned docs, equations, complex layouts — install only when needed
 - Both helper scripts accept `--help` for full usage
 - marker-pdf downloads ~2.5GB of models to `~/.cache/huggingface/` on first use

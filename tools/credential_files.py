@@ -24,7 +24,7 @@ import logging
 import os
 import posixpath
 from contextvars import ContextVar
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional
 from hermes_cli.config import cfg_get
 
@@ -400,6 +400,43 @@ def map_cache_path_to_container(
     return None
 
 
+def from_agent_visible_cache_path(
+    agent_path: str,
+    container_base: str = "/root/.hermes",
+) -> str:
+    """Translate a sandbox-visible cache path back to its host path.
+
+    Gateway attachment notes use container paths when the terminal backend is
+    Docker.  Host-side tools such as ``read_file`` document extraction and
+    ``vision_analyze`` still need the real cache path.  Only the known cache
+    roots are reversible; arbitrary container paths are returned unchanged.
+    """
+    raw = str(agent_path or "")
+    expanded = Path(raw).expanduser()
+    if expanded.is_file():
+        return str(expanded)
+    normalized = PurePosixPath(raw)
+    base = PurePosixPath(container_base.rstrip("/"))
+    for new_subpath, old_name in _CACHE_DIRS:
+        container_dir = base / PurePosixPath(new_subpath)
+        try:
+            rel = normalized.relative_to(container_dir)
+        except ValueError:
+            continue
+        if any(part in {"", ".", ".."} for part in rel.parts):
+            return raw
+        from hermes_constants import get_hermes_dir
+
+        host_dir = get_hermes_dir(new_subpath, old_name).resolve()
+        candidate = (host_dir / Path(*rel.parts)).resolve()
+        try:
+            candidate.relative_to(host_dir)
+        except ValueError:
+            return raw
+        return str(candidate)
+    return raw
+
+
 def to_agent_visible_cache_path(
     host_path: str,
     container_base: str = "/root/.hermes",
@@ -451,5 +488,3 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
-

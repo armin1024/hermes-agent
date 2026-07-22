@@ -491,6 +491,45 @@ class TestAgentCacheLifecycle:
         assert source == "canonical_replay"
         assert history == recovered
 
+    def test_skewed_persisted_turn_remains_canonical_after_recovery(self, tmp_path):
+        """The reported AOPS failure: future user timestamp, local tool rows."""
+        from gateway.run import _build_gateway_agent_history
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db.create_session("aops-skew", source="aops")
+        db.append_message(
+            "aops-skew", "user", "你能帮我处理这个事件吗", timestamp=20_000,
+        )
+        db.append_message(
+            "aops-skew",
+            "assistant",
+            "我来查询",
+            tool_calls=[{
+                "id": "call_58",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+            finish_reason="tool_calls",
+            timestamp=1_000,
+        )
+        db.append_message(
+            "aops-skew", "tool", "event 58", tool_name="terminal",
+            tool_call_id="call_58", timestamp=1_001,
+        )
+        db.append_message(
+            "aops-skew", "assistant", "事件详情", finish_reason="stop", timestamp=1_002,
+        )
+
+        restored = db.get_messages_as_conversation("aops-skew")
+        replay, _ = _build_gateway_agent_history(restored)
+
+        assert [message["role"] for message in replay] == [
+            "user", "assistant", "tool", "assistant",
+        ]
+        assert replay[0]["content"] == "你能帮我处理这个事件吗"
+        assert replay[2]["tool_call_id"] == "call_58"
+
     def test_cache_miss_on_model_change(self):
         """Model change produces different signature → cache miss."""
         from run_agent import AIAgent
@@ -1710,6 +1749,41 @@ class TestAgentCacheMessageCountRebaseline:
 
         # Guard must now reject reuse so the agent rebuilds from fresh disk.
         assert self._guard_would_reuse(runner, "telegram:s1", "s1") is False
+
+    def test_first_turn_rebaseline_includes_late_session_meta(self, tmp_path):
+        """A first-turn session_meta row must be included in the snapshot.
+
+        The production ordering is AIAgent flush, gateway session_meta append,
+        then re-baseline.  Refreshing between the first two steps caused the
+        reported false 4 -> 5 cross-process invalidation on turn two.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db.create_session("s1", source="aops")
+        runner = self._runner_with_db(db)
+        agent = object()
+        with runner._agent_cache_lock:
+            runner._agent_cache["aops:s1"] = (agent, "sig", 0)
+
+        db.append_message("s1", role="user", content="question")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="calling",
+            tool_calls=[{"id": "call_1", "function": {"name": "terminal", "arguments": "{}"}}],
+        )
+        db.append_message(
+            "s1", role="tool", content="result", tool_call_id="call_1",
+        )
+        db.append_message("s1", role="assistant", content="answer")
+        db.append_message("s1", role="session_meta", content=None)
+
+        runner._refresh_agent_cache_message_count("aops:s1", "s1")
+
+        with runner._agent_cache_lock:
+            assert runner._agent_cache["aops:s1"][2] == 5
+        assert self._guard_would_reuse(runner, "aops:s1", "s1") is True
 
     def test_rebaseline_is_fail_safe_and_skips_legacy_and_pending(self, tmp_path):
         """Re-baseline must never crash and must leave legacy 2-tuples and

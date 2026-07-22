@@ -799,6 +799,104 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         _resolved = _resolve_path_for_task(path, task_id)
 
+        # ── PDF extraction + visual-page rendering ───────────────────
+        # PDF attachments may be presented to the model using a Docker-visible
+        # cache path.  The file and vision tools run in the Hermes process, so
+        # reverse that known cache mapping before opening the document.
+        if _resolved.suffix.lower() == ".pdf":
+            from tools.credential_files import (
+                from_agent_visible_cache_path,
+                to_agent_visible_cache_path,
+            )
+            from tools.pdf_extraction import PDFExtractionError, analyze_pdf
+
+            local_pdf_path = Path(from_agent_visible_cache_path(str(_resolved)))
+            try:
+                pdf_result = analyze_pdf(local_pdf_path)
+            except PDFExtractionError as exc:
+                return json.dumps({
+                    "error": str(exc),
+                    "code": exc.code,
+                    "document_type": "pdf",
+                    "path": path,
+                }, ensure_ascii=False)
+
+            rendered_pages = []
+            extracted_lines = []
+            for page in pdf_result["pages"]:
+                extracted_lines.append(
+                    f"--- Page {page['page']}/{pdf_result['page_count']} [{page['mode']}] ---"
+                )
+                if page.get("text"):
+                    extracted_lines.extend(str(page["text"]).splitlines())
+                else:
+                    extracted_lines.append("[No extractable text on this page.]")
+                rendered_image = page.get("rendered_image")
+                if rendered_image:
+                    agent_image = to_agent_visible_cache_path(rendered_image)
+                    rendered_pages.append({
+                        "page": page["page"],
+                        "image_path": agent_image,
+                        "reason": page.get("render_reason", "visual_page"),
+                    })
+                    extracted_lines.append(
+                        f"[Use vision_analyze on {agent_image} to inspect this page.]"
+                    )
+                elif page.get("render_skipped"):
+                    extracted_lines.append(
+                        f"[Page rendering skipped: {page['render_skipped']}.]"
+                    )
+                extracted_lines.append("")
+
+            total_lines = len(extracted_lines)
+            end_line = offset + limit - 1
+            page_text = "\n".join(extracted_lines[offset - 1:end_line])
+            file_ops = _get_file_ops(task_id)
+            content = file_ops._add_line_numbers(page_text, offset) if page_text else ""
+            max_chars = _get_max_read_chars()
+            if len(content) > max_chars:
+                return json.dumps({
+                    "error": (
+                        f"PDF extraction produced {len(content):,} characters which exceeds "
+                        f"the safety limit ({max_chars:,} chars). Use offset and limit to "
+                        "read a smaller page of the extracted result."
+                    ),
+                    "document_type": "pdf",
+                    "path": path,
+                    "total_lines": total_lines,
+                    "file_size": pdf_result["file_size"],
+                }, ensure_ascii=False)
+            if content:
+                content = redact_sensitive_text(content, code_file=True)
+            result_dict = {
+                "content": content,
+                "total_lines": total_lines,
+                "file_size": pdf_result["file_size"],
+                "truncated": total_lines > end_line or pdf_result["truncated"],
+                "extracted_document": True,
+                "document_type": "pdf",
+                "pdf": {
+                    "schema_version": pdf_result["schema_version"],
+                    "page_count": pdf_result["page_count"],
+                    "processed_pages": pdf_result["processed_pages"],
+                    "mode": pdf_result["mode"],
+                    "dpi": pdf_result["dpi"],
+                    "rendered_pages": rendered_pages,
+                    "warnings": pdf_result["warnings"],
+                },
+            }
+            if total_lines > end_line:
+                result_dict["hint"] = (
+                    f"Use offset={end_line + 1} to continue reading "
+                    f"(showing {offset}-{min(end_line, total_lines)} of {total_lines} lines)."
+                )
+            if rendered_pages:
+                result_dict["vision_hint"] = (
+                    "Call vision_analyze for each rendered page relevant to the user's "
+                    "question, then combine that analysis with the extracted text and page numbers."
+                )
+            return json.dumps(result_dict, ensure_ascii=False)
+
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
         # Malformed documents fall through to the normal path/binary guard.
@@ -1512,7 +1610,7 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are rejected; use offset and limit to read specific sections of large files. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
+    "description": "Read a text or document file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are rejected; use offset and limit to read specific sections of large files. PDF, Jupyter notebook (.ipynb), Word (.docx), and Excel (.xlsx) files are auto-extracted. PDF pages with little text or meaningful graphics are rendered to images and returned with paths for vision_analyze. NOTE: Standalone image files must be read with vision_analyze.",
     "parameters": {
         "type": "object",
         "properties": {

@@ -721,6 +721,64 @@ class TestMessageStorage:
         assert conv[1]["content"] == "Hi!"
         assert isinstance(conv[1]["timestamp"], float)
 
+    def test_conversation_replay_uses_insertion_order_not_platform_timestamp(self, db):
+        """Remote clock skew must not orphan a complete tool turn.
+
+        AOPS has emitted local wall-clock values marked as UTC, putting the
+        persisted user timestamp roughly eight hours after the assistant/tool
+        rows written by the gateway.  SQLite ids still reflect the true turn
+        order and are the only safe replay sequence.
+        """
+        db.create_session(session_id="aops-skew", source="aops")
+        future_user_ts = 1784731216.763253
+        local_gateway_ts = 1784702365.7746243
+        tool_calls = [
+            {
+                "id": "call_event_58",
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command":"aops-cli event-center info --id 58"}',
+                },
+            }
+        ]
+
+        db.append_message(
+            "aops-skew", role="user", content="处理事件 58", timestamp=future_user_ts,
+        )
+        db.append_message(
+            "aops-skew",
+            role="assistant",
+            content="查询事件详情",
+            tool_calls=tool_calls,
+            finish_reason="tool_calls",
+            timestamp=local_gateway_ts,
+        )
+        db.append_message(
+            "aops-skew",
+            role="tool",
+            content='{"id":58}',
+            tool_name="terminal",
+            tool_call_id="call_event_58",
+            timestamp=local_gateway_ts + 0.01,
+        )
+        db.append_message(
+            "aops-skew",
+            role="assistant",
+            content="事件处理建议",
+            finish_reason="stop",
+            timestamp=local_gateway_ts + 0.02,
+        )
+
+        conv = db.get_messages_as_conversation("aops-skew")
+
+        assert [message["role"] for message in conv] == [
+            "user", "assistant", "tool", "assistant",
+        ]
+        assert conv[0]["content"] == "处理事件 58"
+        assert conv[1]["tool_calls"][0]["id"] == "call_event_58"
+        assert conv[2]["tool_call_id"] == "call_event_58"
+
     def test_platform_message_id_round_trips(self, db):
         """Platform-side message ids (yuanbao msg_id, telegram update_id, …)
         survive append → get_messages_as_conversation under the

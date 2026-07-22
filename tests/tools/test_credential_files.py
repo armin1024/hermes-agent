@@ -11,6 +11,7 @@ from tools.credential_files import (
     get_credential_file_mounts,
     get_cache_directory_mounts,
     get_skills_directory_mount,
+    from_agent_visible_cache_path,
     iter_cache_files,
     iter_skills_files,
     map_cache_path_to_container,
@@ -466,6 +467,22 @@ class TestMapCachePathToContainer:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
         assert map_cache_path_to_container(str(hermes_home / "cache" / "images" / "x.png")) is None
+
+    def test_reverses_agent_visible_cache_path(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        document_dir = hermes_home / "cache" / "documents"
+        document_dir.mkdir(parents=True)
+        document = document_dir / "report.pdf"
+        document.write_bytes(b"%PDF-1.4")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        assert from_agent_visible_cache_path(
+            "/root/.hermes/cache/documents/report.pdf"
+        ) == str(document.resolve())
+
+    def test_reverse_mapping_leaves_unrelated_path_unchanged(self):
+        path = "/workspace/report.pdf"
+        assert from_agent_visible_cache_path(path) == path
 
 
 class TestIterCacheFiles:

@@ -22,6 +22,10 @@ profile:
   noBundledSkills: true
   setActive: false
 
+skills:
+  preinstall:
+    - builtin:ocr-and-documents
+
 config:
   env:
     AOPS_BOT_TOKEN: ${env.AOPS_BOT_TOKEN}
@@ -42,6 +46,7 @@ config:
       api_mode: ${configYaml.model.api_mode}
       api_key_env: ${configYaml.model.api_key_env}
       api_key: ${configYaml.model.api_key}
+      supports_vision: true
     memory:
       provider: hindsight
     approvals:
@@ -68,6 +73,7 @@ config:
         - delegation
         - cronjob
         - messaging
+        - vision
       aops:
         - terminal
         - file
@@ -80,13 +86,13 @@ config:
         - delegation
         - cronjob
         - messaging
+        - vision
     aops:
       toolsets:
         # UI-only: toolsets listed here return disabled=true for the frontend
         # toggle control. This does not change the runtime enabled state.
         disabled:
           - browser
-          - vision
           - video
           - image_gen
           - video_gen
