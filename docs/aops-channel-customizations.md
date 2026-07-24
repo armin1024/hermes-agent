@@ -15,6 +15,8 @@
 - AOPS cron 投递支持创建会话 `origin`、可修改 `channelId`、`AOPS_HOME_CHANNEL` 或 gateway config `home_channel`，历史记录查询按时间倒序返回；cron 任务 `channel` 统一为数组，合法值为 `tec01`、`anyi`，存量任务迁移为 `["tec01"]`。AOPS slash command 在会话内创建的任务默认 `deliver="origin"` 并保存创建时的 `channelId`，`channel` 只作为 Tec01/Anyi 前端路由字段。
 - `/cron trigger <id|name>`、create/update payload 的 `triggerNow=true` 会在命令返回后立即后台执行一次，不再等待下一轮 60s scheduler tick。
 - AOPS 本地命令支持 `/soul`、`/user`、`/busy`：可读写当前 profile 的 `SOUL.md`、`memories/USER.md`，并可立即切换 `display.busy_input_mode`，无需重启 gateway。
+- AOPS 本地命令支持 `/event-center use <eventId>|status|clear`：事件处理提示按 profile、channelId 和 agentKey 持久保存，跨 `/new`、`/reset` 保持，后续普通 turn 自动注入。内置 `event-center.v2` 模板采用严格只读策略，只允许事件详情查询，明确禁止事件写操作、消息发送、加载 send-message Skill 以及失败后修正并重试禁止命令。
+- 事件中心提示模板可由当前 profile 的 `~/.hermes/aops/event-center-prompt.md` 覆盖；修改后重新执行 `use` 即可在下一 turn 生效。`status` 返回模板版本、来源和 SHA-256 哈希，Gateway 日志仅记录这些元数据，不记录模板正文。
 - AOPS 工具进度回传增强：`tool.completed` 中间帧包含 `data.tool.result.text/length/truncated`、`durationMs`、`isError`，默认最多 4K 字符；`AOPS_PUSH_TOOL_CALLS=false` 时不发送工具中间帧。
 - tec01 一键安装支持新装/更新、目标用户创建、配置下发、预装技能、Hindsight 和 USER.md 初始化。
 - 离线包安装后会执行自检，确认实际导入的 overlay 不会创建旧 `image_cache/audio_cache` 目录。
@@ -71,7 +73,7 @@ AOPS 的主模型始终来自当前 profile 顶层 `config.yaml.model`。`agent_
 
 收到 `redirect` 时，读取服务端提供的 `targetIp`，关闭当前连接并在 `retryAfterMs` 后使用 `Sec-WebSocket-Protocol: <targetIp>` 定向重连；该目标只用于下一次握手，握手失败或连接再次断开后的普通重连不携带子协议，只有收到新的 redirect 才再次定向。服务端必须在 101 响应中回显该子协议，每次重连都重新发送 `auth`。首次连接不携带目标子协议，Token 不放入子协议。`4001` 停止自动重连，`4002`/`4004` 普通退避重连，只有带有效 IPv4 的 redirect 才使用定向重连。
 
-普通断线重连采用 500ms 起步、30s 封顶并附加 0～500ms 抖动的指数退避。业务任务保留原始 `replyToId` 和出站 `messageId`，已完成终态不会重复投递。
+普通断线重连采用 500ms 起步、30s 封顶并附加 0～500ms 抖动的指数退避。业务任务保留原始 `replyToId` 和出站 `messageId`，已完成终态不会重复投递；终态成功或正在发送后，不同 `messageId` 的晚到帧会被抑制。AOPS 后台 `Self-improvement review` 只写本地日志，不再推送到 Tec01。
 
 所有 AOPS HTTP/WebSocket 鉴权请求继续使用请求头 `tec-client-ip`，但值改为“当前系统用户唯一 UUID”。
 

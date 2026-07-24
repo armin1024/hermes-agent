@@ -1819,6 +1819,13 @@ class MessageEvent:
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Internal startup-restore replay marker.  This must be a real dataclass
+    # field rather than a dynamically attached attribute: channel prompt
+    # injection uses dataclasses.replace(), which deliberately copies declared
+    # fields only.  Losing this marker makes a replayed event look fresh and
+    # can requeue it forever while the startup restore gate is closed.
+    startup_restore_replay: bool = False
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
@@ -2123,6 +2130,21 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+class DeferredReply:
+    """Handler result for an inbound event deferred by gateway startup.
+
+    The adapter must consume this result without sending a response.  The
+    queued event will be replayed through its original adapter dispatch path
+    once startup restore completes.
+    """
+
+    def __bool__(self) -> bool:
+        return False
+
+
+DEFERRED_REPLY = DeferredReply()
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2208,9 +2230,13 @@ _RETRYABLE_ERROR_PATTERNS = (
 
 
 # Type for message handlers.  Handlers may return a plain string (normal
-# reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
-# ``None`` when the response was already delivered (e.g. via streaming).
-MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
+# reply), an ``EphemeralReply`` to opt the reply into auto-deletion, a
+# ``DeferredReply`` when startup restore owns later replay, or ``None`` when
+# the response was already delivered (e.g. via streaming).
+MessageHandler = Callable[
+    [MessageEvent],
+    Awaitable[Optional[Union[str, "EphemeralReply", "DeferredReply"]]],
+]
 
 
 def resolve_channel_prompt(

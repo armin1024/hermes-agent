@@ -34,6 +34,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    DeferredReply,
     MessageEvent,
     MessageType,
     SendResult,
@@ -2450,6 +2451,17 @@ class AopsAdapter(BasePlatformAdapter):
         await self._attach_inbound_attachments(event)
         await self.handle_message(event)
 
+    async def _dispatch_deferred_event(self, event: MessageEvent) -> None:
+        """Replay a startup-deferred event through its original AOPS path."""
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        if self._inbound_is_silent(raw):
+            await self._dispatch_silent_event(event)
+            return
+        # Non-silent attachments were already resolved before the event first
+        # entered BasePlatformAdapter.handle_message().  Re-downloading here
+        # would duplicate media paths and network I/O after startup restore.
+        await self.handle_message(event)
+
     async def _dispatch_silent_event(self, event: MessageEvent) -> None:
         started = time.monotonic()
         response: Any = None
@@ -2504,6 +2516,11 @@ class AopsAdapter(BasePlatformAdapter):
                 ensure_ascii=False,
                 indent=2,
             )
+        if isinstance(response, DeferredReply):
+            # Startup restore owns this event and will replay it through
+            # _dispatch_deferred_event().  Sending an unsupported terminal here
+            # would close the Tec01 turn before the real command runs.
+            return
         if response is None:
             response = json.dumps(
                 {
@@ -2928,6 +2945,32 @@ class AopsAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(data.get("messageId") or ""))
         outbound_message_id = str(data.get("messageId") or "").strip()
         terminal_requested = bool(data.get("conversationEnded")) and bool(reply_to_id)
+        if reply_to_id:
+            committed_id = self._terminal_outbound_by_reply_to.get(reply_to_id)
+            claimed_id = self._terminal_claims_by_reply_to.get(reply_to_id)
+            terminal_message_id = committed_id or claimed_id
+            if terminal_message_id and terminal_message_id != outbound_message_id:
+                # A successful terminal permanently closes one inbound turn.
+                # Consume every later frame from a different outbound stream
+                # without websocket I/O: returning success prevents auxiliary
+                # callbacks from retrying and making their status bubble the
+                # last item rendered by Tec01.
+                logger.warning(
+                    "[%s] late AOPS reply suppressed replyToId=%s "
+                    "messageId=%s terminalMessageId=%s phase=%s kind=%s "
+                    "messageType=%s",
+                    self.name,
+                    reply_to_id,
+                    outbound_message_id or "-",
+                    terminal_message_id,
+                    str(data.get("phase") or "-"),
+                    str(data.get("kind") or "-"),
+                    str(data.get("messageType") or "-"),
+                )
+                return SendResult(
+                    success=True,
+                    message_id=outbound_message_id or terminal_message_id,
+                )
         if terminal_requested:
             committed_id = self._terminal_outbound_by_reply_to.get(reply_to_id)
             claimed_id = self._terminal_claims_by_reply_to.get(reply_to_id)

@@ -69,6 +69,7 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
     assert 'cp "$SCRIPT_DIR/tec01_oneclick_install.sh" "$BUNDLE_DIR/tec01_oneclick_install.sh"' in build
     assert "aops-channel-interface.md" in build
+    assert "aops-event-center-interface.md" in build
     assert "AOPS_WHEEL_REQUIREMENTS" in build
     assert "aiohttp==3.13.4" in build
     assert "PyMuPDF==1.26.0" in build
@@ -99,6 +100,10 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "--sync-other-profiles true|false" in script
     assert "syncOtherProfiles is only supported when updating an existing profile" in script
     assert "build_profile_sync_payload" in script
+    assert "profile_sync_unique_profiles" in script
+    assert script.count("done < <(profile_sync_unique_profiles)") == 2
+    assert "reserved_default_profile_directory_ignored" in script
+    assert "duplicate_profile_skipped" in script
     assert "profile-sync-summary.json" in script
     assert "restart_other_profiles_after_owner_bank_sync" in script
     preflight_call = script.index("resolve_aops_owner_bank_plan | tee")
@@ -137,6 +142,9 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "install-timings.json" in script
     assert "[TIMING] stage=%s durationMs=%s" in script
     assert "wait_for_replacement" in script
+    assert "running_replacement_after_timeout" in script
+    assert "except subprocess.TimeoutExpired" in script
+    assert "timed out and no running replacement" in script
     assert "active_agents = int(before.get(\"active_agents\") or 0)" in script
     assert "drain_timeout = 185 if active_agents > 0 else 30" in script
     assert "AOPS not connected within 15s" in script
@@ -264,6 +272,7 @@ def test_oneclick_profile_sync_payload_filters_tokens_and_skips_skills(tmp_path,
     builder.write_text(_embedded_python(script, "build_profile_sync_payload"), encoding="utf-8")
     home = tmp_path / "home"
     (home / ".hermes" / "profiles" / "ops-1").mkdir(parents=True)
+    (home / ".hermes" / "profiles" / "default").mkdir(parents=True)
     payload = tmp_path / "payload.json"
     payload.write_text(json.dumps({
         "config": {
@@ -305,6 +314,55 @@ def test_oneclick_profile_sync_payload_filters_tokens_and_skips_skills(tmp_path,
     assert "env.AOPS_BOT_TOKEN" in protected
     assert "configYaml.platforms.aops.token" in protected
     assert "configYaml.gateway.platforms.aops.token" in protected
+    warnings = json.loads(summary.read_text(encoding="utf-8"))["warnings"]
+    assert warnings == [
+        {
+            "code": "reserved_default_profile_directory_ignored",
+            "profile": "default",
+            "path": str(home / ".hermes" / "profiles" / "default"),
+            "message": "ignored reserved named-profile directory; default uses ~/.hermes",
+        }
+    ]
+
+
+def test_oneclick_profile_sync_consumer_deduplicates_stale_entries(tmp_path):
+    script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(
+        encoding="utf-8"
+    )
+    deduper = tmp_path / "dedupe.py"
+    deduper.write_text(
+        _embedded_python(script, "profile_sync_unique_profiles"),
+        encoding="utf-8",
+    )
+    profiles = tmp_path / "profiles.json"
+    profiles.write_text(
+        json.dumps(["default", "ops-1", "default", "ops-1"]),
+        encoding="utf-8",
+    )
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"warnings": []}), encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(deduper), str(profiles), str(summary)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.stdout.splitlines() == ["default", "ops-1"]
+    assert completed.stderr.count("duplicate_profile_skipped") == 2
+    assert json.loads(summary.read_text(encoding="utf-8"))["warnings"] == [
+        {
+            "code": "duplicate_profile_skipped",
+            "profile": "default",
+            "message": "duplicate profile entry skipped during synchronized update",
+        },
+        {
+            "code": "duplicate_profile_skipped",
+            "profile": "ops-1",
+            "message": "duplicate profile entry skipped during synchronized update",
+        },
+    ]
 
 
 def test_aops_profile_template_defaults_to_terminal_linux_toolsets():

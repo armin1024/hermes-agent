@@ -2212,6 +2212,7 @@ from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    DEFERRED_REPLY,
     EphemeralReply,
     MessageEvent,
     MessageType,
@@ -4213,6 +4214,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return None
 
+    def _aops_event_center_context_for_event(
+        self,
+        event: MessageEvent,
+    ) -> Optional[dict[str, Any]]:
+        """Load profile/channel-scoped event guidance for an AOPS event."""
+        key = self._aops_preference_key_for_event(event)
+        if not key:
+            return None
+
+        def _load() -> Optional[dict[str, Any]]:
+            from gateway import aops_state
+
+            context = aops_state.get_event_center_context(key)
+            if not context:
+                return None
+            return context
+
+        source = getattr(event, "source", None)
+        if (
+            source is not None
+            and getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        ):
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return _load()
+        return _load()
+
+    def _aops_event_center_prompt_for_event(self, event: MessageEvent) -> str:
+        """Return the rendered policy while keeping its metadata available."""
+        context = self._aops_event_center_context_for_event(event)
+        if not context:
+            return ""
+        return str(context.get("systemPrompt") or "").strip()
+
+    def _with_aops_event_center_prompt(self, event: MessageEvent) -> MessageEvent:
+        """Attach persistent event guidance before any queue/steer handoff."""
+        if not event.source or event.source.platform != Platform.AOPS:
+            return event
+        try:
+            context = self._aops_event_center_context_for_event(event)
+        except Exception as exc:
+            logger.warning(
+                "AOPS event-center context load failed channel=%s: %s",
+                getattr(event.source, "chat_id", None) or "-",
+                exc,
+            )
+            return event
+        if not context:
+            return event
+        prompt = str(context.get("systemPrompt") or "").strip()
+        if not prompt:
+            return event
+        template_hash = str(context.get("templateHash") or "")
+        logger.info(
+            "AOPS event-center context active channel=%s eventId=%s "
+            "templateSource=%s templateHash=%s",
+            getattr(event.source, "chat_id", None) or "-",
+            context.get("eventId") or "-",
+            context.get("templateSource") or "unknown",
+            template_hash[:12] or "-",
+        )
+        existing = str(event.channel_prompt or "").strip()
+        combined = f"{existing}\n\n{prompt}".strip() if existing else prompt
+        return dataclasses.replace(event, channel_prompt=combined)
+
     def _aops_session_title_metadata_for_event(self, event: MessageEvent) -> dict[str, str]:
         if not event.source or event.source.platform != Platform.AOPS:
             return {}
@@ -4389,6 +4455,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 shutdown_memory=bool(effects.get("providerChanged")),
             )
+        if effects.get("invalidateSessionAgentCache"):
+            session_key = self._session_key_for_source(event.source)
+            running_agent = getattr(self, "_running_agents", {}).get(session_key)
+            if running_agent is not None:
+                stale_keys = getattr(self, "_aops_memory_stale_keys", None)
+                if stale_keys is None:
+                    stale_keys = set()
+                    self._aops_memory_stale_keys = stale_keys
+                stale_keys.add(session_key)
+            else:
+                self._evict_cached_agent(session_key)
         delete_profile = effects.get("deleteProfile")
         if isinstance(delete_profile, dict):
             try:
@@ -8060,13 +8137,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     getattr(getattr(source, "platform", None), "value", None),
                 )
                 continue
-            # Mark this replay so _handle_message does not queue it again while
-            # the restore gate remains closed for any fresh inbound arrivals.
-            try:
-                setattr(event, "_hermes_startup_restore_replay", True)
-            except Exception:
-                pass
-            await adapter.handle_message(event)
+            # Mark this replay using a declared MessageEvent field.  A dynamic
+            # attribute is lost when AOPS event-center prompt injection calls
+            # dataclasses.replace(), causing an infinite pop/requeue loop.
+            replay_event = dataclasses.replace(
+                event,
+                startup_restore_replay=True,
+            )
+            replay_dispatch = getattr(adapter, "_dispatch_deferred_event", None)
+            if callable(replay_dispatch):
+                await replay_dispatch(replay_event)
+            else:
+                await adapter.handle_message(replay_event)
             drained += 1
         return drained
 
@@ -8082,8 +8164,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=(type(result), result, result.__traceback__),
                     )
         self._startup_restore_tasks = []
-        drained = await self._drain_startup_restore_queue()
-        self._startup_restore_in_progress = False
+        drained = 0
+        try:
+            drained = await self._drain_startup_restore_queue()
+        finally:
+            # Never leave the gateway permanently gated if replay raises.
+            self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
@@ -11077,10 +11163,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             getattr(self, "_startup_restore_in_progress", False)
             and not getattr(event, "internal", False)
-            and not getattr(event, "_hermes_startup_restore_replay", False)
+            and not event.startup_restore_replay
         ):
             self._queue_startup_restore_event(event)
-            return None
+            return DEFERRED_REPLY
+
+        # Event-center context is channel-scoped rather than Hermes-session
+        # scoped.  Attach it only after the restore gate has accepted this
+        # event.  This preserves replay identity and ensures a queued event is
+        # augmented exactly once when it is actually dispatched.
+        event = self._with_aops_event_center_prompt(event)
+        source = event.source
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -21905,10 +21998,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             return
                 _deliver_bg_review_message(message)
 
-            agent.background_review_callback = _bg_review_send
-            # Register the release hook on the adapter so base.py's finally
-            # block can fire it after delivering the main response.
-            if _status_adapter and session_key:
+            # AOPS must never receive a deferred background-review bubble.
+            # The review runs after the conversational terminal and a new
+            # message_reply would become Tec01's last bubble for that
+            # replyToId, hiding the actual answer.  The review still executes
+            # and its summary remains available through _safe_print / local
+            # gateway logs.
+            if source.platform == Platform.AOPS:
+                agent.background_review_callback = None
+            else:
+                agent.background_review_callback = _bg_review_send
+            # Register the release hook on adapters that still surface review
+            # notifications so base.py can fire it after the main response.
+            if (
+                source.platform != Platform.AOPS
+                and _status_adapter
+                and session_key
+            ):
                 if getattr(type(_status_adapter), "register_post_delivery_callback", None) is not None:
                     _status_adapter.register_post_delivery_callback(
                         session_key,
