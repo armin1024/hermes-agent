@@ -27,13 +27,14 @@ PRs #9850, #9934, #7536):
 
 import asyncio
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
-from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.platforms.base import DEFERRED_REPLY, MessageEvent, MessageType, SendResult
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
@@ -1211,8 +1212,69 @@ async def test_startup_restore_gate_queues_real_inbound_messages():
 
     result = await runner._handle_message(inbound)
 
-    assert result is None
+    assert result is DEFERRED_REPLY
     assert runner._startup_restore_queue == [inbound]
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_gate_runs_before_event_center_prompt_injection():
+    """A queued AOPS event must not be replaced before replay identity exists."""
+    runner, _adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._with_aops_event_center_prompt = MagicMock(
+        side_effect=lambda event: replace(event, channel_prompt="event policy")
+    )
+    inbound = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=_make_source(
+            platform=Platform.AOPS,
+            chat_id="event-center-chat",
+        ),
+    )
+
+    result = await runner._handle_message(inbound)
+
+    assert result is DEFERRED_REPLY
+    runner._with_aops_event_center_prompt.assert_not_called()
+    assert runner._startup_restore_queue == [inbound]
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_replay_marker_survives_event_center_replace():
+    """Regression: event-center dataclasses.replace used to requeue forever."""
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_tasks = []
+    runner._with_aops_event_center_prompt = MagicMock(
+        side_effect=lambda event: replace(event, channel_prompt="event policy")
+    )
+    inbound = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=_make_source(
+            platform=Platform.AOPS,
+            chat_id="event-center-chat",
+        ),
+    )
+    runner.adapters[Platform.AOPS] = adapter
+    runner._startup_restore_queue.append(inbound)
+    seen: list[MessageEvent] = []
+
+    async def dispatch_deferred(event: MessageEvent) -> None:
+        seen.append(runner._with_aops_event_center_prompt(event))
+
+    adapter._dispatch_deferred_event = dispatch_deferred
+
+    await runner._finish_startup_restore()
+
+    assert len(seen) == 1
+    assert seen[0].startup_restore_replay is True
+    assert seen[0].channel_prompt == "event policy"
+    assert runner._startup_restore_queue == []
+    assert runner._startup_restore_in_progress is False
 
 
 @pytest.mark.asyncio
@@ -1259,7 +1321,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
         message_type=MessageType.TEXT,
         source=source,
     )
-    assert await runner._handle_message(inbound) is None
+    assert await runner._handle_message(inbound) is DEFERRED_REPLY
     assert scheduled == 1
     assert seen == ["resume-start"]
     assert runner._startup_restore_queue == [inbound]

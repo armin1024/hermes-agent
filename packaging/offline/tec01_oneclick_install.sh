@@ -1972,6 +1972,8 @@ home = Path(target_home)
 root = home / ".hermes"
 profiles_root = root / "profiles"
 profiles = ["default"]
+seen_profiles = {"default"}
+warnings = []
 if profiles_root.is_dir():
     base = profiles_root.resolve()
     for child in sorted(profiles_root.iterdir()):
@@ -1981,6 +1983,23 @@ if profiles_root.is_dir():
             child.resolve().relative_to(base)
         except ValueError:
             continue
+        if child.name == "default":
+            warning = {
+                "code": "reserved_default_profile_directory_ignored",
+                "profile": "default",
+                "path": str(child),
+                "message": "ignored reserved named-profile directory; default uses ~/.hermes",
+            }
+            warnings.append(warning)
+            print(
+                f"[WARN] Ignoring reserved profile directory {child}; "
+                "default profile uses ~/.hermes",
+                file=sys.stderr,
+            )
+            continue
+        if child.name in seen_profiles:
+            continue
+        seen_profiles.add(child.name)
         profiles.append(child.name)
 Path(profiles_path).write_text(json.dumps(profiles, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -1990,8 +2009,53 @@ summary = {
     "protectedFields": sorted(set(protected)),
     "profiles": [],
     "failedProfiles": [],
+    "warnings": warnings,
 }
 Path(summary_path).write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+profile_sync_unique_profiles() {
+  python3 - "$PROFILE_SYNC_PROFILES_JSON" "$PROFILE_SYNC_SUMMARY_JSON" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+profiles_path = Path(sys.argv[1])
+summary_path = Path(sys.argv[2])
+profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
+if not isinstance(profiles, list):
+    raise SystemExit("profile sync list must be an array")
+
+try:
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+except Exception:
+    summary = {}
+warnings = summary.setdefault("warnings", [])
+seen = set()
+for raw in profiles:
+    profile = str(raw or "").strip()
+    if not profile:
+        continue
+    if profile in seen:
+        warning = {
+            "code": "duplicate_profile_skipped",
+            "profile": profile,
+            "message": "duplicate profile entry skipped during synchronized update",
+        }
+        if warning not in warnings:
+            warnings.append(warning)
+        print(
+            f"[WARN] duplicate_profile_skipped profile={profile}",
+            file=sys.stderr,
+        )
+        continue
+    seen.add(profile)
+    print(profile)
+summary_path.write_text(
+    json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
 PY
 }
 
@@ -2516,16 +2580,70 @@ def wait_for_replacement(old_pid: int, timeout_seconds: int = 30) -> bool:
         time.sleep(1)
     return False
 
+def running_replacement_after_timeout():
+    st = state()
+    candidate = int(st.get("pid") or current_pid() or 0)
+    if (
+        str(st.get("gateway_state") or "") == "running"
+        and candidate
+        and candidate != before_pid
+        and pid_alive(candidate)
+    ):
+        return candidate
+    return 0
+
 def hard_systemd_restart() -> int:
-    run(["systemctl", "--user", "reset-failed", unit], timeout=15)
-    result = run(["systemctl", "--user", "restart", unit], timeout=90)
+    try:
+        run(["systemctl", "--user", "reset-failed", unit], timeout=15)
+        result = run(["systemctl", "--user", "restart", unit], timeout=90)
+    except subprocess.TimeoutExpired:
+        replacement_pid = running_replacement_after_timeout()
+        if replacement_pid:
+            warning = (
+                f"systemctl restart {unit} timed out, but replacement runtime "
+                f"is already running with PID {replacement_pid}"
+            )
+            print(f"⚠ {warning}", file=sys.stderr)
+            append_summary(
+                "diagnostics",
+                warning,
+                runtimeState="running",
+            )
+            return 0
+        print(
+            f"⚠ systemctl restart {unit} timed out and no running replacement "
+            "runtime was detected",
+            file=sys.stderr,
+        )
+        return 124
     if result.returncode != 0:
         print(f"⚠ systemctl restart {unit} returned {result.returncode}; falling back to hermes gateway start", file=sys.stderr)
         result = run(["hermes", *profile_args, "gateway", "start"], timeout=90)
     return result.returncode
 
 def systemd_start() -> int:
-    result = run(["systemctl", "--user", "start", unit], timeout=90)
+    try:
+        result = run(["systemctl", "--user", "start", unit], timeout=90)
+    except subprocess.TimeoutExpired:
+        replacement_pid = running_replacement_after_timeout()
+        if replacement_pid:
+            warning = (
+                f"systemctl start {unit} timed out, but gateway runtime "
+                f"is already running with PID {replacement_pid}"
+            )
+            print(f"⚠ {warning}", file=sys.stderr)
+            append_summary(
+                "diagnostics",
+                warning,
+                runtimeState="running",
+            )
+            return 0
+        print(
+            f"⚠ systemctl start {unit} timed out and no running gateway "
+            "runtime was detected",
+            file=sys.stderr,
+        )
+        return 124
     if result.returncode != 0:
         print(f"⚠ systemctl start {unit} returned {result.returncode}; falling back to hermes gateway start", file=sys.stderr)
         result = run(["hermes", *profile_args, "gateway", "start"], timeout=90)
@@ -2870,13 +2988,7 @@ apply_other_profile_configs() {
     else
       record_profile_sync_result "$profile" "updated" "" "" "$duration" "configuration synchronized"
     fi
-  done < <(python3 - "$PROFILE_SYNC_PROFILES_JSON" <<'PY'
-import json, sys
-from pathlib import Path
-for profile in json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")):
-    print(profile)
-PY
-)
+  done < <(profile_sync_unique_profiles)
 }
 
 gateway_action_for_profile() {
@@ -2929,13 +3041,7 @@ start_all_profile_gateways() {
       warn "Gateway $action failed for profile $profile; continuing"
       record_profile_sync_result "$profile" "$(profile_sync_config_status "$profile")" "$action" "failed" "$duration" "gateway lifecycle failed (exit $status)"
     fi
-  done < <(python3 - "$PROFILE_SYNC_PROFILES_JSON" <<'PY'
-import json, sys
-from pathlib import Path
-for profile in json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")):
-    print(profile)
-PY
-)
+  done < <(profile_sync_unique_profiles)
 }
 
 install_skill_zips() {

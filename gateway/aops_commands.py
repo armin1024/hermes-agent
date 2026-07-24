@@ -63,6 +63,7 @@ _AOPS_NATIVE_COMMANDS = {
     "toolsets",
     "skills",
     "memory",
+    "event-center",
 }
 
 _CATEGORY_MAP = {
@@ -114,6 +115,7 @@ _DESCRIPTION_ZH = {
     "user": "查看或编辑当前 profile 的 memories/USER.md 指令。",
     "busy": "查看或切换 busy 输入策略。",
     "memory": "管理 MEMORY.md、USER.md、记忆预算和 memory provider。",
+    "event-center": "设置、查看或清除当前 AOPS 会话的事件中心上下文。",
     "security": "查看或切换安全审批策略。",
     "securty": "查看或切换安全审批策略。",
 }
@@ -632,6 +634,12 @@ def _is_supported_custom_shape(canonical: str, raw_args: str) -> bool:
         return (not args) or (len(args) == 1 and args[0] in {"status", "queue", "steer", "interrupt"})
     if canonical == "memory":
         return True
+    if canonical == "event-center":
+        if not args or args == ["status"]:
+            return True
+        if args[:1] == ["use"]:
+            return len(args) == 2
+        return args == ["clear"]
     return False
 
 
@@ -639,7 +647,7 @@ def is_supported_command(command: str | None, raw_args: str = "", canonical: str
     normalized = _effective_command(canonical or command, raw_args)
     if not normalized:
         return False
-    if normalized in {"skills", "cron", "curator", "toolsets", "soul", "user", "busy", "memory"}:
+    if normalized in {"skills", "cron", "curator", "toolsets", "soul", "user", "busy", "memory", "event-center"}:
         return _is_supported_custom_shape(normalized, raw_args)
     try:
         from agent.skill_commands import resolve_skill_command_key
@@ -1270,6 +1278,122 @@ def _memory_command(command_text: str, args: list[str]) -> LocalCommandResult:
         return _memory_error(command_text, "AOPS_MEMORY_INVALID_SUBCOMMAND", "Usage: /memory provider <status|enable [name]|disable>")
 
     return _memory_error(command_text, "AOPS_MEMORY_INVALID_SUBCOMMAND", "Usage: /memory [status|get|reset|memory_char_limit|user_char_limit|enable|disable|provider]")
+
+
+def _event_center_command(
+    command_text: str,
+    event: MessageEvent,
+    args: list[str],
+) -> LocalCommandResult:
+    """Manage persistent event-center guidance for one AOPS channel."""
+    from gateway import aops_state
+
+    raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+    agent_key = str(raw.get("agentKey") or raw.get("agentId") or "main")
+    key = aops_state.preference_key(
+        platform=event.source.platform.value,
+        channel_id=str(event.source.chat_id or ""),
+        agent_key=agent_key,
+    )
+
+    def _response(
+        *,
+        type_: str,
+        context: dict[str, Any] | None,
+        ok: bool = True,
+        error: dict[str, Any] | None = None,
+        changed: bool = False,
+    ) -> LocalCommandResult:
+        current = context if isinstance(context, dict) else {}
+        text = _single_response(
+            type_=type_,
+            command=command_text,
+            data={
+                "active": bool(current.get("active")),
+                "eventId": current.get("eventId"),
+                "contextVersion": current.get("contextVersion"),
+                "scope": "aops-channel",
+                "updatedAtMs": current.get("updatedAtMs"),
+                "templateSource": current.get("templateSource"),
+                "templatePath": str(aops_state.event_center_template_path()),
+                "templateHash": current.get("templateHash"),
+                "effectiveImmediately": True,
+                "restartRequired": False,
+            },
+            ok=ok,
+            error=error,
+        )
+        metadata = (
+            {"effects": {"invalidateSessionAgentCache": True}}
+            if changed
+            else {}
+        )
+        return LocalCommandResult(text=text, metadata=metadata)
+
+    action = args[0].lower() if args else "status"
+    if (not args) or (action == "status" and len(args) == 1):
+        return _response(
+            type_="event-center.context.status",
+            context=aops_state.get_event_center_context(key),
+        )
+
+    if action == "use" and len(args) == 2:
+        try:
+            _path, context = aops_state.set_event_center_context(key, args[1])
+        except ValueError as exc:
+            return _response(
+                type_="event-center.context.updated",
+                context=None,
+                ok=False,
+                error={
+                    "code": "AOPS_EVENT_CENTER_INVALID_ID",
+                    "message": str(exc),
+                },
+            )
+        except Exception as exc:
+            return _response(
+                type_="event-center.context.updated",
+                context=None,
+                ok=False,
+                error={
+                    "code": "AOPS_EVENT_CENTER_STATE_WRITE_FAILED",
+                    "message": str(exc),
+                },
+            )
+        return _response(
+            type_="event-center.context.updated",
+            context=context,
+            changed=True,
+        )
+
+    if action == "clear" and len(args) == 1:
+        try:
+            _path, previous = aops_state.delete_event_center_context(key)
+        except Exception as exc:
+            return _response(
+                type_="event-center.context.cleared",
+                context=None,
+                ok=False,
+                error={
+                    "code": "AOPS_EVENT_CENTER_STATE_WRITE_FAILED",
+                    "message": str(exc),
+                },
+            )
+        return _response(
+            type_="event-center.context.cleared",
+            context=None,
+            changed=previous is not None,
+        )
+
+    return _response(
+        type_="event-center.context.status",
+        context=aops_state.get_event_center_context(key),
+        ok=False,
+        error={
+            "code": "AOPS_EVENT_CENTER_INVALID_SUBCOMMAND",
+            "message": "Usage: /event-center [status|use <eventId>|clear]",
+        },
+    )
 
 
 def _cfg_get(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -3731,6 +3855,9 @@ def maybe_local_command(event: MessageEvent) -> str | LocalCommandResult | None:
     if canonical == "memory":
         return _memory_command(full_command, args)
 
+    if canonical == "event-center":
+        return _event_center_command(full_command, event, args)
+
     if canonical == "profile" and args[:1] and args[0].lower() == "delete":
         from gateway.aops_profile_delete import handle as _handle_profile_delete
 
@@ -4505,6 +4632,52 @@ def _memory_node(config: Any) -> HelpNode:
     )
 
 
+def _event_center_node(config: Any) -> HelpNode:
+    full_command = "/event-center"
+    children = [
+        _node(
+            type_="configuration",
+            command="status",
+            full_command="/event-center status",
+            description="查看当前 AOPS channel 的事件中心上下文。",
+            dangerous=False,
+            usage="/event-center status",
+            executable=True,
+        ),
+        _node(
+            type_="configuration",
+            command="use",
+            full_command="/event-center use",
+            description="设置当前 AOPS channel 的事件 ID 和只读处理提示。",
+            dangerous=_dangerous(config, "/event-center use"),
+            usage="/event-center use <eventId>",
+            executable=False,
+            completions=[
+                _param("eventId", "事件中心事件 ID。", required=True)
+            ],
+        ),
+        _node(
+            type_="configuration",
+            command="clear",
+            full_command="/event-center clear",
+            description="清除当前 AOPS channel 的事件中心上下文。",
+            dangerous=_dangerous(config, "/event-center clear"),
+            usage="/event-center clear",
+            executable=True,
+        ),
+    ]
+    return _node(
+        type_="configuration",
+        command=full_command,
+        full_command=full_command,
+        description=_DESCRIPTION_ZH["event-center"],
+        dangerous=_dangerous(config, full_command),
+        usage="/event-center [status|use <eventId>|clear]",
+        executable=True,
+        children=children,
+    )
+
+
 def _curator_node(config: Any) -> HelpNode:
     full_command = "/curator"
     children: list[HelpNode] = []
@@ -4565,6 +4738,7 @@ def help_tree_response(config: Any, command_text: str = "/help") -> str:
     nodes.append(_instruction_node(config, "user"))
     nodes.append(_busy_node(config))
     nodes.append(_memory_node(config))
+    nodes.append(_event_center_node(config))
     if not is_blocked(config, "security"):
         nodes.append(_security_node(config))
     nodes = [node for node in nodes if node.full_command != "/curator"]
@@ -4665,6 +4839,9 @@ def aops_text_command_lines() -> list[str]:
         "`/memory enable <memory|user|all>` -- Enable built-in memory or user profile",
         "`/memory disable <memory|user|all>` -- Disable built-in memory or user profile",
         "`/memory provider <status|enable [name]|disable>` -- Manage external memory provider",
+        "`/event-center [status]` -- Show the current event-center context",
+        "`/event-center use <eventId>` -- Set event-center guidance for this AOPS channel",
+        "`/event-center clear` -- Clear event-center guidance for this AOPS channel",
         "`/security` -- Show current approval policy",
         "`/security set <off|manual|smart>` -- Switch approval policy",
     ]

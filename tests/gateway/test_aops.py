@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib
 import json
 import os
@@ -16,7 +17,7 @@ import pytest
 import gateway.run as gateway_run
 from agent.prompt_builder import PLATFORM_HINTS
 from gateway.config import GatewayConfig, Platform, PlatformConfig, StreamingConfig, _apply_env_overrides
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import DEFERRED_REPLY, MessageEvent, MessageType
 from gateway.platforms.aops import AopsAdapter, AopsLiveReplyBridge, SendResult
 import gateway.platforms.aops as aops_mod
 from gateway.run import GatewayRunner
@@ -909,14 +910,67 @@ async def test_aops_allows_only_one_terminal_message_id_per_reply_to():
         "messageId": "botmsg-final-2",
         "text": "duplicate",
     })
+    late_status = await adapter.send_reply_event({
+        "messageId": "botmsg-status-late",
+        "seq": 1,
+        "phase": "start",
+        "kind": "status",
+        "channelId": "conv-1",
+        "replyToId": "msg-2",
+        "conversationEnded": False,
+        "text": "late status",
+    })
 
     assert first.success is True
     assert same_id_retry.success is True
-    assert conflicting.success is False
-    assert conflicting.retryable is False
+    assert conflicting.success is True
+    assert late_status.success is True
     assert adapter._terminal_outbound_by_reply_to == {"msg-2": "botmsg-final-1"}
     assert len(adapter._ws.sent) == 2
     assert adapter._task_states["msg-2"]["terminalOutboundMessageId"] == "botmsg-final-1"
+
+
+@pytest.mark.asyncio
+async def test_aops_suppresses_other_stream_while_terminal_is_claimed(caplog):
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"base_url": "https://aops.example.com"},
+        )
+    )
+    adapter._connected_event.set()
+    adapter._ws = _FakeWebSocket()
+    caplog.set_level("WARNING", logger="gateway.platforms.aops")
+
+    before_terminal = await adapter.send_reply_event({
+        "messageId": "botmsg-status-before",
+        "seq": 1,
+        "phase": "start",
+        "kind": "status",
+        "channelId": "conv-1",
+        "replyToId": "msg-2",
+        "conversationEnded": False,
+        "text": "normal status",
+    })
+    adapter._terminal_claims_by_reply_to["msg-2"] = "botmsg-final-1"
+    result = await adapter.send_reply_event({
+        "messageId": "botmsg-tool-late",
+        "seq": 3,
+        "phase": "tool",
+        "kind": "tool",
+        "channelId": "conv-1",
+        "replyToId": "msg-2",
+        "conversationEnded": False,
+        "text": "late tool",
+    })
+
+    assert before_terminal.success is True
+    assert result.success is True
+    assert len(adapter._ws.sent) == 1
+    assert adapter._ws.sent[0]["data"]["messageId"] == "botmsg-status-before"
+    assert "late AOPS reply suppressed" in caplog.text
+    assert "late tool" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -4700,6 +4754,280 @@ async def test_aops_memory_rejects_invalid_limit_and_target(monkeypatch, tmp_pat
     assert json.loads(result.text)["error"]["code"] == "AOPS_MEMORY_INVALID_TARGET"
 
 
+@pytest.mark.asyncio
+async def test_aops_event_center_context_use_status_clear_and_cache_invalidation(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway import aops_state
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event_for_channel(
+        "/event-center use event_123456",
+        channel_id="conv-event",
+        agent_key="ops",
+    )
+    session_key = runner._session_key_for_source(event.source)
+    runner._agent_cache[session_key] = (
+        gateway_run._AGENT_PENDING_SENTINEL,
+        "sig",
+    )
+
+    result = await runner._handle_message(event)
+    payload = json.loads(result.text)
+
+    assert payload["type"] == "event-center.context.updated"
+    assert payload["ok"] is True
+    assert payload["active"] is True
+    assert payload["eventId"] == "event_123456"
+    assert payload["contextVersion"] == "event-center.v2"
+    assert len(payload["templateHash"]) == 64
+    assert payload["scope"] == "aops-channel"
+    assert payload["effectiveImmediately"] is True
+    assert payload["restartRequired"] is False
+    assert session_key not in runner._agent_cache
+
+    state_key = aops_state.preference_key(
+        platform="aops",
+        channel_id="conv-event",
+        agent_key="ops",
+    )
+    stored = aops_state.get_event_center_context(state_key)
+    assert stored["eventId"] == "event_123456"
+    assert "aops-cli event-center info --id 'event_123456'" in stored["systemPrompt"]
+    assert '<event_center_policy priority="critical">' in stored["systemPrompt"]
+    assert "如果禁止命令已经尝试并失败，绝不能修正参数或重试" in stored["systemPrompt"]
+    assert "禁止查看或加载 `send-message` Skill" in stored["systemPrompt"]
+    assert "请用户确认后自行更新工单或发送消息" in stored["systemPrompt"]
+    assert stored["templateHash"] == hashlib.sha256(
+        stored["systemPrompt"].encode("utf-8")
+    ).hexdigest()
+    state = json.loads(
+        (tmp_path / "aops" / "channel-state.json").read_text(encoding="utf-8")
+    )
+    assert "eventCenterContexts" in state
+
+    status = await runner._handle_message(
+        _make_aops_event_for_channel(
+            "/event-center status",
+            channel_id="conv-event",
+            agent_key="ops",
+        )
+    )
+    status_payload = json.loads(status.text)
+    assert status_payload["type"] == "event-center.context.status"
+    assert status_payload["eventId"] == "event_123456"
+    assert status_payload["contextVersion"] == "event-center.v2"
+    assert status_payload["templateHash"] == stored["templateHash"]
+    assert "systemPrompt" not in status_payload
+
+    cleared = await runner._handle_message(
+        _make_aops_event_for_channel(
+            "/event-center clear",
+            channel_id="conv-event",
+            agent_key="ops",
+        )
+    )
+    cleared_payload = json.loads(cleared.text)
+    assert cleared_payload["type"] == "event-center.context.cleared"
+    assert cleared_payload["active"] is False
+    assert aops_state.get_event_center_context(state_key) is None
+
+
+@pytest.mark.asyncio
+async def test_aops_event_center_context_validates_id_and_supports_silent(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    invalid = await runner._handle_message(
+        _make_aops_event_for_channel("/event-center use bad;id")
+    )
+    invalid_payload = json.loads(invalid.text)
+    assert invalid_payload["ok"] is False
+    assert invalid_payload["error"]["code"] == "AOPS_EVENT_CENTER_INVALID_ID"
+
+    silent = await runner._handle_message(
+        _make_silent_aops_event("/event-center use event-quiet")
+    )
+    silent_payload = json.loads(silent.text)
+    assert silent_payload["ok"] is True
+    assert silent.metadata["silent"] is True
+    assert silent.metadata["title"] == ""
+
+
+@pytest.mark.asyncio
+async def test_aops_event_center_uses_profile_prompt_template(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway import aops_state
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    template_path = tmp_path / "aops" / "event-center-prompt.md"
+    template_path.parent.mkdir(parents=True)
+    template_path.write_text(
+        "# 自定义事件指南\n事件：{事件id}\n查询：{eventId}\n别名：{event_id}\n",
+        encoding="utf-8",
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+    event = _make_aops_event_for_channel(
+        "/event-center use EVT-900",
+        channel_id="conv-template",
+        agent_key="main",
+    )
+
+    result = await runner._handle_message(event)
+    payload = json.loads(result.text)
+    assert payload["ok"] is True
+    assert payload["templateSource"] == "profile-file"
+    assert payload["templatePath"] == str(template_path)
+
+    key = aops_state.preference_key(
+        platform="aops",
+        channel_id="conv-template",
+        agent_key="main",
+    )
+    stored = aops_state.get_event_center_context(key)
+    assert stored["systemPrompt"] == (
+        "# 自定义事件指南\n"
+        "事件：EVT-900\n"
+        "查询：EVT-900\n"
+        "别名：EVT-900"
+    )
+    assert payload["templateHash"] == hashlib.sha256(
+        stored["systemPrompt"].encode("utf-8")
+    ).hexdigest()
+
+
+def test_aops_event_center_prompt_is_channel_and_agent_scoped_across_sessions(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    from gateway import aops_state
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    caplog.set_level("INFO", logger="gateway.run")
+    runner = _make_runner(extra={"dm_policy": "open"})
+    state_key = aops_state.preference_key(
+        platform="aops",
+        channel_id="conv-event",
+        agent_key="ops",
+    )
+    aops_state.set_event_center_context(state_key, "evt-42")
+
+    event = _make_aops_event_for_channel(
+        "继续分析这个事件",
+        channel_id="conv-event",
+        agent_key="ops",
+    )
+    first = runner._with_aops_event_center_prompt(event)
+    # /new only rotates the Hermes session ID; this channel lookup is stable.
+    second = runner._with_aops_event_center_prompt(event)
+    assert first.channel_prompt == second.channel_prompt
+    assert "当前事件 ID：evt-42" in first.channel_prompt
+    assert "禁止调用 `send-message`" in first.channel_prompt
+    assert "templateSource=built-in" in caplog.text
+    assert "templateHash=" in caplog.text
+    assert "绝不能实际修改事件" not in caplog.text
+
+    other_channel = runner._with_aops_event_center_prompt(
+        _make_aops_event_for_channel(
+            "普通消息",
+            channel_id="conv-other",
+            agent_key="ops",
+        )
+    )
+    other_agent = runner._with_aops_event_center_prompt(
+        _make_aops_event_for_channel(
+            "普通消息",
+            channel_id="conv-event",
+            agent_key="main",
+        )
+    )
+    assert other_channel.channel_prompt is None
+    assert other_agent.channel_prompt is None
+
+
+@pytest.mark.asyncio
+async def test_aops_event_center_prompt_reaches_agent_system_prompt(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway import aops_state
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openai",
+            "api_key": "key",
+            "base_url": "https://example.com",
+            "api_mode": "responses",
+        },
+    )
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    runner = _make_runner(platform=Platform.AOPS, extra={})
+    runner.config = GatewayConfig(platforms={})
+    event = _make_aops_event_for_channel(
+        "分析当前事件",
+        channel_id="conv-event-agent",
+        agent_key="main",
+    )
+    key = aops_state.preference_key(
+        platform="aops",
+        channel_id="conv-event-agent",
+        agent_key="main",
+    )
+    aops_state.set_event_center_context(key, "evt-agent-7")
+    event = runner._with_aops_event_center_prompt(event)
+
+    _CapturingAgent.last_init = None
+    result = await runner._run_agent(
+        message=event.text,
+        context_prompt="",
+        history=[],
+        source=event.source,
+        session_id="session-event-agent",
+        session_key="agent:main:aops:dm:conv-event-agent",
+        channel_prompt=event.channel_prompt,
+    )
+
+    assert result["final_response"] == "ok"
+    prompt = _CapturingAgent.last_init["ephemeral_system_prompt"]
+    assert "当前事件 ID：evt-agent-7" in prompt
+    assert "aops-cli event-center info --id 'evt-agent-7'" in prompt
+
+
+@pytest.mark.asyncio
+async def test_aops_help_includes_event_center_command():
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/help"))
+    payload = json.loads(result)
+    node = next(
+        item
+        for item in payload["items"]
+        if item["fullCommand"] == "/event-center"
+    )
+    assert node["usage"] == "/event-center [status|use <eventId>|clear]"
+    assert {child["command"] for child in node["children"]} == {
+        "status",
+        "use",
+        "clear",
+    }
+
+
 def test_aops_profile_delete_preview_and_one_time_confirm(monkeypatch, tmp_path):
     from gateway import aops_commands
 
@@ -5444,6 +5772,43 @@ async def test_aops_silent_adapter_cron_trigger_schedules_immediate_runner_task(
     assert payload["messageType"] == "silent"
     assert payload["silent"] is True
     assert payload["contentMetadata"]["effects"]["triggerCronJobId"] == job["id"]
+
+
+@pytest.mark.asyncio
+async def test_aops_silent_startup_deferred_event_sends_no_unsupported_terminal():
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"base_url": "https://aops.example.com"},
+        )
+    )
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    adapter.set_message_handler(AsyncMock(return_value=DEFERRED_REPLY))
+
+    await adapter._dispatch_silent_event(_make_silent_aops_event("/model status"))
+
+    adapter.send_reply_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_aops_deferred_silent_event_replays_through_silent_dispatch():
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"base_url": "https://aops.example.com"},
+        )
+    )
+    event = _make_silent_aops_event("/model status")
+    event.startup_restore_replay = True
+    adapter._dispatch_silent_event = AsyncMock()
+    adapter.handle_message = AsyncMock()
+
+    await adapter._dispatch_deferred_event(event)
+
+    adapter._dispatch_silent_event.assert_awaited_once_with(event)
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -59,6 +59,24 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class AopsProgressCaptureAdapter(ProgressCaptureAdapter):
+    """Minimal native-reply surface for AOPS runner callback tests."""
+
+    def __init__(self, platform=Platform.AOPS):
+        super().__init__(platform=platform)
+        self.push_tool_calls = True
+        self._message_counter = 0
+        self.reply_events = []
+
+    def create_message_id(self) -> str:
+        self._message_counter += 1
+        return f"botmsg-{self._message_counter}"
+
+    async def send_reply_event(self, payload) -> SendResult:
+        self.reply_events.append(dict(payload))
+        return SendResult(success=True, message_id=payload.get("messageId"))
+
+
 class SmallLimitProgressAdapter(ProgressCaptureAdapter):
     """Adapter with a tiny platform limit to exercise progress rollover."""
 
@@ -1029,6 +1047,34 @@ async def test_run_agent_defers_background_review_notification_until_release(mon
 
     assert result["final_response"] == "done"
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_disables_background_review_chat_notification_for_aops(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-aops-bg-review",
+        platform=Platform.AOPS,
+        chat_id="conv-1",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=AopsProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert not any(
+        "Self-improvement review" in str(event.get("text") or "")
+        for event in adapter.reply_events
+    )
+    assert (
+        adapter.pop_post_delivery_callback("agent:main:aops:dm:conv-1")
+        is None
+    )
 
 
 @pytest.mark.asyncio

@@ -56,6 +56,8 @@
 ## 1.1 回复终态唯一性
 
 - 每个入站 `replyToId` 最多一条成功发送的 `conversationEnded=true`。
+- 终态成功或正在发送后，不同 `messageId` 的所有晚到帧均被 Hermes 抑制；相同
+  终态 `messageId` 的网络幂等重试继续允许。
 - 主动状态消息使用独立 `messageId`、`phase=end`、`kind=status`、`conversationEnded=false`。
 - `phase=end` 结束状态气泡自身；最终 assistant 回复才结束对应用户 turn。
 - `/steer` 注入确认、`/queue` 排队确认、`/background` 启动确认以及 gateway
@@ -68,6 +70,8 @@
 - 旧 turn 被打断时，使用旧流原 `messageId` 发送一次带
   `interrupted=true`、`finishReason=interrupted` 的终态。
 - Tec01 不会收到内部 `Operation interrupted: waiting for model response` 文本。
+- Tec01 不会收到终态后完成的 `Self-improvement review` 后台摘要；该结果仅写入
+  Hermes 本地日志。
 - slash-confirm 审批卡片保持非终态；批准、始终批准或取消后，命令结果终结原始
   slash 指令，审批操作消息另行返回简短终态确认。两者使用各自的 `replyToId`。
 
@@ -441,11 +445,17 @@ AOPS 本地命令支持对当前 profile 的 Hermes 内置记忆和外部 memory
 /memory provider status
 /memory provider enable [name]
 /memory provider disable
+/event-center
+/event-center status
+/event-center use <eventId>
+/event-center clear
 ```
 
 预算指令分别对应 `memory.memory_char_limit` 与 `memory.user_char_limit`，不会互相覆盖。文件路径为 `<profile-home>/memories/MEMORY.md` 和 `<profile-home>/memories/USER.md`。reset 只清空本地文件，不删除 Hindsight 远端数据；响应中的 `remoteDataRetained` 为 `true`。
 
 所有变更均通过原子配置/文件写入完成，无需重启网关。网关会驱逐当前 profile 的缓存 agent，下一轮重新加载配置；正在执行的 turn 保持原有 system prompt。内置记忆开关与 `memory.provider` 开关独立，provider 关闭时保留最近一次 provider 供无参数 enable 恢复。
+
+`/event-center use` 启用 `event-center.v2` 只读事件协助策略。状态响应包含 `contextVersion`、`templateSource`、`templatePath` 和渲染后模板的 `templateHash`（SHA-256），不返回模板正文。默认策略仅允许 `aops-cli event-center info` 查询，禁止事件写操作、消息发送、加载 `send-message` Skill，以及失败后修正并重试禁止命令。自定义模板路径为 `<profile-home>/aops/event-center-prompt.md`；修改后必须重新执行 `use`。
 
 ## 10. Profile 删除协议
 
