@@ -1186,6 +1186,23 @@ def execute_code(
     Returns:
         JSON string with execution results.
     """
+    # A terminal allowlist is intended to be a hard command boundary.
+    # execute_code can invoke subprocess/os.system directly and would bypass
+    # that boundary, so reject it before sandbox selection or approval logic.
+    from tools.terminal_policy import terminal_policy_blocks_code_execution
+
+    if terminal_policy_blocks_code_execution():
+        return json.dumps({
+            "status": "blocked",
+            "error": (
+                "execute_code is disabled while terminal.command_policy=allowlist "
+                "because arbitrary code could bypass the terminal command policy."
+            ),
+            "error_code": "CODE_EXECUTION_DISABLED_BY_TERMINAL_POLICY",
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
+
     if not SANDBOX_AVAILABLE:
         return json.dumps({
             "error": "execute_code sandbox is unavailable in this environment. "

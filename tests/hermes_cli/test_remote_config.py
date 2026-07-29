@@ -340,7 +340,7 @@ def test_remote_config_applies_env_configyaml_soul_and_user_memory(tmp_path, mon
     env = load_env()
     assert env["CUSTOM_FLAG"] == "enabled"
     cfg = load_config()
-    assert cfg["model"]["model"] == "qwen3-32b"
+    assert cfg["model"]["default"] == "qwen3-32b"
     assert cfg["model"]["base_url"] == "http://llm/v1"
     assert cfg["checkpoints"]["enabled"] is True
     assert (profile_home / "memories" / "USER.md").read_text(encoding="utf-8") == "# User\n\nPrefer Chinese.\n"

@@ -274,6 +274,7 @@ cp "$REPO_ROOT/docs/aops-tec01-command-protocol.md" "$BUNDLE_DIR/docs/aops-tec01
 cp "$REPO_ROOT/docs/aops-memory-management-interface.md" "$BUNDLE_DIR/docs/aops-memory-management-interface.md"
 cp "$REPO_ROOT/docs/aops-profile-delete-interface.md" "$BUNDLE_DIR/docs/aops-profile-delete-interface.md"
 cp "$REPO_ROOT/docs/aops-event-center-interface.md" "$BUNDLE_DIR/docs/aops-event-center-interface.md"
+cp "$REPO_ROOT/docs/aops-terminal-command-policy.md" "$BUNDLE_DIR/docs/aops-terminal-command-policy.md"
 
 CONTENT_SHA="$(
   cd "$BUNDLE_DIR"

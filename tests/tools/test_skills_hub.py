@@ -2395,6 +2395,51 @@ class TestInstallPathSafety:
         assert not (skills_dir / "bad-skill" / "leak.txt").exists()
         assert secret.read_text() == "data exfiltration payload\n"
 
+    def test_install_from_quarantine_accepts_managed_skills_root_symlink(self, tmp_path):
+        """A managed ~/.hermes symlink into /data must remain a valid root."""
+        import tools.skills_hub as hub
+        from tools.skills_guard import ScanResult
+
+        physical_skills = tmp_path / "data" / "skills"
+        physical_skills.mkdir(parents=True)
+        logical_skills = tmp_path / "home" / "skills"
+        logical_skills.parent.mkdir(parents=True)
+        try:
+            logical_skills.symlink_to(physical_skills, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation unsupported on this platform")
+
+        logical_quarantine = logical_skills / ".hub" / "quarantine"
+        logical_quarantine.mkdir(parents=True)
+        q_dir = logical_quarantine / "pending"
+        q_dir.mkdir()
+        (q_dir / "SKILL.md").write_text("---\nname: managed-skill\n---\n")
+
+        bundle = hub.SkillBundle(
+            name="managed-skill",
+            files={"SKILL.md": "---\nname: managed-skill\n---\n"},
+            source="community",
+            identifier="managed-skill",
+            trust_level="community",
+        )
+        scan_result = ScanResult(
+            skill_name="managed-skill",
+            source="community",
+            trust_level="community",
+            verdict="safe",
+        )
+
+        with patch.object(hub, "SKILLS_DIR", logical_skills), \
+             patch.object(hub, "QUARANTINE_DIR", logical_quarantine), \
+             patch.object(hub, "LOCK_FILE", logical_skills / ".hub" / "lock.json"), \
+             patch.object(hub, "AUDIT_LOG", logical_skills / ".hub" / "audit.log"):
+            installed = hub.install_from_quarantine(
+                q_dir, "managed-skill", "", bundle, scan_result,
+            )
+
+        assert installed == physical_skills / "managed-skill"
+        assert (installed / "SKILL.md").is_file()
+
 
 # ---------------------------------------------------------------------------
 # parallel_search_sources — overall_timeout must be honoured even when a

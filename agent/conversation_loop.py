@@ -617,6 +617,18 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    # Cached gateway agents survive config edits. Refresh the model-visible
+    # execute_code schema at each turn so terminal policy changes take effect
+    # without a gateway restart. The handler itself also fails closed.
+    try:
+        from tools.terminal_policy import sync_agent_code_execution_policy
+
+        sync_agent_code_execution_policy(agent)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Failed to refresh terminal policy for cached agent"
+        )
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn

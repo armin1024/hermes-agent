@@ -296,7 +296,8 @@ class TestClawHubSource(unittest.TestCase):
         bundle = self.src.fetch("caldav-calendar")
 
         self.assertIsNone(bundle)
-        self.assertEqual(mock_get.call_count, 3)
+        requested_urls = [str(call.args[0]) for call in mock_get.call_args_list]
+        self.assertNotIn("http://127.0.0.1/private-skill", requested_urls)
 
     @patch("tools.skills_hub._write_index_cache")
     @patch("tools.skills_hub._read_index_cache", return_value=None)

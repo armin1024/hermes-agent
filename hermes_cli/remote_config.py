@@ -412,6 +412,17 @@ def _apply_config_yaml(config_payload: dict[str, Any], options: dict[str, Any]) 
     if config_yaml and not isinstance(config_yaml, dict):
         raise RemoteConfigError("config.configYaml must be a JSON object")
     if config_yaml:
+        # AOPS 0.17 templates used ``model.model`` while 0.19's canonical
+        # selector is ``model.default``. Accept the legacy input shape without
+        # persisting an unknown key that save_config() will discard.
+        config_yaml = copy.deepcopy(config_yaml)
+        incoming_model = config_yaml.get("model")
+        if (
+            isinstance(incoming_model, dict)
+            and incoming_model.get("model") not in (None, "")
+            and incoming_model.get("default") in (None, "")
+        ):
+            incoming_model["default"] = incoming_model["model"]
         _deep_merge_config_yaml(cfg, config_yaml, options=options, changed=changed)
 
     # AOPS is a gateway platform, not just a local-command config section.

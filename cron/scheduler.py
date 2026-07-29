@@ -1842,6 +1842,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         "channel": route_channels,
                         "job_id": job_id,
                         "name": job_name,
+                        # Private adapter-only field. AOPS uploads these files
+                        # before its single terminal message and never exposes
+                        # the local paths on the wire.
+                        "_aops_attachment_paths": list(media_files),
                         "botReplyExtra": {
                             "messageType": "cron",
                             "channel": route_channels,
@@ -2004,7 +2008,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # payload is already assumed delivered (#38922).  Record the
                 # skipped attachments so the drop is visible rather than silently
                 # lost.
-                if adapter_ok and not timed_out and media_files:
+                if (
+                    adapter_ok
+                    and not timed_out
+                    and media_files
+                    and platform_name.lower() != "aops"
+                ):
                     _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
@@ -2102,7 +2111,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        # Create the coroutine inside the worker, not before
+                        # ThreadPoolExecutor.submit().  A rejected submission
+                        # (shutdown/race or a test executor) would otherwise
+                        # leave the eagerly-created coroutine unawaited.
+                        def _send_in_fresh_loop():
+                            return asyncio.run(
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    cleaned_delivery_content,
+                                    thread_id=thread_id,
+                                    media_files=media_files,
+                                )
+                            )
+
+                        future = pool.submit(_send_in_fresh_loop)
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)

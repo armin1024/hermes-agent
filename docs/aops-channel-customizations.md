@@ -17,7 +17,11 @@
 - AOPS 本地命令支持 `/soul`、`/user`、`/busy`：可读写当前 profile 的 `SOUL.md`、`memories/USER.md`，并可立即切换 `display.busy_input_mode`，无需重启 gateway。
 - AOPS 本地命令支持 `/event-center use <eventId>|status|clear`：事件处理提示按 profile、channelId 和 agentKey 持久保存，跨 `/new`、`/reset` 保持，后续普通 turn 自动注入。内置 `event-center.v2` 模板采用严格只读策略，只允许事件详情查询，明确禁止事件写操作、消息发送、加载 send-message Skill 以及失败后修正并重试禁止命令。
 - 事件中心提示模板可由当前 profile 的 `~/.hermes/aops/event-center-prompt.md` 覆盖；修改后重新执行 `use` 即可在下一 turn 生效。`status` 返回模板版本、来源和 SHA-256 哈希，Gateway 日志仅记录这些元数据，不记录模板正文。
-- AOPS 工具进度回传增强：`tool.completed` 中间帧包含 `data.tool.result.text/length/truncated`、`durationMs`、`isError`，默认最多 4K 字符；`AOPS_PUSH_TOOL_CALLS=false` 时不发送工具中间帧。
+- AOPS 工具进度回传增强：`tool.started` 中间帧的 `data.text` 和
+  `data.tool.result.text` 均包含脱敏后的完整参数 JSON，并附带结构化
+  `data.tool.args` 和简短 `data.tool.preview`；`tool.completed` 包含
+  `data.tool.result.text/length/truncated`、`durationMs`、`isError`，结果默认最多
+  4K 字符；`AOPS_PUSH_TOOL_CALLS=false` 时不发送工具中间帧。
 - tec01 一键安装支持新装/更新、目标用户创建、配置下发、预装技能、Hindsight 和 USER.md 初始化。
 - 离线包安装后会执行自检，确认实际导入的 overlay 不会创建旧 `image_cache/audio_cache` 目录。
 - AOPS WebSocket 严格使用 `auth -> auth_ok -> READY` 握手；支持服务端 ping/pong、redirect 定向重连和 `Sec-WebSocket-Protocol` 目标 Pod 路由。连续重定向达到 4 次时进入 30 秒冷却，随后自动从普通入口恢复连接。
@@ -37,6 +41,8 @@ AOPS_TRUSTED_AGENT_KEY_FROM=*
 AOPS_DANGEROUS_COMMANDS="/skills,/curator run,/curator restore"
 CLAWHUB_REGISTRY=http://clawhub.internal
 AOPS_CONNECT_TIMEOUT=90
+# Optional: silent /cron history execution ceiling (default: 30 seconds).
+AOPS_CRON_HISTORY_COMMAND_TIMEOUT=30
 ```
 
 示例 `config.yaml`：
@@ -229,6 +235,7 @@ AOPS 本地命令入口继续支持 `/skills`、`/skills list`、`/cron` 等结�
 - `/cron history <id>` 返回最新记录在前，默认最多 20 条。
 - `/cron history before <id> [tsMs]` 返回锚点之前的更老记录，仍保持最新在前。
 - `/cron history after <id> <tsMs>` 返回锚点之后的更新记录，仍保持最新在前。
+- 静默 `/cron history` 使用独立的 30 秒执行上限（可由 `AOPS_CRON_HISTORY_COMMAND_TIMEOUT` 调整），不会受普通静默本地指令默认 3 秒上限影响。无锚点查询只对当前页 20 条记录读取输出快照，其余历史仅用于轻量计数。
 - cron 自动投递到 AOPS 时优先使用任务当前保存的 `origin.chat_id`，因此触发后的 `message_reply.data.channelId` 应等于任务的 `channelId`；旧会话归档后可用 `/cron update <id> {"channelId":"new_channel_id"}` 迁移。无 origin 时才使用 `AOPS_HOME_CHANNEL` 或 gateway config `home_channel`。投递的 `message_reply.data.channel` 和 `botReplyExtra.channel` 必须是用户选择的渠道数组，`message_reply.data.job_id` 和 `botReplyExtra.job_id` 必须是触发本次投递的定时任务 ID。设置 `channelId` 会默认切到 `deliver="origin"`，除非请求显式传 `deliver="local"`。
 - cron 每次运行都会写入历史快照，历史条目的名称、提示词、执行时间、`channelId`、`channel`、`deliver` 不随后续任务修改变化。`outputPath` 是 gateway 本地路径，Tec01/Anyi 对端不能直接读取本地文件，只能看到已推送的 `message_reply.data.text`。
 - `dangerous_commands` 仅标记命令危险状态，用于前端审批展示；是否禁止执行由 `blocked_commands` 控制。
@@ -244,10 +251,29 @@ AOPS 入站 `attachments` 会由 Bot 侧下载并缓存：
 - 下载失败不会静默丢失，会在用户问题后追加中文系统提示。
 - 静默 SkillHub 命令跳过附件处理，避免无关附件干扰命令执行。
 
+AOPS 出站普通终态和 cron 终态支持上传 Hermes 本轮生成的本地文件：
+
+- 上传接口为 `{AOPS_BOT_URL}/api/v1/bot/attachments/upload`，使用当前
+  profile 的 `AOPS_BOT_TOKEN` Bearer 鉴权。
+- Tec01 返回的下载上下文按
+  `AOPS_BOT_URL.rstrip("/") + "/" + downloadUrl.lstrip("/")` 转换为
+  完整 URL，保留 `/aops/tec01` 等反向代理前缀。
+- 完整改写后的 Markdown 放入 `message_reply.data.text`，链接目标使用上传
+  响应的 `data.fileId`；结构化 `attachments[]` 同时保留 `fileId` 和完整
+  `downloadUrl`。
+- UI 预览或下载时携带用户 JWT；Hermes 不接收用户 JWT，也不在 URL
+  中暴露 Bot Token。
+- 本地 Markdown 链接、`MEDIA:`、裸文件路径，以及内容完全是一个真实
+  安全文件路径的 Markdown 行内代码均可触发上传；代码块、引用块、
+  不存在的示例路径、HTTP/HTTPS 链接、工具进度和本地管理指令不会触发。
+- 上传和正文改写在唯一终态发送前完成，cron 仍保持单消息投递。
+
 统一 AOPS 日志只记录与 Tec01 上游的附件 HTTP 交互：
 
 - `http.attachment.request`
 - `http.attachment.response`
+- `http.attachment.upload.request`
+- `http.attachment.upload.response`
 
 日志写入 `~/.hermes/logs/aops/aops-YYYY-MM-DD.log`，每行包含时间、收发方向、上游事件、`messageType`、关键摘要和 `raw=` 原始 payload。普通 session 状态、busy handler、agent 内部状态和附件本地缓存过程不写入 AOPS 日志。
 
@@ -416,3 +442,9 @@ Hermes 侧已做的保护：
 ### 一个小时前的缓存文件没有被清理
 
 这是预期行为。网关约每小时检查一次，但只删除超过 24 小时的缓存文件。
+# Terminal command policy
+
+AOPS profiles can enable `terminal.command_policy: allowlist`. The policy is
+enforced before approvals and applies to main agents, subagents, cron, and
+direct terminal calls. `execute_code` is disabled in this mode. See
+[`aops-terminal-command-policy.md`](aops-terminal-command-policy.md).

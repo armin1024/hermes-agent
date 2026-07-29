@@ -199,9 +199,38 @@ cron 投递消息必须带 `data.channel` 数组，供 Tec01 后台路由到一�
 
 合法渠道为 `tec01` 和 `anyi`。存量 cron 任务缺失 `channel` 时会迁移为 `["tec01"]`。cron 投递 `message_reply.data.job_id` 必填，值为触发本次投递的定时任务 ID；`botReplyExtra.job_id` 同步填充同一个值，方便 Tec01 后台按 extra 统一解析。注意：`channel` 是 Tec01 后台的前端路由字段，不是 Hermes 内部投递目标；`channelId` 是 AOPS 消息投递会话 ID，内部保存为 `origin.chat_id`。AOPS slash command 在会话内创建 cron 时默认保存创建会话为 `origin` 并写入 `deliver="origin"`，触发后回复到创建时的 `channelId`；旧会话归档后可通过 `/cron update <id> {"channelId":"new_channel_id"}` 迁移投递目标。仅在没有可用 origin 时才退回 `deliver="aops"`，并通过 `AOPS_HOME_CHANNEL` 或 gateway config 的 `home_channel` 投递到 AOPS home channel。
 
-cron 每次执行都会保存本地输出文件并写入历史快照。快照包含执行当时的 `channelId`、`channel`、`deliver`、名称、提示词和 schedule；`outputPath` 是 gateway 机器上的本地路径，Tec01/Anyi 对端不能直接读取该文件。对端能看到的是 `message_reply.data.text` 中已推送的结果摘要/正文。若 UI 需要查看完整文件，需要新增受控的 history 文件读取或下载接口。
+cron 每次执行都会保存本地输出文件并写入历史快照。快照包含执行当时的 `channelId`、`channel`、`deliver`、名称、提示词和 schedule；`outputPath` 是 gateway 机器上的本地审计路径，Tec01/Anyi 对端不能直接读取。若本轮输出正文通过 Markdown、`MEDIA:` 或裸路径明确引用生成文件，AOPS 会将该文件上传；同一条 cron 终态的 `text` 使用 `data.fileId` 作为 Markdown 链接目标，`attachments[]` 同时返回 `fileId` 和完整 `downloadUrl`。未在正文中引用的内部审计文件不会自动对外上传。
 
-工具进度消息仍通过 `message_reply` 中间帧发送。`tool.completed` 会回传有界结果摘要，默认最多 4096 字符：
+工具进度消息仍通过 `message_reply` 中间帧发送。`tool.started` 的
+`data.text` 保持 Tec01 UI 既有协议，内容是经过 Hermes 脱敏处理的完整工具参数 JSON。
+`tool.result.text` 使用相同内容；同时附带结构化 `tool.args` 和用于简略展示的
+`tool.preview`。例如：
+
+```json
+{
+  "event": "message_reply",
+  "data": {
+    "phase": "tool",
+    "kind": "tool",
+    "conversationEnded": false,
+    "text": "{\"command\": \"if [ -f .env ]; then set -a; . ./.env; set +a; fi; ...\"}",
+    "tool": {
+      "phase": "start",
+      "name": "terminal",
+      "preview": "if [ -f .env ] + 15 commands",
+      "args": {
+        "command": "if [ -f .env ]; then set -a; . ./.env; set +a; fi; ..."
+      },
+      "result": {
+        "text": "{\"command\": \"if [ -f .env ]; then set -a; . ./.env; set +a; fi; ...\"}"
+      },
+      "isError": false
+    }
+  }
+}
+```
+
+`tool.completed` 会回传有界执行结果，默认最多 4096 字符：
 
 ```json
 {
@@ -679,6 +708,65 @@ skills:
 
 - 入站 `attachments` 由 Hermes 使用 AOPS 鉴权头下载，图片、音频、视频、文档进入统一缓存目录 `~/.hermes/cache/{images,audio,videos,documents}`。
 - 静默 SkillHub 命令跳过附件处理，避免附件干扰命令执行。
+
+### Bot 生成文件上传与预览
+
+AOPS 普通对话和 cron 的最终回复会识别本轮正文中的本地 Markdown
+链接、`MEDIA:`、裸文件路径，以及内容完全是一个真实安全文件路径的
+Markdown 行内代码（例如 `` `/home/oma/report.txt` ``），并上传到：
+
+```http
+POST {AOPS_BOT_URL}/api/v1/bot/attachments/upload
+Authorization: Bearer <AOPS_BOT_TOKEN>
+Content-Type: multipart/form-data
+```
+
+Tec01 返回的 `data.downloadUrl` 是下载上下文。Hermes 使用以下规则生成
+UI 可直接预览的完整地址：
+
+```text
+AOPS_BOT_URL.rstrip("/") + "/" + downloadUrl.lstrip("/")
+```
+
+例如：
+
+```text
+AOPS_BOT_URL = http://host:40018/aops/tec01
+downloadUrl  = /chat/attachments/download/CMS001
+完整地址     = http://host:40018/aops/tec01/chat/attachments/download/CMS001
+```
+
+正文 Markdown 链接使用上传响应的 `data.fileId` 作为目标；完整地址仅写入
+`message_reply.data.attachments[].downloadUrl`。Tec01 UI 根据 `fileId`
+渲染预览，需要下载时使用结构化 `downloadUrl` 并携带当前用户 JWT。终态示例：
+
+```json
+{
+  "event": "message_reply",
+  "data": {
+    "phase": "end",
+    "kind": "final",
+    "messageType": "common",
+    "text": "巡检结果见：[巡检报告.xlsx](CMS001)",
+    "attachments": [
+      {
+        "fileId": "CMS001",
+        "fileName": "巡检报告.xlsx",
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "fileType": "spreadsheet",
+        "size": 186542,
+        "downloadUrl": "http://host:40018/aops/tec01/chat/attachments/download/CMS001"
+      }
+    ],
+    "conversationEnded": true
+  }
+}
+```
+
+单文件失败不会让整条回复失败；失败摘要通过 `attachmentErrors[]` 返回。
+单文件最大 50 MiB，每条回复最多 10 个文件、总计最大 100 MiB。附件在
+同一条终态中返回，不会在终态后补发第二条文件消息。
+代码块、引用块、不存在的示例路径和普通行内代码不会触发上传。
 - AOPS wire 日志位于 `~/.hermes/logs/aops/aops-YYYY-MM-DD.log`，默认保留 7 天，可通过 `platforms.aops.extra.log_retention_days` 或 `AOPS_LOG_RETENTION_DAYS` 覆盖。
 - 日志会记录 Tec01/AOPS 上游交互摘要和 raw payload；敏感字段如 `runtime.model.apiKey` 在日志中脱敏。
 - 成功的流式 `phase=delta` 默认不逐 chunk 落盘；`phase=end` 保留完整最终 payload，并记录 delta 数、字符数和持续时间。delta 失败会记录失败 chunk 及最后成功 chunk。
@@ -863,3 +951,8 @@ AOPS 支持通过本地 `/memory` 指令管理当前 profile 的内置记忆、�
 ## Profile 删除
 
 AOPS channel 的 profile 删除接口、权限、确认码和响应示例见：[AOPS Profile 删除接口](aops-profile-delete-interface.md)。删除仅支持当前 named profile，`default` 永远保留。
+# Terminal command allowlist
+
+For profile-scoped restrictive terminal execution and the read-only
+`/security terminal [status]` response, see
+[`aops-terminal-command-policy.md`](aops-terminal-command-policy.md).

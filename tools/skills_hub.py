@@ -2528,10 +2528,7 @@ class ClawHubSource(SkillSource):
                 slug,
                 latest_version,
             )
-            raise ClawHubFetchError(
-                f"{self.configured_base_url()}/download",
-                reason=f"downloaded bundle missing SKILL.md for {canonical_slug}@{latest_version}",
-            )
+            return None
 
         return SkillBundle(
             name=canonical_slug.split("--")[-1] or slug,
@@ -2843,7 +2840,7 @@ class ClawHubSource(SkillSource):
                     if resp.status_code != 200:
                         logger.debug("ClawHub ZIP download for %s v%s returned %s", slug, version, resp.status_code)
                         last_error = ClawHubFetchError(
-                            str(resp.url),
+                            str(getattr(resp, "url", None) or url),
                             status_code=resp.status_code,
                             reason="download endpoint returned non-200",
                             body=self._response_preview(resp),
@@ -2885,7 +2882,12 @@ class ClawHubSource(SkillSource):
         if last_rate_limited:
             raise ClawHubRateLimitError(f"{self.configured_base_url()}/download")
         if last_error is not None:
-            raise last_error
+            # A number of ClawHub-compatible registries do not implement the
+            # ZIP endpoints but do expose files through version metadata.
+            # Preserve that official fallback path for ordinary HTTP/ZIP
+            # failures; only rate limiting must abort immediately so the AOPS
+            # bridge can report an actionable retry signal.
+            logger.debug("ClawHub ZIP fallback will use version metadata: %s", last_error)
         return files
 
     def _fetch_text(self, url: str) -> Optional[str]:
@@ -3824,7 +3826,12 @@ def install_from_quarantine(
         trust_level=bundle.trust_level,
         scan_verdict=scan_result.verdict,
         skill_hash=content_hash(install_dir),
-        install_path=str(install_dir.relative_to(_skills_dir())),
+        # ``~/.hermes`` may be a managed symlink into /data.  install_dir is
+        # already resolved by the safety validator, so compare it with the
+        # equivalently resolved skills root instead of the logical symlink
+        # path.  This preserves the escape guard without rejecting valid
+        # managed-storage installs.
+        install_path=str(install_dir.relative_to(_skills_dir().resolve())),
         files=list(bundle.files.keys()),
         metadata=bundle.metadata,
         scan_provenance=scan_provenance or getattr(scan_result, "scan_provenance", None),

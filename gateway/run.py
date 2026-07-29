@@ -4288,7 +4288,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_entry = self.session_store.get_or_create_session(event.source) if self.session_store else None
             session_id = getattr(session_entry, "session_id", None)
             if session_id and self._session_db:
-                title = self._session_db.get_session_title(session_id) or ""
+                db = getattr(self._session_db, "_db", self._session_db)
+                title = db.get_session_title(session_id) or ""
         except Exception:
             title = ""
             session_id = ""
@@ -4814,8 +4815,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_id = str(title_meta.get("sessionId") or "").strip()
                 if rule_title and session_id and self._session_db:
                     try:
-                        self._session_db.create_session(session_id, source="aops")
-                        self._session_db.set_session_title(session_id, rule_title)
+                        db = getattr(self._session_db, "_db", self._session_db)
+                        db.create_session(session_id, source="aops")
+                        db.set_session_title(session_id, rule_title)
                         merged_meta["title"] = rule_title
                     except Exception as exc:
                         logger.debug("AOPS cron create rule title set skipped: %s", exc)
@@ -4829,7 +4831,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_id or not self._session_db:
             return ""
         try:
-            return str(self._session_db.get_session_title(session_id) or "")
+            db = getattr(self._session_db, "_db", self._session_db)
+            return str(db.get_session_title(session_id) or "")
         except Exception:
             return ""
 
@@ -4882,7 +4885,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if str(user_message or "").lstrip().startswith("/"):
             return ""
         try:
-            if self._session_db.get_session_title(session_id):
+            db = getattr(self._session_db, "_db", self._session_db)
+            if db.get_session_title(session_id):
                 return ""
         except Exception:
             return ""
@@ -4922,8 +4926,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not title:
             return ""
         try:
-            self._session_db.create_session(session_id, source="aops")
-            self._session_db.set_session_title(session_id, title)
+            db = getattr(self._session_db, "_db", self._session_db)
+            db.create_session(session_id, source="aops")
+            db.set_session_title(session_id, title)
         except Exception as exc:
             logger.debug("AOPS synchronous title set failed: %s", exc)
             return ""
@@ -14863,7 +14868,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
-                if response:
+                if response and source.platform != Platform.AOPS:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
                         await self._deliver_media_from_response(
@@ -21878,7 +21883,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     getattr(agent, "provider", None) or turn_route["runtime"].get("provider") or "-",
                     getattr(agent, "api_mode", None) or turn_route["runtime"].get("api_mode") or "-",
                     _base_host,
-                    "true" if _agent_from_cache else "false",
+                "true" if reused_cached_agent else "false",
                 )
 
             # Per-message state — callbacks and reasoning config change every
@@ -23476,9 +23481,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     first_response = _delivery_result.get("final_response", "")
                     if native_reply_task:
                         try:
-                            await asyncio.wait_for(asyncio.shield(native_reply_task), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            logger.debug("AOPS native reply wait before queued message timed out")
+                            # AOPS final delivery may include bounded HTTP file
+                            # uploads.  Do not start the queued turn before its
+                            # predecessor's unique terminal frame has landed.
+                            await asyncio.shield(native_reply_task)
                         except asyncio.CancelledError:
                             raise
                         except Exception as e:

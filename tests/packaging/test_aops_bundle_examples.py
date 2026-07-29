@@ -70,6 +70,7 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert 'cp "$SCRIPT_DIR/tec01_oneclick_install.sh" "$BUNDLE_DIR/tec01_oneclick_install.sh"' in build
     assert "aops-channel-interface.md" in build
     assert "aops-event-center-interface.md" in build
+    assert "aops-terminal-command-policy.md" in build
     assert "AOPS_WHEEL_REQUIREMENTS" in build
     assert "aiohttp==3.13.4" in build
     assert "PyMuPDF==1.26.0" in build

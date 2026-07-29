@@ -2206,6 +2206,49 @@ def terminal_tool(
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
+        # Restrictive profile policy. This deliberately runs before environment
+        # creation, the ``force`` fast-path, YOLO, and approval handling.
+        # Allowed commands are rewritten to an absolute trusted executable so
+        # a poisoned PATH cannot change what ultimately runs.
+        if workdir:
+            workdir_error = _validate_workdir(workdir)
+            if workdir_error:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": workdir_error,
+                    "status": "blocked",
+                    "error_code": "TERMINAL_WORKDIR_NOT_ALLOWED",
+                }, ensure_ascii=False)
+        policy_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=cwd,
+            session_key=task_id,
+        )
+        from tools.terminal_policy import evaluate_terminal_command
+
+        policy_decision = evaluate_terminal_command(
+            command,
+            workdir=policy_cwd,
+            env_type=env_type,
+        )
+        if not policy_decision.get("allowed", False):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": policy_decision.get(
+                    "error",
+                    "Command is not allowed by profile terminal policy.",
+                ),
+                "status": "blocked",
+                "error_code": policy_decision.get(
+                    "error_code",
+                    "TERMINAL_COMMAND_NOT_ALLOWED",
+                ),
+                "policy": policy_decision.get("policy", "allowlist"),
+            }, ensure_ascii=False)
+        command = str(policy_decision.get("command") or command)
+
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:

@@ -627,9 +627,27 @@ def init_agent(
     agent.provider_data_collection = provider_data_collection
     agent.openrouter_min_coding_score = openrouter_min_coding_score
 
+    # A restrictive terminal policy must also remove execute_code from the
+    # model-visible schema. The execute_code entry point independently checks
+    # the same policy, so stale cached agents cannot bypass this filter.
+    _terminal_policy_injected = False
+    try:
+        from tools.terminal_policy import terminal_policy_blocks_code_execution
+
+        if terminal_policy_blocks_code_execution():
+            disabled_toolsets = list(disabled_toolsets or [])
+            if "code_execution" not in disabled_toolsets:
+                disabled_toolsets.append("code_execution")
+                _terminal_policy_injected = True
+    except Exception as exc:
+        # Policy loading errors fail closed at execution time. Keep agent
+        # construction resilient while recording why schema filtering failed.
+        logger.warning("Could not apply terminal policy toolset filter: %s", exc)
+
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
+    agent._terminal_policy_injected_code_execution_block = _terminal_policy_injected
     
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default

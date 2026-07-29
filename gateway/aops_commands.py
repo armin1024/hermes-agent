@@ -2240,6 +2240,15 @@ def _toolset_list_data() -> tuple[list[dict[str, Any]], dict[str, Any], set[str]
     cfg = load_config()
     enabled = _get_aops_dashboard_toolsets(cfg, include_default_mcp_servers=False)
     ui_disabled, unsupported_reasons = _configured_toolset_ui_state(cfg)
+    from tools.terminal_policy import terminal_policy_blocks_code_execution
+
+    if terminal_policy_blocks_code_execution():
+        enabled.discard("code_execution")
+        ui_disabled.add("code_execution")
+        unsupported_reasons["code_execution"] = (
+            "terminal.command_policy=allowlist 时禁止 execute_code，"
+            "避免任意代码绕过终端命令白名单。"
+        )
     definitions = {
         name: (label, description)
         for name, label, description in _get_effective_configurable_toolsets()
@@ -3051,6 +3060,7 @@ def _security_mode_info(mode: str) -> dict[str, str]:
 def _security_command(command_text: str, args: list[str]) -> str:
     from hermes_cli.config import load_config, save_config
     from hermes_constants import get_hermes_home
+    from tools.terminal_policy import terminal_policy_status
 
     aliases = {
         "full": "off",
@@ -3068,6 +3078,27 @@ def _security_command(command_text: str, args: list[str]) -> str:
         cfg["approvals"] = approvals
     current = str(approvals.get("mode") or "manual").strip().lower()
     destructive_slash_confirm = bool(approvals.get("destructive_slash_confirm", True))
+    terminal_status = terminal_policy_status()
+    if args and args[0] == "terminal":
+        if len(args) > 2 or (len(args) == 2 and args[1] != "status"):
+            return _single_response(
+                type_="security.terminal.status",
+                command=command_text,
+                data={
+                    "terminal": terminal_status,
+                    "usage": "/security terminal [status]",
+                },
+                ok=False,
+                error={
+                    "code": "SECURITY_TERMINAL_USAGE",
+                    "message": "Usage: /security terminal [status]",
+                },
+            )
+        return _single_response(
+            type_="security.terminal.status",
+            command=command_text,
+            data={"terminal": terminal_status},
+        )
     if not args or args == ["status"]:
         return _single_response(
             type_="security.status",
@@ -3075,6 +3106,7 @@ def _security_command(command_text: str, args: list[str]) -> str:
             data={
                 "current": _security_mode_info(current),
                 "destructiveSlashConfirm": destructive_slash_confirm,
+                "terminal": terminal_status,
                 "configPath": str(get_hermes_home() / "config.yaml"),
             },
         )
@@ -3085,6 +3117,7 @@ def _security_command(command_text: str, args: list[str]) -> str:
             data={
                 "current": _security_mode_info(current),
                 "destructiveSlashConfirm": destructive_slash_confirm,
+                "terminal": terminal_status,
                 "allowedModes": ["off", "manual", "smart"],
             },
             ok=False,
@@ -3323,16 +3356,30 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
                 )
 
     entries: list[dict[str, Any]] = []
+    matching_total: Optional[int] = None
     history_path = Path(cron_jobs.HISTORY_FILE)
     try:
         if history_path.exists():
             found_anchor = requested_anchor is None
             collected_after_anchor = 0
+            # With no anchor, ``history before`` is the first (newest) page,
+            # just like ``history``.  Older code retained every matching row
+            # and later normalized each one, including opening its output
+            # snapshot.  Large recurring jobs therefore turned a 20-item
+            # query into thousands of file reads.  Keep only the requested
+            # page while performing a lightweight JSONL count for the response
+            # ``total``/``hasMore`` fields.
+            count_only_after_page = requested_anchor is None and direction in {"latest", "before"}
+            if count_only_after_page:
+                matching_total = 0
             for raw in _iter_cron_history_entries_newest_first(history_path):
                 if str(raw.get("job_id") or "") == str(job_id):
+                    if matching_total is not None:
+                        matching_total += 1
+                        if len(entries) < 20:
+                            entries.append(raw)
+                        continue
                     entries.append(raw)
-                    if requested_anchor is None and direction == "latest" and len(entries) >= 20:
-                        break
                     raw_ts = _to_ms(
                         _first_history_value(
                             raw,
@@ -3500,7 +3547,7 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
         items=selected,
         context=context,
         summary=summary,
-        total=len(normalized),
+        total=matching_total if matching_total is not None else len(normalized),
         limit=20,
     )
 
@@ -4448,6 +4495,23 @@ def _security_node(config: Any) -> HelpNode:
                 usage="/security set <off|manual|smart>",
                 executable=False,
                 completions=list(_USAGE_COMPLETIONS.get("security", [])),
+            ),
+            _node(
+                type_="configuration",
+                command="terminal",
+                full_command="/security terminal",
+                description="查看当前 profile 的终端命令执行策略。",
+                dangerous=_dangerous(config, "/security terminal"),
+                usage="/security terminal [status]",
+                executable=False,
+                completions=[
+                    _param(
+                        "subcommand",
+                        "终端安全策略操作。",
+                        required=False,
+                        choices=[_choice("status", "查看白名单加载状态。")],
+                    )
+                ],
             )
         ],
     )
@@ -4843,6 +4907,7 @@ def aops_text_command_lines() -> list[str]:
         "`/event-center use <eventId>` -- Set event-center guidance for this AOPS channel",
         "`/event-center clear` -- Clear event-center guidance for this AOPS channel",
         "`/security` -- Show current approval policy",
+        "`/security terminal [status]` -- Show the current profile terminal command policy",
         "`/security set <off|manual|smart>` -- Switch approval policy",
     ]
 

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import quote, urljoin, urlparse, urlunparse
+from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
 try:
     import aiohttp
@@ -35,6 +35,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     DeferredReply,
+    MEDIA_DELIVERY_EXTS,
     MessageEvent,
     MessageType,
     SendResult,
@@ -44,6 +45,7 @@ from gateway.platforms.base import (
     cache_video_from_bytes,
     proxy_kwargs_for_aiohttp,
     resolve_proxy_url,
+    validate_media_delivery_path,
 )
 from hermes_constants import get_default_hermes_root, get_hermes_home
 
@@ -70,6 +72,11 @@ _ERROR = object()
 _HANDOFF = object()
 _AOPS_CLIENT_ID_CACHE: dict[str, str] = {}
 _AOPS_MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+_AOPS_MAX_OUTBOUND_ATTACHMENTS = 10
+_AOPS_MAX_OUTBOUND_ATTACHMENT_BYTES = 100 * 1024 * 1024
+_AOPS_ATTACHMENT_UPLOAD_CONCURRENCY = 3
+_AOPS_ATTACHMENT_UPLOAD_ATTEMPTS = 3
+_AOPS_ATTACHMENT_UPLOAD_TIMEOUT_SECS = 60.0
 _AOPS_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _AOPS_AGENT_ROUTE_RUNTIME_FIELDS = frozenset(
     {"model", "provider", "base_url", "api_key", "api_mode", "command", "args", "credential_pool"}
@@ -78,6 +85,20 @@ _AOPS_AGENT_ROUTE_RUNTIME_FIELDS = frozenset(
 
 class _AopsAuthTimeout(RuntimeError):
     """The server did not acknowledge the WebSocket auth handshake."""
+
+
+@dataclass
+class _AopsOutboundAttachment:
+    path: str
+    file_name: str
+    order: int
+
+
+@dataclass
+class _AopsAttachmentTransform:
+    text: str
+    attachments: list[dict[str, Any]]
+    errors: list[dict[str, str]]
 
 
 def _valid_target_ip(value: Any) -> str:
@@ -459,6 +480,47 @@ def _build_ws_url(base_url: str) -> str:
     base_path = parsed.path.rstrip("/")
     ws_path = f"{base_path}/api/v1/ws" if base_path else "/api/v1/ws"
     return urlunparse(parsed._replace(scheme=ws_scheme, path=ws_path, params="", query="", fragment=""))
+
+
+def _aops_context_url(base_url: str, path_or_url: Any) -> str:
+    """Resolve a Tec01 path without discarding the AOPS reverse-proxy prefix."""
+    raw = str(path_or_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme:
+        return raw if parsed.scheme.lower() in {"http", "https"} and parsed.netloc else ""
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    base_parsed = urlparse(base)
+    if base_parsed.scheme.lower() not in {"http", "https"} or not base_parsed.netloc:
+        return ""
+    return f"{base}/{raw.lstrip('/')}"
+
+
+def _aops_local_link_path(raw_target: Any) -> str:
+    """Return a local filesystem path for a Markdown link target, if any."""
+    target = str(raw_target or "").strip()
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1].strip()
+    if not target:
+        return ""
+    if target.lower().startswith("file://"):
+        parsed = urlparse(target)
+        if parsed.netloc not in {"", "localhost"}:
+            return ""
+        target = unquote(parsed.path)
+    else:
+        parsed = urlparse(target)
+        if parsed.scheme or parsed.netloc:
+            return ""
+        target = unquote(target)
+    if target.startswith("~/") or target.startswith("/"):
+        return os.path.expanduser(target)
+    if re.match(r"^[A-Za-z]:[/\\]", target):
+        return target
+    return ""
 
 
 def _now_ms() -> int:
@@ -880,6 +942,15 @@ def _aops_skillhub_command_exec_timeout() -> float:
     return value if value > 0 else 120.0
 
 
+def _aops_cron_history_command_exec_timeout() -> float:
+    raw = os.getenv("AOPS_CRON_HISTORY_COMMAND_TIMEOUT", "30").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 30.0
+    return value if value > 0 else 30.0
+
+
 def _aops_is_skillhub_silent_command(text: str) -> bool:
     lowered = (text or "").strip().lower()
     return (
@@ -889,9 +960,16 @@ def _aops_is_skillhub_silent_command(text: str) -> bool:
     )
 
 
+def _aops_is_cron_history_silent_command(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    return lowered == "/cron history" or lowered.startswith("/cron history ")
+
+
 def _aops_local_command_exec_timeout_for_event(event: MessageEvent) -> float:
     if _aops_is_skillhub_silent_command(getattr(event, "text", "") or ""):
         return _aops_skillhub_command_exec_timeout()
+    if _aops_is_cron_history_silent_command(getattr(event, "text", "") or ""):
+        return _aops_cron_history_command_exec_timeout()
     return _aops_local_command_exec_timeout()
 
 
@@ -1370,6 +1448,8 @@ class AopsLiveReplyBridge:
         tool: Optional[dict[str, Any]] = None,
         error: Optional[dict[str, Any]] = None,
         content: Optional[list[dict[str, Any]]] = None,
+        attachments: Optional[list[dict[str, Any]]] = None,
+        attachment_errors: Optional[list[dict[str, Any]]] = None,
         interrupted: bool = False,
         finish_reason: str | None = None,
         superseded: bool = False,
@@ -1406,6 +1486,10 @@ class AopsLiveReplyBridge:
             data["error"] = error
         if content:
             data["content"] = content
+        if attachments:
+            data["attachments"] = attachments
+        if attachment_errors:
+            data["attachmentErrors"] = attachment_errors
         if interrupted:
             data["interrupted"] = True
         if finish_reason:
@@ -1514,9 +1598,17 @@ class AopsLiveReplyBridge:
             phase = "result"
         elif event_type == "tool.started":
             phase = "start"
+        args = payload.get("args")
         tool_text = preview
         result_payload = None
-        if phase == "result":
+        if phase == "start" and isinstance(args, dict):
+            # Tec01's existing tool renderer parses ``data.text``.  The 0.19
+            # display preview may compact a compound terminal command to
+            # ``first command + N commands``, so serialize the complete
+            # display-safe argument object into text instead of replacing the
+            # UI contract with that preview.
+            tool_text = self._stringify_tool_result(args)
+        elif phase == "result":
             result_payload = self._bounded_tool_result(payload.get("result"), fallback=preview)
             if result_payload:
                 tool_text = result_payload.get("text") or tool_text
@@ -1529,6 +1621,13 @@ class AopsLiveReplyBridge:
         tool_payload: dict[str, Any] = {"phase": phase}
         if tool_name:
             tool_payload["name"] = tool_name
+        # Also retain the structured arguments and compact preview for newer
+        # consumers.  The arguments have already passed through Hermes'
+        # tool-argument redaction before reaching the progress callback.
+        if phase == "start" and isinstance(args, dict):
+            tool_payload["args"] = dict(args)
+        if phase == "start" and preview:
+            tool_payload["preview"] = preview
         if result_payload:
             tool_payload["result"] = result_payload
         elif tool_text:
@@ -1602,6 +1701,8 @@ class AopsLiveReplyBridge:
             if isinstance(item, tuple) and item and item[0] is _FINAL:
                 payload = item[1]
                 final_text = payload.get("text", "")
+                transformed = await self.adapter.prepare_outbound_attachments(final_text)
+                final_text = transformed.text
                 await self._ensure_started()
                 self._text = final_text
                 await self._send_event(
@@ -1610,6 +1711,8 @@ class AopsLiveReplyBridge:
                     text=final_text,
                     conversation_ended=bool(payload.get("conversation_ended", True)),
                     content=payload.get("content") or None,
+                    attachments=transformed.attachments or None,
+                    attachment_errors=transformed.errors or None,
                     interrupted=bool(payload.get("interrupted")),
                     finish_reason=payload.get("finish_reason"),
                 )
@@ -1870,6 +1973,461 @@ class AopsAdapter(BasePlatformAdapter):
     def _request_kwargs(self) -> tuple[dict[str, Any], dict[str, Any]]:
         return proxy_kwargs_for_aiohttp(self._proxy_url)
 
+    @staticmethod
+    def _attachment_error(file_name: str, code: str, message: str) -> dict[str, str]:
+        return {
+            "fileName": str(file_name or "attachment"),
+            "code": code,
+            "message": message,
+        }
+
+    @staticmethod
+    def _attachment_path_error(path: str) -> dict[str, str]:
+        file_name = Path(str(path or "")).name or "attachment"
+        try:
+            exists = Path(os.path.expanduser(str(path or ""))).exists()
+        except (OSError, ValueError):
+            exists = False
+        if not exists:
+            return AopsAdapter._attachment_error(
+                file_name,
+                "AOPS_ATTACHMENT_NOT_FOUND",
+                "文件不存在或已不可用",
+            )
+        return AopsAdapter._attachment_error(
+            file_name,
+            "AOPS_ATTACHMENT_PATH_DENIED",
+            "文件路径不允许上传",
+        )
+
+    async def _upload_attachment_file(
+        self,
+        session: "aiohttp.ClientSession",
+        request_kwargs: dict[str, Any],
+        attachment: _AopsOutboundAttachment,
+    ) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+        upload_url = _aops_context_url(self._base_url, "api/v1/bot/attachments/upload")
+        if not upload_url:
+            return None, self._attachment_error(
+                attachment.file_name,
+                "AOPS_ATTACHMENT_UPLOAD_FAILED",
+                "AOPS 附件上传地址无效",
+            )
+
+        retry_statuses = {429, 502, 503, 504}
+        last_status: int | None = None
+        for attempt in range(_AOPS_ATTACHMENT_UPLOAD_ATTEMPTS):
+            started = time.monotonic()
+            try:
+                file_size = os.path.getsize(attachment.path)
+            except OSError:
+                return None, self._attachment_path_error(attachment.path)
+            self._log_wire(
+                "info",
+                direction="out",
+                action="http.attachment.upload.request",
+                payload={
+                    "method": "POST",
+                    "url": upload_url,
+                    "fileName": attachment.file_name,
+                    "bytes": file_size,
+                    "attempt": attempt + 1,
+                },
+            )
+            try:
+                with open(attachment.path, "rb") as handle:
+                    form = aiohttp.FormData()
+                    mime_type = mimetypes.guess_type(attachment.file_name)[0] or "application/octet-stream"
+                    form.add_field(
+                        "file",
+                        handle,
+                        filename=attachment.file_name,
+                        content_type=mime_type,
+                    )
+                    async with session.post(
+                        upload_url,
+                        data=form,
+                        headers=self._headers(),
+                        **request_kwargs,
+                    ) as response:
+                        last_status = int(response.status)
+                        retry_after = str(response.headers.get("Retry-After") or "").strip()
+                        try:
+                            payload = await response.json(content_type=None)
+                        except Exception:
+                            payload = None
+
+                        elapsed_ms = int((time.monotonic() - started) * 1000)
+                        logger.info(
+                            "[%s] AOPS attachment upload file=%s bytes=%s status=%s attempt=%s durationMs=%s",
+                            self.name,
+                            attachment.file_name,
+                            file_size,
+                            response.status,
+                            attempt + 1,
+                            elapsed_ms,
+                        )
+
+                        if response.status in retry_statuses and attempt + 1 < _AOPS_ATTACHMENT_UPLOAD_ATTEMPTS:
+                            self._log_wire(
+                                "warning",
+                                direction="in",
+                                action="http.attachment.upload.response",
+                                payload={
+                                    "status": response.status,
+                                    "fileName": attachment.file_name,
+                                    "attempt": attempt + 1,
+                                },
+                                error=f"status={response.status}",
+                            )
+                            try:
+                                delay = min(30.0, max(0.0, float(retry_after)))
+                            except (TypeError, ValueError):
+                                delay = min(2.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
+                            await asyncio.sleep(delay)
+                            continue
+                        if response.status == 401:
+                            self._log_wire(
+                                "warning",
+                                direction="in",
+                                action="http.attachment.upload.response",
+                                payload={"status": response.status, "fileName": attachment.file_name},
+                                error="unauthorized",
+                            )
+                            return None, self._attachment_error(
+                                attachment.file_name,
+                                "AOPS_ATTACHMENT_UPLOAD_UNAUTHORIZED",
+                                "Bot Token 无权上传附件",
+                            )
+                        if response.status >= 400:
+                            self._log_wire(
+                                "warning",
+                                direction="in",
+                                action="http.attachment.upload.response",
+                                payload={"status": response.status, "fileName": attachment.file_name},
+                                error=f"status={response.status}",
+                            )
+                            return None, self._attachment_error(
+                                attachment.file_name,
+                                "AOPS_ATTACHMENT_UPLOAD_FAILED",
+                                f"文件上传失败（HTTP {response.status}）",
+                            )
+                        if not isinstance(payload, dict) or payload.get("status") != 200:
+                            return None, self._attachment_error(
+                                attachment.file_name,
+                                "AOPS_ATTACHMENT_INVALID_RESPONSE",
+                                "附件上传接口返回无效结果",
+                            )
+                        data = payload.get("data")
+                        if not isinstance(data, dict):
+                            data = {}
+                        file_id = str(data.get("fileId") or "").strip()
+                        download_url = _aops_context_url(self._base_url, data.get("downloadUrl"))
+                        if not file_id or not download_url:
+                            return None, self._attachment_error(
+                                attachment.file_name,
+                                "AOPS_ATTACHMENT_INVALID_RESPONSE",
+                                "附件上传结果缺少文件标识或下载地址",
+                            )
+                        try:
+                            size = int(data.get("size"))
+                        except (TypeError, ValueError):
+                            size = os.path.getsize(attachment.path)
+                        uploaded = {
+                            "fileId": file_id,
+                            "fileName": str(data.get("fileName") or attachment.file_name),
+                            "mimeType": data.get("mimeType"),
+                            "fileType": str(data.get("fileType") or "unknown"),
+                            "size": size,
+                            "downloadUrl": download_url,
+                        }
+                        self._log_wire(
+                            "info",
+                            direction="in",
+                            action="http.attachment.upload.response",
+                            payload={
+                                "status": response.status,
+                                "fileId": file_id,
+                                "fileName": uploaded["fileName"],
+                                "bytes": uploaded["size"],
+                            },
+                        )
+                        return uploaded, None
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                logger.warning(
+                    "[%s] AOPS attachment upload failed file=%s attempt=%s: %s",
+                    self.name,
+                    attachment.file_name,
+                    attempt + 1,
+                    exc,
+                )
+                if attempt + 1 < _AOPS_ATTACHMENT_UPLOAD_ATTEMPTS:
+                    await asyncio.sleep(min(2.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25))
+                    continue
+                break
+
+        suffix = f"（HTTP {last_status}）" if last_status is not None else ""
+        return None, self._attachment_error(
+            attachment.file_name,
+            "AOPS_ATTACHMENT_UPLOAD_FAILED",
+            f"文件上传失败{suffix}",
+        )
+
+    async def prepare_outbound_attachments(
+        self,
+        content: str,
+        *,
+        explicit_paths: Optional[list[Any]] = None,
+    ) -> _AopsAttachmentTransform:
+        """Upload local files referenced by one final AOPS reply."""
+        original = str(content or "")
+        working = original
+        errors: list[dict[str, str]] = []
+        records: dict[str, _AopsOutboundAttachment] = {}
+        append_paths: set[str] = set()
+        markdown_paths: set[str] = set()
+        markdown_refs: dict[str, tuple[str, str, bool]] = {}
+
+        def add_path(raw_path: str, order: int, *, append_link: bool) -> str:
+            safe = validate_media_delivery_path(raw_path)
+            if not safe:
+                errors.append(self._attachment_path_error(raw_path))
+                return ""
+            normalized = str(Path(safe).resolve())
+            if normalized not in records:
+                records[normalized] = _AopsOutboundAttachment(
+                    path=normalized,
+                    file_name=Path(normalized).name or "attachment",
+                    order=order,
+                )
+            else:
+                records[normalized].order = min(records[normalized].order, order)
+            if append_link:
+                append_paths.add(normalized)
+            return normalized
+
+        # Protect Markdown links before the generic bare-path extractor runs.
+        markdown_pattern = re.compile(r"(!?)\[([^\]\n]*)\]\(([^)\n]+)\)")
+        protected = BasePlatformAdapter._mask_protected_spans(original)
+        replacements: list[tuple[int, int, str]] = []
+        for index, match in enumerate(markdown_pattern.finditer(original)):
+            if protected[match.start():match.end()].strip() == "":
+                continue
+            is_image = match.group(1) == "!"
+            label = str(match.group(2) or "").strip() or "下载文件"
+            raw_target = str(match.group(3) or "").strip()
+            local_path = _aops_local_link_path(raw_target)
+            if not local_path:
+                continue
+            token = f"@@AOPS_ATTACHMENT_LINK_{index}_{uuid.uuid4().hex}@@"
+            safe_path = add_path(local_path, match.start(), append_link=False)
+            if safe_path:
+                markdown_paths.add(safe_path)
+            markdown_refs[token] = (safe_path, label, is_image)
+            replacements.append((match.start(), match.end(), token))
+
+        # Models commonly report a newly-created file as an inline-code path:
+        # ``Created `/home/user/report.txt`.``  Generic protected-span masking
+        # intentionally hides inline code from bare-path extraction, so handle
+        # the narrow case where the *entire* inline span resolves to a real,
+        # safe file.  Fenced examples, blockquotes, missing paths and unsafe
+        # paths remain untouched and are never uploaded.
+        excluded_inline_spans = [
+            match.span()
+            for pattern, flags in (
+                (r"```[^\n]*\n.*?```", re.DOTALL),
+                (r"^>.*$", re.MULTILINE),
+            )
+            for match in re.finditer(pattern, original, flags)
+        ]
+        inline_code_pattern = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
+        for index, match in enumerate(inline_code_pattern.finditer(original)):
+            if any(match.start() < end and match.end() > start for start, end in excluded_inline_spans):
+                continue
+            if any(match.start() < end and match.end() > start for start, end, _token in replacements):
+                continue
+            local_path = _aops_local_link_path(match.group(1))
+            if not local_path or not validate_media_delivery_path(local_path):
+                continue
+            label = Path(local_path).name or "下载文件"
+            token = f"@@AOPS_ATTACHMENT_INLINE_{index}_{uuid.uuid4().hex}@@"
+            safe_path = add_path(local_path, match.start(), append_link=False)
+            if not safe_path:
+                continue
+            markdown_paths.add(safe_path)
+            markdown_refs[token] = (safe_path, label, False)
+            replacements.append((match.start(), match.end(), token))
+        for start, end, token in reversed(replacements):
+            working = working[:start] + token + working[end:]
+
+        media_files, working = BasePlatformAdapter.extract_media(working)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        for index, (media_path, _is_voice) in enumerate(media_files):
+            add_path(media_path, len(original) + index, append_link=True)
+        # Ensure invalid/unsupported MEDIA directives never expose local paths.
+        working = BasePlatformAdapter.strip_media_directives_for_display(working)
+
+        # Standalone file:// URLs are local artifacts too.  Markdown file URLs
+        # were replaced above, so only bare occurrences remain here.
+        file_url_pattern = re.compile(r"(?<![\w])file://[^\s<>)\]]+", re.IGNORECASE)
+        protected = BasePlatformAdapter._mask_protected_spans(working)
+        file_url_replacements: list[tuple[int, int]] = []
+        for match in file_url_pattern.finditer(working):
+            if protected[match.start():match.end()].strip() == "":
+                continue
+            local_path = _aops_local_link_path(match.group(0))
+            if local_path:
+                add_path(local_path, len(original) + match.start(), append_link=True)
+            file_url_replacements.append(match.span())
+        for start, end in reversed(file_url_replacements):
+            working = working[:start] + working[end:]
+
+        local_files, working = BasePlatformAdapter.extract_local_files(working)
+        local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+        for index, local_path in enumerate(local_files):
+            add_path(local_path, len(original) + len(media_files) + index, append_link=True)
+
+        # extract_local_files intentionally leaves missing/denied paths visible
+        # for generic platforms. AOPS must not expose host-local paths to Tec01,
+        # so scrub remaining deliverable-looking bare paths and report them.
+        ext_part = "|".join(re.escape(ext.lstrip(".")) for ext in MEDIA_DELIVERY_EXTS)
+        bare_path_pattern = re.compile(
+            r"(?<![/:\w.])(?:~/|/|[A-Za-z]:[/\\])"
+            r"(?:[\w.\-]+[/\\])*[\w.\-]+\.(?:" + ext_part + r")\b",
+            re.IGNORECASE,
+        )
+        protected = BasePlatformAdapter._mask_protected_spans(working)
+        invalid_bare_replacements: list[tuple[int, int]] = []
+        for match in bare_path_pattern.finditer(working):
+            if protected[match.start():match.end()].strip() == "":
+                continue
+            add_path(match.group(0), len(original) + match.start(), append_link=True)
+            invalid_bare_replacements.append(match.span())
+        for start, end in reversed(invalid_bare_replacements):
+            working = working[:start] + working[end:]
+
+        for index, item in enumerate(explicit_paths or []):
+            raw_path = item[0] if isinstance(item, (list, tuple)) and item else item
+            if raw_path:
+                add_path(
+                    str(raw_path),
+                    len(original) + len(media_files) + len(local_files) + index,
+                    append_link=True,
+                )
+
+        selected: list[_AopsOutboundAttachment] = []
+        total_bytes = 0
+        for attachment in sorted(records.values(), key=lambda item: item.order):
+            try:
+                size = os.path.getsize(attachment.path)
+            except OSError:
+                errors.append(self._attachment_path_error(attachment.path))
+                continue
+            if size > _AOPS_MAX_ATTACHMENT_BYTES:
+                errors.append(self._attachment_error(
+                    attachment.file_name,
+                    "AOPS_ATTACHMENT_TOO_LARGE",
+                    "文件超过 50 MiB 上传限制",
+                ))
+                continue
+            if len(selected) >= _AOPS_MAX_OUTBOUND_ATTACHMENTS:
+                errors.append(self._attachment_error(
+                    attachment.file_name,
+                    "AOPS_ATTACHMENT_LIMIT_EXCEEDED",
+                    "单条回复最多上传 10 个文件",
+                ))
+                continue
+            if total_bytes + size > _AOPS_MAX_OUTBOUND_ATTACHMENT_BYTES:
+                errors.append(self._attachment_error(
+                    attachment.file_name,
+                    "AOPS_ATTACHMENT_TOTAL_SIZE_EXCEEDED",
+                    "单条回复附件总大小超过 100 MiB",
+                ))
+                continue
+            selected.append(attachment)
+            total_bytes += size
+
+        uploaded_by_path: dict[str, dict[str, Any]] = {}
+        if selected and AIOHTTP_AVAILABLE:
+            session_kwargs, request_kwargs = self._request_kwargs()
+            timeout = aiohttp.ClientTimeout(
+                connect=min(10.0, _AOPS_ATTACHMENT_UPLOAD_TIMEOUT_SECS),
+                total=_AOPS_ATTACHMENT_UPLOAD_TIMEOUT_SECS,
+            )
+            semaphore = asyncio.Semaphore(_AOPS_ATTACHMENT_UPLOAD_CONCURRENCY)
+
+            try:
+                async with aiohttp.ClientSession(timeout=timeout, trust_env=True, **session_kwargs) as session:
+                    async def upload_one(item: _AopsOutboundAttachment):
+                        async with semaphore:
+                            try:
+                                result = await self._upload_attachment_file(session, request_kwargs, item)
+                            except Exception as exc:
+                                logger.warning(
+                                    "[%s] Unexpected AOPS attachment upload failure file=%s: %s",
+                                    self.name,
+                                    item.file_name,
+                                    exc,
+                                )
+                                result = (None, self._attachment_error(
+                                    item.file_name,
+                                    "AOPS_ATTACHMENT_UPLOAD_FAILED",
+                                    "文件上传失败",
+                                ))
+                            return item, result
+
+                    results = await asyncio.gather(*(upload_one(item) for item in selected))
+                for item, (uploaded, error) in results:
+                    if uploaded:
+                        uploaded_by_path[item.path] = uploaded
+                    elif error:
+                        errors.append(error)
+            except Exception as exc:
+                logger.warning("[%s] AOPS attachment upload client failed: %s", self.name, exc)
+                for item in selected:
+                    errors.append(self._attachment_error(
+                        item.file_name,
+                        "AOPS_ATTACHMENT_UPLOAD_FAILED",
+                        "文件上传客户端初始化失败",
+                    ))
+        elif selected:
+            for item in selected:
+                errors.append(self._attachment_error(
+                    item.file_name,
+                    "AOPS_ATTACHMENT_UPLOAD_FAILED",
+                    "AOPS 附件上传依赖不可用",
+                ))
+
+        for token, (path, label, is_image) in markdown_refs.items():
+            uploaded = uploaded_by_path.get(path)
+            prefix = "!" if is_image else ""
+            replacement = f"{prefix}[{label}]({uploaded['fileId']})" if uploaded else label
+            working = working.replace(token, replacement)
+
+        appended: list[str] = []
+        for attachment in sorted(selected, key=lambda item: item.order):
+            if attachment.path not in append_paths or attachment.path in markdown_paths:
+                continue
+            uploaded = uploaded_by_path.get(attachment.path)
+            if uploaded:
+                appended.append(f"[下载 {uploaded['fileName']}]({uploaded['fileId']})")
+        if appended:
+            base = working.rstrip()
+            working = f"{base}\n\n" if base else ""
+            working += "\n".join(appended)
+
+        working = re.sub(r"\n{3,}", "\n\n", working).strip()
+        attachments = [
+            uploaded_by_path[item.path]
+            for item in sorted(selected, key=lambda candidate: candidate.order)
+            if item.path in uploaded_by_path
+        ]
+        return _AopsAttachmentTransform(
+            text=working,
+            attachments=attachments,
+            errors=errors,
+        )
+
     def _log_wire(
         self,
         level: str,
@@ -1887,7 +2445,12 @@ class AopsAdapter(BasePlatformAdapter):
             config=self.config,
         )
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # ``is_reconnect`` is part of the 0.19 BasePlatformAdapter contract.
+        # AOPS owns its auth/redirect/reconnect state machine inside
+        # ``_listen_loop`` and therefore does not need different cold/retry
+        # queue semantics, but it must accept the gateway-provided keyword.
+        del is_reconnect
         if not AIOHTTP_AVAILABLE:
             self._set_fatal_error("aops_missing_dependency", "AOPS startup failed: aiohttp not installed", retryable=True)
             return False
@@ -3054,6 +3617,18 @@ class AopsAdapter(BasePlatformAdapter):
         kind = str(metadata.get("kind") or "final")
         message_type_metadata = {**metadata, "silent": outbound_silent} if outbound_silent is not None else metadata
         message_type = _aops_message_type(metadata=message_type_metadata, inherited_silent=None)
+        attachment_transform = _AopsAttachmentTransform(
+            text=str(content or ""),
+            attachments=[],
+            errors=[],
+        )
+        if message_type == "cron":
+            explicit_paths = metadata.get("_aops_attachment_paths")
+            attachment_transform = await self.prepare_outbound_attachments(
+                content,
+                explicit_paths=explicit_paths if isinstance(explicit_paths, list) else None,
+            )
+            content = attachment_transform.text
         outbound_extra = _aops_outbound_extra_fields(metadata, message_type=message_type)
         title = self._resolve_outbound_title(
             {
@@ -3110,6 +3685,10 @@ class AopsAdapter(BasePlatformAdapter):
             end_payload["silent"] = outbound_silent
         if metadata.get("content"):
             end_payload["content"] = metadata["content"]
+        if attachment_transform.attachments:
+            end_payload["attachments"] = attachment_transform.attachments
+        if attachment_transform.errors:
+            end_payload["attachmentErrors"] = attachment_transform.errors
         result = await self.send_reply_event(end_payload)
         if result.success:
             self._chat_cache.setdefault(str(chat_id), {"id": str(chat_id), "name": str(chat_id), "type": "dm"})

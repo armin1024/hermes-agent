@@ -1205,6 +1205,14 @@ DEFAULT_CONFIG = {
         "modal_mode": "auto",
         "cwd": ".",  # Use current directory
         "timeout": 180,
+        # Restrictive execution policy. ``unrestricted`` preserves the normal
+        # terminal behavior. ``allowlist`` only executes commands matching
+        # command_patterns or allowed_commands, before approvals/YOLO/force.
+        "command_policy": "unrestricted",
+        "trusted_executable_dirs": ["/usr/bin", "/bin", "/usr/local/bin"],
+        "allowed_workdirs": [],
+        "command_patterns": [],
+        "allowed_commands": [],
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this

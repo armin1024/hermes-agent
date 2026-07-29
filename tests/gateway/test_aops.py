@@ -128,7 +128,7 @@ class _FakeResponse:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def json(self):
+    async def json(self, *args, **kwargs):
         return self._payload
 
     async def text(self):
@@ -167,6 +167,7 @@ class _FakeClientSession:
         self.post_calls = []
         self.ws_calls = []
         self.get_responses = []
+        self.post_responses = []
 
     def get(self, url, **kwargs):
         self.get_calls.append((url, kwargs))
@@ -176,6 +177,8 @@ class _FakeClientSession:
 
     def post(self, url, **kwargs):
         self.post_calls.append((url, kwargs))
+        if self.post_responses:
+            return self.post_responses.pop(0)
         return _FakeResponse(payload={"ok": True})
 
     async def ws_connect(self, url, **kwargs):
@@ -439,7 +442,7 @@ async def test_aops_connect_waits_for_auth_ok(monkeypatch):
 
     adapter._listen_loop = _fake_listener
 
-    assert await adapter.connect() is True
+    assert await adapter.connect(is_reconnect=True) is True
     assert adapter._connection_state == "READY"
     assert fake_session.ws_calls == []
 
@@ -1336,11 +1339,11 @@ async def test_aops_outbound_title_resolves_from_channel_session(tmp_path):
 async def test_aops_title_command_result_metadata_uses_set_session_title(tmp_path):
     from gateway.aops_commands import LocalCommandResult
     from gateway.session import SessionStore
-    from hermes_state import SessionDB
+    from hermes_state import AsyncSessionDB, SessionDB
 
     runner = _make_runner(extra={"dm_policy": "open"})
     runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=runner.config)
-    runner._session_db = SessionDB(db_path=tmp_path / "state.db")
+    runner._session_db = AsyncSessionDB(SessionDB(db_path=tmp_path / "state.db"))
 
     result = await runner._handle_message(_make_aops_event_for_channel("/title 我的标题", channel_id="conv-title"))
 
@@ -1353,15 +1356,15 @@ async def test_aops_title_command_result_metadata_uses_set_session_title(tmp_pat
 async def test_aops_title_command_result_metadata_uses_current_session_title(tmp_path):
     from gateway.aops_commands import LocalCommandResult
     from gateway.session import SessionStore
-    from hermes_state import SessionDB
+    from hermes_state import AsyncSessionDB, SessionDB
 
     runner = _make_runner(extra={"dm_policy": "open"})
     runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=runner.config)
-    runner._session_db = SessionDB(db_path=tmp_path / "state.db")
+    runner._session_db = AsyncSessionDB(SessionDB(db_path=tmp_path / "state.db"))
     source = SessionSource(platform=Platform.AOPS, chat_id="conv-title", chat_type="dm")
     entry = runner.session_store.get_or_create_session(source)
-    runner._session_db.create_session(entry.session_id, source="aops")
-    runner._session_db.set_session_title(entry.session_id, "已有中文标题")
+    runner._session_db._db.create_session(entry.session_id, source="aops")
+    runner._session_db._db.set_session_title(entry.session_id, "已有中文标题")
 
     result = await runner._handle_message(_make_aops_event_for_channel("/title", channel_id="conv-title"))
 
@@ -1373,11 +1376,11 @@ async def test_aops_title_command_result_metadata_uses_current_session_title(tmp
 @pytest.mark.asyncio
 async def test_aops_send_uses_title_command_metadata_in_payload(tmp_path):
     from gateway.session import SessionStore
-    from hermes_state import SessionDB
+    from hermes_state import AsyncSessionDB, SessionDB
 
     runner = _make_runner(extra={"dm_policy": "open"})
     runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=runner.config)
-    runner._session_db = SessionDB(db_path=tmp_path / "state.db")
+    runner._session_db = AsyncSessionDB(SessionDB(db_path=tmp_path / "state.db"))
     adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
     adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
 
@@ -2808,6 +2811,264 @@ async def test_aops_inbound_attachment_failure_keeps_text_event(tmp_path, monkey
     assert _aops_log_events(tmp_path) == ["http.attachment.request", "http.attachment.response"]
 
 
+def test_aops_attachment_download_url_preserves_tec01_context():
+    assert aops_mod._aops_context_url(
+        "http://a018-aiapp.cloud-tfb.cn:40018/aops/tec01",
+        "/chat/attachments/download/CMS001",
+    ) == (
+        "http://a018-aiapp.cloud-tfb.cn:40018/aops/tec01/"
+        "chat/attachments/download/CMS001"
+    )
+    assert aops_mod._aops_context_url(
+        "http://a018-aiapp.cloud-tfb.cn:40018/aops/tec01",
+        "https://cdn.example.com/CMS001",
+    ) == "https://cdn.example.com/CMS001"
+    assert aops_mod._aops_context_url(
+        "http://a018-aiapp.cloud-tfb.cn:40018/aops/tec01",
+        "javascript:alert(1)",
+    ) == ""
+
+
+@pytest.mark.asyncio
+async def test_aops_upload_uses_real_tec01_contract_and_full_download_url(tmp_path):
+    report = tmp_path / "report.xlsx"
+    report.write_bytes(b"spreadsheet")
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="bot-token",
+            extra={"base_url": "http://host:40018/aops/tec01"},
+        )
+    )
+    fake_session = _FakeClientSession(_FakeWebSocket())
+    fake_session.post_responses.append(_FakeResponse(payload={
+        "status": 200,
+        "msg": "成功",
+        "data": {
+            "fileId": "CMS001",
+            "fileName": "report.xlsx",
+            "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "fileType": "spreadsheet",
+            "size": report.stat().st_size,
+            "downloadUrl": "/chat/attachments/download/CMS001",
+        },
+    }))
+    attachment = aops_mod._AopsOutboundAttachment(
+        path=str(report),
+        file_name=report.name,
+        order=0,
+    )
+
+    uploaded, error = await adapter._upload_attachment_file(
+        fake_session,
+        {},
+        attachment,
+    )
+
+    assert error is None
+    assert uploaded["downloadUrl"] == (
+        "http://host:40018/aops/tec01/chat/attachments/download/CMS001"
+    )
+    assert fake_session.post_calls[0][0] == (
+        "http://host:40018/aops/tec01/api/v1/bot/attachments/upload"
+    )
+    assert fake_session.post_calls[0][1]["headers"]["Authorization"] == "Bearer bot-token"
+    assert "data" in fake_session.post_calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_aops_outbound_attachment_rewrites_markdown_and_returns_metadata(tmp_path):
+    report = tmp_path / "巡检报告.xlsx"
+    report.write_bytes(b"fake spreadsheet")
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"base_url": "http://host:40018/aops/tec01"},
+        )
+    )
+
+    async def fake_upload(_session, _request_kwargs, attachment):
+        return {
+            "fileId": "CMS001",
+            "fileName": attachment.file_name,
+            "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "fileType": "spreadsheet",
+            "size": os.path.getsize(attachment.path),
+            "downloadUrl": "http://host:40018/aops/tec01/chat/attachments/download/CMS001",
+        }, None
+
+    adapter._upload_attachment_file = fake_upload
+    result = await adapter.prepare_outbound_attachments(
+        f"巡检结果见：[巡检报告.xlsx]({report})\nMEDIA:{report}"
+    )
+
+    expected_url = "http://host:40018/aops/tec01/chat/attachments/download/CMS001"
+    assert result.text == "巡检结果见：[巡检报告.xlsx](CMS001)"
+    assert result.attachments == [{
+        "fileId": "CMS001",
+        "fileName": "巡检报告.xlsx",
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "fileType": "spreadsheet",
+        "size": len(b"fake spreadsheet"),
+        "downloadUrl": expected_url,
+    }]
+    assert result.errors == []
+
+
+@pytest.mark.asyncio
+async def test_aops_outbound_attachment_uploads_real_inline_code_path(tmp_path):
+    report = tmp_path / "test_file.txt"
+    report.write_text("abc", encoding="utf-8")
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"base_url": "http://host:40018/aops/tec01"},
+        )
+    )
+
+    async def fake_upload(_session, _request_kwargs, attachment):
+        return {
+            "fileId": "CMS-TXT",
+            "fileName": attachment.file_name,
+            "mimeType": "text/plain",
+            "fileType": "text",
+            "size": os.path.getsize(attachment.path),
+            "downloadUrl": "http://host:40018/aops/tec01/chat/attachments/download/CMS-TXT",
+        }, None
+
+    adapter._upload_attachment_file = fake_upload
+    result = await adapter.prepare_outbound_attachments(
+        f"已生成测试文件 `{report}`，内容为 `abc`。"
+    )
+
+    expected_url = "http://host:40018/aops/tec01/chat/attachments/download/CMS-TXT"
+    assert result.text == "已生成测试文件 [test_file.txt](CMS-TXT)，内容为 `abc`。"
+    assert result.attachments == [{
+        "fileId": "CMS-TXT",
+        "fileName": "test_file.txt",
+        "mimeType": "text/plain",
+        "fileType": "text",
+        "size": 3,
+        "downloadUrl": expected_url,
+    }]
+    assert result.errors == []
+
+
+@pytest.mark.asyncio
+async def test_aops_outbound_attachment_ignores_inline_examples_and_code_blocks(tmp_path):
+    report = tmp_path / "real.txt"
+    report.write_text("abc", encoding="utf-8")
+    content = (
+        "`/missing/example.txt` 不存在。\n"
+        "```text\n"
+        f"{report}\n"
+        "```\n"
+        f"> `{report}` 是引用示例。"
+    )
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"base_url": "http://host:40018/aops/tec01"},
+        )
+    )
+    adapter._upload_attachment_file = AsyncMock()
+
+    result = await adapter.prepare_outbound_attachments(content)
+
+    assert result.text == content
+    assert result.attachments == []
+    assert result.errors == []
+    adapter._upload_attachment_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_aops_bridge_terminal_contains_rewritten_text_and_attachments(tmp_path):
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"%PDF-fake")
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"base_url": "http://host/aops/tec01"},
+        )
+    )
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    adapter.prepare_outbound_attachments = AsyncMock(return_value=aops_mod._AopsAttachmentTransform(
+        text="报告：[report.pdf](CMSPDF)",
+        attachments=[{
+            "fileId": "CMSPDF",
+            "fileName": "report.pdf",
+            "mimeType": "application/pdf",
+            "fileType": "pdf",
+            "size": report.stat().st_size,
+            "downloadUrl": "http://host/aops/tec01/chat/attachments/download/CMSPDF",
+        }],
+        errors=[],
+    ))
+    bridge = AopsLiveReplyBridge(adapter, chat_id="conv-1", reply_to_id="msg-1")
+
+    task = asyncio.create_task(bridge.run())
+    bridge.send_final(f"报告：[report.pdf]({report})")
+    bridge.finish()
+    await task
+
+    terminal = adapter.send_reply_event.await_args_list[-1].args[0]
+    assert terminal["conversationEnded"] is True
+    assert terminal["text"].endswith("(CMSPDF)")
+    assert terminal["attachments"][0]["fileId"] == "CMSPDF"
+
+
+@pytest.mark.asyncio
+async def test_aops_cron_send_passes_explicit_paths_into_single_terminal(tmp_path):
+    report = tmp_path / "report.csv"
+    report.write_text("a,b\n1,2\n", encoding="utf-8")
+    adapter = AopsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"base_url": "http://host/aops/tec01"},
+        )
+    )
+    adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
+    adapter.prepare_outbound_attachments = AsyncMock(return_value=aops_mod._AopsAttachmentTransform(
+        text="结果\n\n[下载 report.csv](CMSCSV)",
+        attachments=[{
+            "fileId": "CMSCSV",
+            "fileName": "report.csv",
+            "mimeType": "text/csv",
+            "fileType": "spreadsheet",
+            "size": report.stat().st_size,
+            "downloadUrl": "http://host/aops/tec01/chat/attachments/download/CMSCSV",
+        }],
+        errors=[],
+    ))
+
+    result = await adapter.send(
+        "conv-1",
+        "结果",
+        metadata={
+            "message_type": "cron",
+            "channel": ["tec01"],
+            "job_id": "job-1",
+            "name": "日报",
+            "_aops_attachment_paths": [(str(report), False)],
+        },
+    )
+
+    assert result.success is True
+    adapter.prepare_outbound_attachments.assert_awaited_once_with(
+        "结果",
+        explicit_paths=[(str(report), False)],
+    )
+    events = [call.args[0] for call in adapter.send_reply_event.await_args_list]
+    assert len([event for event in events if event["conversationEnded"]]) == 1
+    assert events[-1]["attachments"][0]["fileId"] == "CMSCSV"
+    assert events[-1]["job_id"] == "job-1"
+
+
 def test_aops_extracts_user_content_from_messages_json():
     adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
 
@@ -3088,17 +3349,27 @@ async def test_aops_bridge_still_emits_real_tool_progress():
 
     await bridge._emit_tool({
         "event_type": "tool.started",
-        "tool_name": "exec",
-        "preview": "pwd",
-        "args": {},
+        "tool_name": "terminal",
+        "preview": "if [ -f .env ] + 15 commands",
+        "args": {
+            "command": "if [ -f .env ]; then set -a; . ./.env; set +a; fi; aops-cli message send-message",
+        },
     })
 
     adapter.send_reply_event.assert_awaited()
     events = [call.args[0] for call in adapter.send_reply_event.await_args_list]
     assert [event["phase"] for event in events] == ["start", "tool"]
     assert events[1]["kind"] == "tool"
-    assert events[1]["tool"]["name"] == "exec"
-    assert events[1]["text"] == "pwd"
+    assert events[1]["tool"]["name"] == "terminal"
+    expected_args_text = json.dumps({
+        "command": "if [ -f .env ]; then set -a; . ./.env; set +a; fi; aops-cli message send-message",
+    }, ensure_ascii=False)
+    assert events[1]["text"] == expected_args_text
+    assert events[1]["tool"]["preview"] == "if [ -f .env ] + 15 commands"
+    assert events[1]["tool"]["args"] == {
+        "command": "if [ -f .env ]; then set -a; . ./.env; set +a; fi; aops-cli message send-message",
+    }
+    assert events[1]["tool"]["result"]["text"] == expected_args_text
 
 
 @pytest.mark.asyncio
@@ -5440,6 +5711,50 @@ async def test_aops_cron_history_returns_newest_first(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_aops_cron_history_before_without_anchor_only_normalizes_page(monkeypatch, tmp_path):
+    import cron.jobs as cron_jobs
+    from gateway import aops_commands
+
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = cron_jobs.create_job(prompt="Frequent report", schedule="*/1 * * * *", name="Frequent report")
+    for minute in range(25):
+        cron_jobs.append_cron_history(
+            {
+                "job_id": job["id"],
+                "job_name": job["name"],
+                "job_description": "Frequent report",
+                "status": "ok",
+                "finished_at": f"2026-05-08T09:{minute:02d}:00+00:00",
+                "response_preview": f"run-{minute}",
+            }
+        )
+
+    snapshot_calls = 0
+    original_snapshot = aops_commands._history_output_snapshot
+
+    def counted_snapshot(entry):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return original_snapshot(entry)
+
+    monkeypatch.setattr(aops_commands, "_history_output_snapshot", counted_snapshot)
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event(f"/cron history before {job['id']}"))
+    payload = json.loads(result)
+
+    assert payload["count"] == 20
+    assert payload["total"] == 25
+    assert payload["hasMore"] is True
+    assert payload["items"][0]["summary"] == "run-24"
+    assert payload["items"][-1]["summary"] == "run-5"
+    assert snapshot_calls == 20
+
+
+@pytest.mark.asyncio
 async def test_aops_cron_history_explains_deleted_one_shot_with_history(monkeypatch, tmp_path):
     import cron.jobs as cron_jobs
 
@@ -6018,6 +6333,72 @@ async def test_aops_security_command_updates_approval_mode(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_aops_security_terminal_status_is_profile_scoped_and_read_only(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "terminal:\n"
+        "  command_policy: allowlist\n"
+        "  trusted_executable_dirs:\n"
+        "    - /usr/bin\n"
+        "  command_patterns:\n"
+        "    - date\n",
+        encoding="utf-8",
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/security terminal status"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "security.terminal.status"
+    assert payload["ok"] is True
+    assert payload["terminal"]["mode"] == "allowlist"
+    assert payload["terminal"]["valid"] is True
+    assert payload["terminal"]["patternCount"] == 1
+    assert payload["terminal"]["codeExecutionBlocked"] is True
+    assert payload["terminal"]["effectiveImmediately"] is True
+    assert payload["terminal"]["restartRequired"] is False
+
+
+@pytest.mark.asyncio
+async def test_aops_security_status_includes_terminal_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/security status"))
+
+    payload = json.loads(result)
+    assert payload["type"] == "security.status"
+    assert payload["terminal"]["mode"] == "unrestricted"
+    assert payload["terminal"]["codeExecutionBlocked"] is False
+
+
+@pytest.mark.asyncio
+async def test_aops_toolsets_marks_code_execution_unavailable_in_allowlist_mode(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "terminal:\n"
+        "  command_policy: allowlist\n"
+        "  command_patterns:\n"
+        "    - date\n",
+        encoding="utf-8",
+    )
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/toolsets list"))
+
+    payload = json.loads(result)
+    item = next(entry for entry in payload["items"] if entry["name"] == "code_execution")
+    assert item["enabled"] is False
+    assert item["disabled"] is True
+    assert item["configurable"] is False
+    assert "terminal.command_policy=allowlist" in item["unsupportedReason"]
+
+
+@pytest.mark.asyncio
 async def test_aops_security_set_off_disables_destructive_slash_confirm(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     runner = _make_runner(extra={"dm_policy": "open"})
@@ -6078,6 +6459,10 @@ async def test_aops_help_includes_security_command():
     assert security["executable"] is True
     set_child = next(child for child in security["children"] if child["command"] == "set")
     assert set_child["usage"] == "/security set <off|manual|smart>"
+    terminal_child = next(
+        child for child in security["children"] if child["command"] == "terminal"
+    )
+    assert terminal_child["usage"] == "/security terminal [status]"
 
 
 @pytest.mark.asyncio
@@ -6503,7 +6888,6 @@ model:
     assert payload["configUpdated"] is True
     saved = (tmp_path / "config.yaml").read_text(encoding="utf-8")
     assert "default: qwen35-122b" in saved
-    assert "model: qwen35-122b" in saved
     assert "api_key: ${AOPS_MODEL_GATEWAY_KEY}" in saved
 
 
@@ -7190,6 +7574,17 @@ def test_aops_non_skillhub_silent_commands_keep_short_exec_timeout(monkeypatch):
     monkeypatch.setenv("AOPS_SKILLHUB_COMMAND_TIMEOUT", "45")
 
     assert aops_mod._aops_local_command_exec_timeout_for_event(event) == 4.0
+
+
+def test_aops_silent_cron_history_uses_dedicated_exec_timeout(monkeypatch):
+    event = _make_silent_aops_event("/cron history before c260b8fa5eda")
+    monkeypatch.setenv("AOPS_LOCAL_COMMAND_EXEC_TIMEOUT", "3")
+    monkeypatch.delenv("AOPS_CRON_HISTORY_COMMAND_TIMEOUT", raising=False)
+
+    assert aops_mod._aops_local_command_exec_timeout_for_event(event) == 30.0
+
+    monkeypatch.setenv("AOPS_CRON_HISTORY_COMMAND_TIMEOUT", "12")
+    assert aops_mod._aops_local_command_exec_timeout_for_event(event) == 12.0
 
 
 def test_aops_skillhub_install_uses_cli_short_name_and_detects_cli_error(monkeypatch):
