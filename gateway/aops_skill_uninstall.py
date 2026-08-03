@@ -12,6 +12,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from gateway.aops_i18n import aops_error, aops_t
+
 
 def is_not_hub_installed_message(message: str) -> bool:
     text = str(message or "").lower()
@@ -135,31 +137,31 @@ def _match_local_skill(target_ref: str, items: list[dict[str, Any]]) -> tuple[di
 def _validate_local_skill_dir(matched: dict[str, Any], skills_root: Path) -> tuple[bool, str | None, Path | None]:
     raw_path = str(matched.get("path") or "").strip()
     if not raw_path:
-        return False, "Matched skill has no SKILL.md path.", None
+        return False, aops_t("skills.path_missing"), None
     skill_md = Path(raw_path)
     skill_dir = skill_md.parent
 
     try:
         root_resolved = skills_root.resolve()
         dir_resolved = skill_dir.resolve()
-    except Exception as exc:
-        return False, f"Cannot resolve skill path: {exc}", None
+    except Exception:
+        return False, aops_t("skills.path_resolve_failed"), None
 
     if dir_resolved == root_resolved:
-        return False, "Refusing to remove the skills root directory.", None
+        return False, aops_t("skills.root_delete_refused"), None
     try:
         if not dir_resolved.is_relative_to(root_resolved):
-            return False, "Refusing to remove a path outside the current profile skills directory.", None
+            return False, aops_t("skills.outside_root_refused"), None
     except AttributeError:
         if not str(dir_resolved).startswith(str(root_resolved) + "/"):
-            return False, "Refusing to remove a path outside the current profile skills directory.", None
+            return False, aops_t("skills.outside_root_refused"), None
 
     try:
         relative_parts = dir_resolved.relative_to(root_resolved).parts
     except Exception:
         relative_parts = ()
     if ".hub" in relative_parts:
-        return False, "Refusing to remove hub metadata directories.", None
+        return False, aops_t("skills.metadata_delete_refused"), None
 
     cursor = skill_dir
     root_check = root_resolved
@@ -175,12 +177,12 @@ def _validate_local_skill_dir(matched: dict[str, Any], skills_root: Path) -> tup
         checked = [skill_dir]
     for path in checked:
         if path.is_symlink():
-            return False, f"Refusing to remove a symlinked skill path: {path}", None
+            return False, aops_t("skills.symlink_delete_refused", path=path), None
 
     if not skill_dir.is_dir():
-        return False, "Matched skill directory does not exist.", None
+        return False, aops_t("skills.directory_missing"), None
     if not (skill_dir / "SKILL.md").is_file():
-        return False, "Matched directory does not contain SKILL.md.", None
+        return False, aops_t("skills.skill_file_missing"), None
 
     return True, None, skill_dir
 
@@ -194,7 +196,7 @@ def uninstall_local_skill_fallback(target_ref: str, *, items: list[dict[str, Any
     if not target_ref:
         return {
             "ok": False,
-            "error": {"code": "SKILL_NAME_REQUIRED", "message": "Skill name is required."},
+            "error": aops_error("SKILL_NAME_REQUIRED", "skills.name_required"),
         }
 
     if items is None:
@@ -215,7 +217,7 @@ def uninstall_local_skill_fallback(target_ref: str, *, items: list[dict[str, Any
                 "ok": False,
                 "error": {
                     "code": "SKILL_AMBIGUOUS",
-                    "message": f"Skill `{target_ref}` matched multiple installed skills.",
+                    "message": aops_t("skills.ambiguous", name=target_ref),
                     "details": {
                         "matches": [
                             {
@@ -232,7 +234,7 @@ def uninstall_local_skill_fallback(target_ref: str, *, items: list[dict[str, Any
             }
         return {
             "ok": False,
-            "error": {"code": "SKILL_NOT_FOUND", "message": f"Skill `{target_ref}` not found."},
+            "error": aops_error("SKILL_NOT_FOUND", "skills.not_found", name=target_ref),
             "context": context,
         }
 
@@ -242,7 +244,7 @@ def uninstall_local_skill_fallback(target_ref: str, *, items: list[dict[str, Any
             "ok": False,
             "error": {
                 "code": "SKILL_UNINSTALL_FAILED",
-                "message": reason or f"Failed to uninstall `{target_ref}`.",
+                "message": reason or aops_t("skills.uninstall_failed", name=target_ref),
             },
             "context": context,
         }
@@ -269,6 +271,6 @@ def uninstall_local_skill_fallback(target_ref: str, *, items: list[dict[str, Any
         "name": skill_name,
         "source": "local",
         "removedPath": removed_path,
-        "message": f"Uninstalled local skill '{skill_name}' from {removed_path}",
+        "message": aops_t("skills.uninstalled", name=skill_name, path=removed_path),
         "context": context,
     }

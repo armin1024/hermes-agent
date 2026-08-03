@@ -321,7 +321,7 @@ PY
 while IFS= read -r rel; do
   [[ -n "$rel" ]] || continue
   src="$OVERLAY_DIR/$rel"
-  if [[ "$rel" == skills/* ]]; then
+  if [[ "$rel" == skills/* || "$rel" == locales/* ]]; then
     dst="$DATA_ROOT/$rel"
   else
     dst="$SITE_PACKAGES/$rel"

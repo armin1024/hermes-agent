@@ -1,5 +1,10 @@
 # AOPS Channel Interface
 
+> AOPS 自身生成的静态用户文案支持 `display.language=en|zh`。AOPS 离线
+> 安装模板默认使用 `zh`。协议字段、错误码、模型回复和工具原始输出不翻译；
+> 动态底层错误的原文保存在 `error.details.rawMessage`。统计口径见
+> `docs/aops-i18n-audit.md`。
+
 本文档是 AOPS channel 的接口与运维功能总入口。后续只要 AOPS channel、Tec01 一键安装、profile、多 agent、静默命令、模型/工具集配置或 runtime 上报发生变化，必须同步更新本文档。
 
 ## 功能总览
@@ -703,6 +708,14 @@ skills:
 时，Hermes 会把执行/取消结果作为唯一终态返回原始指令的 `replyToId`；审批操作
 消息本身也会收到一条简短终态确认。两个入站消息分别闭环，执行结果不会只绑定到
 审批操作消息。
+
+`/new`、`/reset` 执行成功后的 AOPS 回复会按 `display.language` 本地化
+模型、提供方、上下文、服务地址及上下文来源说明。AOPS 不输出 Hermes 的随机
+Tip，保证重置结果稳定；非 AOPS 平台维持官方随机 Tip 行为。
+
+AOPS 的主会话提醒、busy queue/steer/interrupt、长任务心跳、无活动预警、自动
+会话重置和上下文压缩告警也按 `display.language` 输出。工具 ID、模型名和第三方
+原始错误不会翻译。
 
 ## 附件和日志
 

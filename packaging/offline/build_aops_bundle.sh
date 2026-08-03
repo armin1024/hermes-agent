@@ -190,6 +190,13 @@ for dir in "${PACKAGE_DIRS[@]}"; do
     ! -path '*/__pycache__/*' \
     -print | sed "s#^$REPO_ROOT/##" >> "$RUNTIME_FILE_LIST"
 done
+for rel in "locales/aops_en.yaml" "locales/aops_zh.yaml"; do
+  if [[ ! -f "$REPO_ROOT/$rel" ]]; then
+    echo "Missing AOPS locale catalog: $REPO_ROOT/$rel" >&2
+    exit 1
+  fi
+  printf '%s\n' "$rel" >> "$RUNTIME_FILE_LIST"
+done
 sort -u "$RUNTIME_FILE_LIST" -o "$RUNTIME_FILE_LIST"
 
 MANIFEST_PATH="$BUNDLE_DIR/overlay.manifest"
@@ -227,6 +234,7 @@ done < <(find "$REPO_ROOT/$PDF_SKILL_DIR" -type f ! -path '*/__pycache__/*' -pri
 cat > "$BUNDLE_DIR/examples/config.aops.example.yaml" <<'EOF'
 display:
   busy_input_mode: queue
+  language: zh
 
 platforms:
   aops:
@@ -275,6 +283,8 @@ cp "$REPO_ROOT/docs/aops-memory-management-interface.md" "$BUNDLE_DIR/docs/aops-
 cp "$REPO_ROOT/docs/aops-profile-delete-interface.md" "$BUNDLE_DIR/docs/aops-profile-delete-interface.md"
 cp "$REPO_ROOT/docs/aops-event-center-interface.md" "$BUNDLE_DIR/docs/aops-event-center-interface.md"
 cp "$REPO_ROOT/docs/aops-terminal-command-policy.md" "$BUNDLE_DIR/docs/aops-terminal-command-policy.md"
+cp "$REPO_ROOT/docs/aops-i18n-audit.md" "$BUNDLE_DIR/docs/aops-i18n-audit.md"
+cp "$REPO_ROOT/docs/aops-i18n-deployment.md" "$BUNDLE_DIR/docs/aops-i18n-deployment.md"
 
 CONTENT_SHA="$(
   cd "$BUNDLE_DIR"

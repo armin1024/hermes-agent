@@ -31,6 +31,7 @@ except ImportError:
     aiohttp = None  # type: ignore[assignment]
     AIOHTTP_AVAILABLE = False
 
+from gateway.aops_i18n import aops_error, aops_t
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -1992,12 +1993,12 @@ class AopsAdapter(BasePlatformAdapter):
             return AopsAdapter._attachment_error(
                 file_name,
                 "AOPS_ATTACHMENT_NOT_FOUND",
-                "文件不存在或已不可用",
+                aops_t("attachment.not_found"),
             )
         return AopsAdapter._attachment_error(
             file_name,
             "AOPS_ATTACHMENT_PATH_DENIED",
-            "文件路径不允许上传",
+            aops_t("attachment.path_denied"),
         )
 
     async def _upload_attachment_file(
@@ -2011,7 +2012,7 @@ class AopsAdapter(BasePlatformAdapter):
             return None, self._attachment_error(
                 attachment.file_name,
                 "AOPS_ATTACHMENT_UPLOAD_FAILED",
-                "AOPS 附件上传地址无效",
+                aops_t("attachment.upload_url_invalid"),
             )
 
         retry_statuses = {429, 502, 503, 504}
@@ -2097,7 +2098,7 @@ class AopsAdapter(BasePlatformAdapter):
                             return None, self._attachment_error(
                                 attachment.file_name,
                                 "AOPS_ATTACHMENT_UPLOAD_UNAUTHORIZED",
-                                "Bot Token 无权上传附件",
+                                aops_t("attachment.upload_unauthorized"),
                             )
                         if response.status >= 400:
                             self._log_wire(
@@ -2110,13 +2111,16 @@ class AopsAdapter(BasePlatformAdapter):
                             return None, self._attachment_error(
                                 attachment.file_name,
                                 "AOPS_ATTACHMENT_UPLOAD_FAILED",
-                                f"文件上传失败（HTTP {response.status}）",
+                                aops_t(
+                                    "attachment.upload_failed_http",
+                                    status=response.status,
+                                ),
                             )
                         if not isinstance(payload, dict) or payload.get("status") != 200:
                             return None, self._attachment_error(
                                 attachment.file_name,
                                 "AOPS_ATTACHMENT_INVALID_RESPONSE",
-                                "附件上传接口返回无效结果",
+                                aops_t("attachment.invalid_response"),
                             )
                         data = payload.get("data")
                         if not isinstance(data, dict):
@@ -2127,7 +2131,7 @@ class AopsAdapter(BasePlatformAdapter):
                             return None, self._attachment_error(
                                 attachment.file_name,
                                 "AOPS_ATTACHMENT_INVALID_RESPONSE",
-                                "附件上传结果缺少文件标识或下载地址",
+                                aops_t("attachment.response_missing_file"),
                             )
                         try:
                             size = int(data.get("size"))
@@ -2166,11 +2170,14 @@ class AopsAdapter(BasePlatformAdapter):
                     continue
                 break
 
-        suffix = f"（HTTP {last_status}）" if last_status is not None else ""
         return None, self._attachment_error(
             attachment.file_name,
             "AOPS_ATTACHMENT_UPLOAD_FAILED",
-            f"文件上传失败{suffix}",
+            (
+                aops_t("attachment.upload_failed_http", status=last_status)
+                if last_status is not None
+                else aops_t("attachment.upload_failed")
+            ),
         )
 
     async def prepare_outbound_attachments(
@@ -2327,21 +2334,21 @@ class AopsAdapter(BasePlatformAdapter):
                 errors.append(self._attachment_error(
                     attachment.file_name,
                     "AOPS_ATTACHMENT_TOO_LARGE",
-                    "文件超过 50 MiB 上传限制",
+                    aops_t("attachment.too_large"),
                 ))
                 continue
             if len(selected) >= _AOPS_MAX_OUTBOUND_ATTACHMENTS:
                 errors.append(self._attachment_error(
                     attachment.file_name,
                     "AOPS_ATTACHMENT_LIMIT_EXCEEDED",
-                    "单条回复最多上传 10 个文件",
+                    aops_t("attachment.count_exceeded"),
                 ))
                 continue
             if total_bytes + size > _AOPS_MAX_OUTBOUND_ATTACHMENT_BYTES:
                 errors.append(self._attachment_error(
                     attachment.file_name,
                     "AOPS_ATTACHMENT_TOTAL_SIZE_EXCEEDED",
-                    "单条回复附件总大小超过 100 MiB",
+                    aops_t("attachment.total_too_large"),
                 ))
                 continue
             selected.append(attachment)
@@ -2372,7 +2379,7 @@ class AopsAdapter(BasePlatformAdapter):
                                 result = (None, self._attachment_error(
                                     item.file_name,
                                     "AOPS_ATTACHMENT_UPLOAD_FAILED",
-                                    "文件上传失败",
+                                    aops_t("attachment.upload_failed"),
                                 ))
                             return item, result
 
@@ -2388,14 +2395,14 @@ class AopsAdapter(BasePlatformAdapter):
                     errors.append(self._attachment_error(
                         item.file_name,
                         "AOPS_ATTACHMENT_UPLOAD_FAILED",
-                        "文件上传客户端初始化失败",
+                        aops_t("attachment.upload_client_failed"),
                     ))
         elif selected:
             for item in selected:
                 errors.append(self._attachment_error(
                     item.file_name,
                     "AOPS_ATTACHMENT_UPLOAD_FAILED",
-                    "AOPS 附件上传依赖不可用",
+                    aops_t("attachment.upload_dependency_missing"),
                 ))
 
         for token, (path, label, is_image) in markdown_refs.items():
@@ -3036,10 +3043,14 @@ class AopsAdapter(BasePlatformAdapter):
             if command == "help":
                 response = _aops_commands.help_tree_response(self.config, event.text.strip() or "/help")
             elif command == "commands":
-                lines = ["🧰 **AOPS Local Commands**", *_aops_commands.aops_text_command_lines(), ""]
+                lines = [
+                    aops_t("help.local_header"),
+                    *_aops_commands.aops_text_command_lines(),
+                    "",
+                ]
                 skill_entries = _aops_commands.aops_skill_command_lines(self.config)
                 if skill_entries:
-                    lines.extend(["⚡ **Skill Commands**:", *skill_entries, ""])
+                    lines.extend([aops_t("help.skill_header"), *skill_entries, ""])
                 response = "\n".join(lines).strip()
             elif self._message_handler is not None:
                 response = await asyncio.wait_for(
@@ -3061,7 +3072,10 @@ class AopsAdapter(BasePlatformAdapter):
                     "command": event.text,
                     "error": {
                         "code": "SILENT_COMMAND_TIMEOUT",
-                        "message": f"Silent local command timed out after {exec_timeout:.0f}s.",
+                        "message": aops_t(
+                            "silent.timeout",
+                            seconds=f"{exec_timeout:.0f}",
+                        ),
                     },
                 },
                 ensure_ascii=False,
@@ -3074,7 +3088,11 @@ class AopsAdapter(BasePlatformAdapter):
                     "type": "silent.error",
                     "ok": False,
                     "command": event.text,
-                    "error": {"code": "SILENT_COMMAND_FAILED", "message": str(exc)},
+                    "error": aops_error(
+                        "SILENT_COMMAND_FAILED",
+                        "common.operation_failed",
+                        raw_message=str(exc),
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -3091,7 +3109,10 @@ class AopsAdapter(BasePlatformAdapter):
                     "type": "silent.error",
                     "ok": False,
                     "command": event.text,
-                    "error": {"code": "SILENT_COMMAND_UNSUPPORTED", "message": "Unsupported silent command."},
+                    "error": aops_error(
+                        "SILENT_COMMAND_UNSUPPORTED",
+                        "silent.unsupported",
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -3812,15 +3833,15 @@ class AopsAdapter(BasePlatformAdapter):
                 "id": confirm_id,
                 "approvalKind": "slash",
                 "allowedActions": [
-                    {"command": "/approve", "display": "执行本次"},
-                    {"command": "/always", "display": "始终执行"},
-                    {"command": "/cancel", "display": "取消"},
+                    {"command": "/approve", "display": aops_t("slash_confirm.approve_once")},
+                    {"command": "/always", "display": aops_t("slash_confirm.approve_always")},
+                    {"command": "/cancel", "display": aops_t("slash_confirm.cancel")},
                 ],
                 "message": message,
                 "replyContent": message,
                 "sessionKey": session_key,
                 "command": title,
-                "description": "slash command confirmation",
+                "description": aops_t("slash_confirm.description"),
             }],
         }
         if reply_to:
@@ -3849,19 +3870,34 @@ class AopsAdapter(BasePlatformAdapter):
         return None
 
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        return SendResult(success=False, error="AOPS does not support native image delivery")
+        return SendResult(
+            success=False,
+            error=aops_t("delivery.native_image_unsupported"),
+        )
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
-        return SendResult(success=False, error="AOPS does not support native document delivery")
+        return SendResult(
+            success=False,
+            error=aops_t("delivery.native_document_unsupported"),
+        )
 
     async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
-        return SendResult(success=False, error="AOPS does not support native voice delivery")
+        return SendResult(
+            success=False,
+            error=aops_t("delivery.native_voice_unsupported"),
+        )
 
     async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
-        return SendResult(success=False, error="AOPS does not support native video delivery")
+        return SendResult(
+            success=False,
+            error=aops_t("delivery.native_video_unsupported"),
+        )
 
     async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
-        return SendResult(success=False, error="AOPS does not support native image delivery")
+        return SendResult(
+            success=False,
+            error=aops_t("delivery.native_image_unsupported"),
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return dict(self._chat_cache.get(str(chat_id), {"id": str(chat_id), "name": str(chat_id), "type": "dm"}))

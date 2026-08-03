@@ -250,6 +250,46 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
+def _aops_runtime_text(
+    surface: Any,
+    key: str,
+    fallback: str,
+    **values: Any,
+) -> str:
+    """Localize shared gateway lifecycle text only on the AOPS surface.
+
+    Most gateway lifecycle paths are shared by every messaging adapter.  Keep
+    their official text byte-for-byte compatible, while routing AOPS-visible
+    notices through the dedicated AOPS catalog.
+    """
+    if _gateway_platform_value(surface) == "aops":
+        from gateway.aops_i18n import aops_t
+
+        return aops_t(f"runtime.{key}", **values)
+    try:
+        return fallback.format(**values)
+    except (KeyError, IndexError, ValueError):
+        return fallback
+
+
+def _aops_activity_label(platform: Any, activity: Any) -> str:
+    """Translate known lifecycle activity labels without translating tool IDs."""
+    value = str(activity or "").strip()
+    if _gateway_platform_value(platform) != "aops" or not value:
+        return value
+    key = {
+        "clarify": "activity_clarify",
+        "api_call": "activity_api_call",
+        "initializing": "activity_initializing",
+        "waiting for non-streaming API response": "activity_waiting_model",
+        "waiting for provider response (streaming)": "activity_waiting_model",
+        "receiving stream response": "activity_receiving",
+    }.get(value.lower())
+    if key is None:
+        return value
+    return _aops_runtime_text(platform, key, value)
+
+
 def _non_conversational_metadata(
     metadata: Optional[Dict[str, Any]] = None,
     *,
@@ -7175,42 +7215,95 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if start_ts:
                     elapsed_min = int((now - start_ts) / 60)
                     if elapsed_min > 0:
-                        status_parts.append(f"{elapsed_min} min elapsed")
+                        status_parts.append(
+                            _aops_runtime_text(
+                                event.source.platform,
+                                "elapsed_detail",
+                                "{minutes} min elapsed",
+                                minutes=elapsed_min,
+                            )
+                        )
                 if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
+                    status_parts.append(
+                        _aops_runtime_text(
+                            event.source.platform,
+                            "iteration_detail",
+                            "iteration {iteration}/{maximum}",
+                            iteration=iteration,
+                            maximum=max_iter,
+                        )
+                    )
                 if current_tool:
-                    status_parts.append(f"running: {current_tool}")
+                    status_parts.append(
+                        _aops_runtime_text(
+                            event.source.platform,
+                            "running_detail",
+                            "running: {activity}",
+                            activity=_aops_activity_label(
+                                event.source.platform, current_tool
+                            ),
+                        )
+                    )
             except Exception:
                 pass
 
-        status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
+        if status_parts:
+            separator = "，" if _gateway_platform_value(event.source.platform) == "aops" else ", "
+            status_detail = f" ({separator.join(status_parts)})"
+        else:
+            status_detail = ""
         if is_steer_mode:
-            message = (
-                f"⏩ Steered into current run{status_detail}. "
-                f"Your message arrives after the next tool call."
+            message = _aops_runtime_text(
+                event.source.platform,
+                "busy_steered",
+                (
+                    "⏩ Steered into current run{detail}. "
+                    "Your message arrives after the next tool call."
+                ),
+                detail=status_detail,
             )
         elif is_queue_mode and demoted_for_subagents:
             # #30170 — explain the demotion so the user knows their
             # follow-up didn't accidentally kill the subagent and
             # discovers `/stop` as the explicit escape hatch.
-            message = (
-                f"⏳ Subagent working{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
+            message = _aops_runtime_text(
+                event.source.platform,
+                "busy_subagent",
+                (
+                    "⏳ Subagent working{detail} — your message is queued for "
+                    "when it finishes (use /stop to cancel everything)."
+                ),
+                detail=status_detail,
             )
         elif is_queue_mode and demoted_for_compression:
-            message = (
-                f"⏳ Compressing context{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
+            message = _aops_runtime_text(
+                event.source.platform,
+                "busy_compressing",
+                (
+                    "⏳ Compressing context{detail} — your message is queued for "
+                    "when it finishes (use /stop to cancel everything)."
+                ),
+                detail=status_detail,
             )
         elif is_queue_mode:
-            message = (
-                f"⏳ Queued for the next turn{status_detail}. "
-                f"I'll respond once the current task finishes."
+            message = _aops_runtime_text(
+                event.source.platform,
+                "busy_queued",
+                (
+                    "⏳ Queued for the next turn{detail}. "
+                    "I'll respond once the current task finishes."
+                ),
+                detail=status_detail,
             )
         else:
-            message = (
-                f"⚡ Interrupting current task{status_detail}. "
-                f"I'll respond to your message shortly."
+            message = _aops_runtime_text(
+                event.source.platform,
+                "busy_interrupting",
+                (
+                    "⚡ Interrupting current task{detail}. "
+                    "I'll respond to your message shortly."
+                ),
+                detail=status_detail,
             )
 
         # First-touch onboarding: the very first time a user sends a message
@@ -7232,10 +7325,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _hint_mode = "queue"
                 else:
                     _hint_mode = "interrupt"
-                message = (
-                    f"{message}\n\n"
-                    f"{busy_input_hint_gateway(_hint_mode)}"
-                )
+                if event.source.platform == Platform.AOPS:
+                    hint = _aops_runtime_text(
+                        event.source.platform,
+                        f"busy_hint_{_hint_mode}",
+                        busy_input_hint_gateway(_hint_mode),
+                    )
+                else:
+                    hint = busy_input_hint_gateway(_hint_mode)
+                message = f"{message}\n\n{hint}"
                 mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
         except Exception as _onb_err:
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
@@ -11465,6 +11563,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and isinstance(_confirm_context, dict)
                     and _resolved is not None
                 ):
+                    from gateway.aops_i18n import aops_t
+
                     _origin_reply_to = str(_confirm_context.get("reply_to_id") or "").strip()
                     _origin_channel = str(_confirm_context.get("channel_id") or event.source.chat_id).strip()
                     _origin_adapter = self.adapters.get(Platform.AOPS)
@@ -11481,7 +11581,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _origin_metadata["title"] = _origin_title
                         _origin_result = await _origin_adapter.send(
                             _origin_channel,
-                            _resolved or "操作已完成。",
+                            _resolved or aops_t("slash_confirm.completed_fallback"),
                             reply_to=_origin_reply_to,
                             metadata=_origin_metadata,
                         )
@@ -11491,16 +11591,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _origin_reply_to,
                                 getattr(_origin_result, "error", "unknown error"),
                             )
-                            return (
-                                f"⚠️ /{_pending_confirm.get('command') or 'command'} 已处理，"
-                                "但原请求的终态回传失败。"
+                            return aops_t(
+                                "slash_confirm.original_delivery_failed",
+                                command=_pending_confirm.get("command") or "command",
                             )
                         cancelled = _confirm_choice == "cancel"
-                        action_text = "已取消" if cancelled else "已批准并执行"
+                        action_text = aops_t(
+                            "slash_confirm.action_cancelled"
+                            if cancelled
+                            else "slash_confirm.action_approved"
+                        )
                         action_icon = "🟡" if cancelled else "✅"
-                        return (
-                            f"{action_icon} /{_pending_confirm.get('command') or 'command'} {action_text}；"
-                            "执行结果已返回原请求。"
+                        return aops_t(
+                            "slash_confirm.action_result_returned",
+                            icon=action_icon,
+                            command=_pending_confirm.get("command") or "command",
+                            action=action_text,
                         )
                 return _resolved or ""
             # Stale pending + unrelated command: drop the pending state so
@@ -11658,7 +11764,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # fields silently lost the attachment when the queued turn ran.
                 has_media = bool(getattr(event, "media_urls", None))
                 if not queued_text and not has_media:
-                    return "Usage: /queue <prompt>"
+                    return _aops_runtime_text(
+                        source.platform,
+                        "queue_usage",
+                        "Usage: /queue <prompt>",
+                    )
                 adapter = self._adapter_for_source(source)
                 if adapter:
                     queued_event = MessageEvent(
@@ -11683,12 +11793,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 depth = self._queue_depth(_quick_key, adapter=self._adapter_for_source(source))
                 if depth <= 1:
                     return _non_conversational_reply(
-                        "Queued for the next turn.",
+                        _aops_runtime_text(
+                            source.platform,
+                            "queue_next",
+                            "Queued for the next turn.",
+                        ),
                         platform=source.platform,
                         silent=self._aops_event_silent_flag(event),
                     )
                 return _non_conversational_reply(
-                    f"Queued for the next turn. ({depth} queued)",
+                    _aops_runtime_text(
+                        source.platform,
+                        "queue_next_count",
+                        "Queued for the next turn. ({depth} queued)",
+                        depth=depth,
+                    ),
                     platform=source.platform,
                     silent=self._aops_event_silent_flag(event),
                 )
@@ -11701,7 +11820,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "steer":
                 steer_text = event.get_command_args().strip()
                 if not steer_text:
-                    return "Usage: /steer <prompt>"
+                    return _aops_runtime_text(
+                        source.platform,
+                        "steer_usage",
+                        "Usage: /steer <prompt>",
+                    )
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent is _AGENT_PENDING_SENTINEL:
                     # Agent hasn't started yet — queue as turn-boundary fallback.
@@ -11716,7 +11839,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         self._enqueue_fifo(_quick_key, queued_event, adapter)
                     return _non_conversational_reply(
-                        "Agent still starting — /steer queued for the next turn.",
+                        _aops_runtime_text(
+                            source.platform,
+                            "steer_agent_starting",
+                            "Agent still starting — /steer queued for the next turn.",
+                        ),
                         platform=source.platform,
                         silent=self._aops_event_silent_flag(event),
                     )
@@ -11730,15 +11857,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception as exc:
                         logger.warning("Steer failed for session %s: %s", _quick_key, exc)
-                        return f"⚠️ Steer failed: {exc}"
+                        return _aops_runtime_text(
+                            source.platform,
+                            "steer_failed",
+                            "⚠️ Steer failed: {error}",
+                            error=exc,
+                        )
                     if accepted:
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                         return _non_conversational_reply(
-                            f"⏩ Steer queued — arrives after the next tool call: '{preview}'",
+                            _aops_runtime_text(
+                                source.platform,
+                                "steer_queued",
+                                (
+                                    "⏩ Steer queued — arrives after the next "
+                                    "tool call: '{preview}'"
+                                ),
+                                preview=preview,
+                            ),
                             platform=source.platform,
                             silent=self._aops_event_silent_flag(event),
                         )
-                    return "Steer rejected (empty payload)."
+                    return _aops_runtime_text(
+                        source.platform,
+                        "steer_rejected",
+                        "Steer rejected (empty payload).",
+                    )
                 # Running agent is missing or lacks steer() — fall back to queue.
                 adapter = self._adapter_for_source(source)
                 if adapter:
@@ -11751,20 +11895,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 return _non_conversational_reply(
-                    "No active agent — /steer queued for the next turn.",
+                    _aops_runtime_text(
+                        source.platform,
+                        "steer_no_agent",
+                        "No active agent — /steer queued for the next turn.",
+                    ),
                     platform=source.platform,
                     silent=self._aops_event_silent_flag(event),
                 )
 
             # /model must not be used while the agent is running.
             if _cmd_def_inner and _cmd_def_inner.name == "model":
-                return "Agent is running — wait or /stop first, then switch models."
+                return _aops_runtime_text(
+                    source.platform,
+                    "model_agent_running",
+                    "Agent is running — wait or /stop first, then switch models.",
+                )
 
             # /codex-runtime must not be used while the agent is running.
             # Switching mid-turn would split a turn across two transports.
             if _cmd_def_inner and _cmd_def_inner.name == "codex-runtime":
-                return ("Agent is running — wait or /stop first, then "
-                        "change runtime.")
+                return _aops_runtime_text(
+                    source.platform,
+                    "runtime_agent_running",
+                    "Agent is running — wait or /stop first, then change runtime.",
+                )
 
             # /approve and /deny must bypass the running-agent interrupt path.
             # The agent thread is blocked on a threading.Event inside
@@ -13542,21 +13697,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter = self._adapter_for_source(source)
                     if adapter:
                         if reset_reason == "suspended":
-                            reason_text = "previous session was stopped or interrupted"
+                            reason_text = _aops_runtime_text(
+                                source.platform,
+                                "reset_reason_suspended",
+                                "previous session was stopped or interrupted",
+                            )
                         elif reset_reason == "resume_pending_expired":
-                            reason_text = "gateway restart recovery timed out"
+                            reason_text = _aops_runtime_text(
+                                source.platform,
+                                "reset_reason_recovery_timeout",
+                                "gateway restart recovery timed out",
+                            )
                         elif reset_reason == "daily":
-                            reason_text = f"daily schedule at {policy.at_hour}:00"
+                            reason_text = _aops_runtime_text(
+                                source.platform,
+                                "reset_reason_daily",
+                                "daily schedule at {hour}:00",
+                                hour=policy.at_hour,
+                            )
                         else:
                             hours = policy.idle_minutes // 60
                             mins = policy.idle_minutes % 60
                             duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
-                            reason_text = f"inactive for {duration}"
-                        notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
+                            reason_text = _aops_runtime_text(
+                                source.platform,
+                                "reset_reason_inactive",
+                                "inactive for {duration}",
+                                duration=duration,
+                                minutes=policy.idle_minutes,
+                            )
+                        notice = _aops_runtime_text(
+                            source.platform,
+                            "auto_reset",
+                            (
+                                "◐ Session automatically reset ({reason}). "
+                                "Conversation history cleared.\n"
+                                "Use /resume to browse and restore a previous session.\n"
+                                "Adjust reset timing in config.yaml under session_reset."
+                            ),
+                            reason=reason_text,
                         )
                         try:
                             session_info = await asyncio.to_thread(
@@ -14008,13 +14187,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # reaches gateway users directly.
                                         from agent.redact import redact_sensitive_text
                                         _err = redact_sensitive_text(_err, force=True)
-                                        _warn_msg = (
-                                            "⚠️ Context compression aborted "
-                                            f"({_err}). No messages were dropped — "
-                                            "conversation is unchanged. Run /compress "
-                                            "to retry, /reset for a clean session, or "
-                                            "check your auxiliary.compression model "
-                                            "configuration."
+                                        _warn_msg = _aops_runtime_text(
+                                            source.platform,
+                                            "compression_aborted",
+                                            (
+                                                "⚠️ Context compression aborted "
+                                                "({error}). No messages were dropped — "
+                                                "conversation is unchanged. Run /compress "
+                                                "to retry, /reset for a clean session, or "
+                                                "check your auxiliary.compression model "
+                                                "configuration."
+                                            ),
+                                            error=_err,
                                         )
                                         try:
                                             _adapter = self._adapter_for_source(source)
@@ -14041,11 +14225,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     elif _comp is not None and getattr(_comp, "_last_aux_model_failure_model", None):
                                         _aux_model = getattr(_comp, "_last_aux_model_failure_model", "")
                                         _aux_err = getattr(_comp, "_last_aux_model_failure_error", None) or "unknown error"
-                                        _aux_msg = (
-                                            f"ℹ️ Configured compression model `{_aux_model}` "
-                                            f"failed ({_aux_err}). Recovered using your main "
-                                            "model — context is intact — but you may want to "
-                                            "check `auxiliary.compression.model` in config.yaml."
+                                        _aux_msg = _aops_runtime_text(
+                                            source.platform,
+                                            "compression_fallback",
+                                            (
+                                                "ℹ️ Configured compression model `{model}` "
+                                                "failed ({error}). Recovered using your main "
+                                                "model — context is intact — but you may want "
+                                                "to check `auxiliary.compression.model` in "
+                                                "config.yaml."
+                                            ),
+                                            model=_aux_model,
+                                            error=_aux_err,
                                         )
                                         try:
                                             _adapter = self._adapter_for_source(source)
@@ -14164,12 +14355,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source.platform == Platform.SLACK
                     else "/sethome"
                 )
-                notice = (
-                    f"📬 No home channel is set for {platform_name.title()}. "
-                    f"A home channel is where Hermes delivers cron job results "
-                    f"and cross-platform messages.\n\n"
-                    f"Type {sethome_cmd} to make this chat your home channel, "
-                    f"or ignore to skip."
+                notice = _aops_runtime_text(
+                    source.platform,
+                    "home_channel_missing",
+                    (
+                        "📬 No home channel is set for {platform}. "
+                        "A home channel is where Hermes delivers cron job results "
+                        "and cross-platform messages.\n\n"
+                        "Type {command} to make this chat your home channel, "
+                        "or ignore to skip."
+                    ),
+                    platform=platform_name.title(),
+                    command=sethome_cmd,
                 )
                 await self._deliver_platform_notice(source, notice)
         
@@ -15031,12 +15228,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         inside this method, so contextvars behave correctly in the worker
         thread.
         """
+        is_aops = source.platform == Platform.AOPS
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(aops=True) if is_aops else self._format_session_info()
+        return self._format_session_info(aops=True) if is_aops else self._format_session_info()
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, *, aops: bool = False) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -15129,11 +15327,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Format context source hint
         if config_context_length is not None:
-            ctx_source = "config"
+            ctx_source_key = "config"
         elif context_length == DEFAULT_FALLBACK_CONTEXT:
-            ctx_source = "default — set model.context_length in config to override"
+            ctx_source_key = "default"
         else:
-            ctx_source = "detected"
+            ctx_source_key = "detected"
 
         # Format context length for display
         if context_length >= 1_000_000:
@@ -15143,15 +15341,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             ctx_display = str(context_length)
 
-        lines = [
-            f"◆ Model: `{model}`",
-            f"◆ Provider: {provider or 'openrouter'}",
-            f"◆ Context: {ctx_display} tokens ({ctx_source})",
-        ]
+        if aops:
+            from gateway.aops_i18n import aops_t
+
+            ctx_source = aops_t(f"reset_info.source_{ctx_source_key}")
+            lines = [
+                aops_t("reset_info.model", model=model),
+                aops_t("reset_info.provider", provider=provider or "openrouter"),
+                aops_t(
+                    "reset_info.context",
+                    context=ctx_display,
+                    source=ctx_source,
+                ),
+            ]
+        else:
+            ctx_source = {
+                "config": "config",
+                "default": "default — set model.context_length in config to override",
+                "detected": "detected",
+            }[ctx_source_key]
+            lines = [
+                f"◆ Model: `{model}`",
+                f"◆ Provider: {provider or 'openrouter'}",
+                f"◆ Context: {ctx_display} tokens ({ctx_source})",
+            ]
 
         # Show endpoint for local/custom setups
         if base_url and ("localhost" in base_url or "127.0.0.1" in base_url or "0.0.0.0" in base_url):
-            lines.append(f"◆ Endpoint: {base_url}")
+            if aops:
+                lines.append(aops_t("reset_info.endpoint", url=base_url))
+            else:
+                lines.append(f"◆ Endpoint: {base_url}")
 
         return "\n".join(lines)
 
@@ -16982,9 +17202,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await execute()
 
         session_key = self._session_key_for_source(event.source)
+        is_aops = event.source.platform == Platform.AOPS
 
         async def _on_confirm(choice: str):
             if choice == "cancel":
+                if is_aops:
+                    from gateway.aops_i18n import aops_t
+
+                    return aops_t("slash_confirm.cancelled", command=command)
                 return f"🟡 /{command} cancelled. Conversation unchanged."
             if choice == "always":
                 try:
@@ -17000,11 +17225,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             result = await execute()
             if choice == "always":
-                note = (
-                    "\n\nℹ️ Future /clear, /new, /reset, and /undo will run "
-                    "without confirmation. Re-enable via "
-                    "`approvals.destructive_slash_confirm: true` in config.yaml."
-                )
+                if is_aops:
+                    from gateway.aops_i18n import aops_t
+
+                    note = aops_t("slash_confirm.always_followup")
+                else:
+                    note = (
+                        "\n\nℹ️ Future /clear, /new, /reset, and /undo will run "
+                        "without confirmation. Re-enable via "
+                        "`approvals.destructive_slash_confirm: true` in config.yaml."
+                    )
                 if isinstance(result, str):
                     return result + note
                 # EphemeralReply or other — leave untouched; the opt-out note
@@ -17014,15 +17244,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return result
 
         _p = self._typed_command_prefix_for(event.source.platform)
-        prompt_message = (
-            f"⚠️ **Confirm /{command}**\n\n"
-            f"{detail}\n\n"
-            "Choose:\n"
-            "• **Approve Once** — proceed this time only\n"
-            "• **Always Approve** — proceed and silence this prompt permanently\n"
-            "• **Cancel** — keep current conversation\n\n"
-            f"_Text fallback: reply `{_p}approve`, `{_p}always`, or `{_p}cancel`._"
-        )
+        if is_aops:
+            from gateway.aops_i18n import aops_t
+
+            localized_detail = detail
+            if command == "new":
+                localized_detail = aops_t("slash_confirm.new_detail")
+            elif command == "undo":
+                match = re.search(r"\blast\s+(\d+)\s+user turns?\b", detail)
+                count = int(match.group(1)) if match else 1
+                localized_detail = aops_t(
+                    "slash_confirm.undo_one_detail"
+                    if count == 1
+                    else "slash_confirm.undo_many_detail",
+                    count=count,
+                )
+            prompt_message = aops_t(
+                "slash_confirm.prompt",
+                command=command,
+                detail=localized_detail,
+                prefix=_p,
+            )
+        else:
+            prompt_message = (
+                f"⚠️ **Confirm /{command}**\n\n"
+                f"{detail}\n\n"
+                "Choose:\n"
+                "• **Approve Once** — proceed this time only\n"
+                "• **Always Approve** — proceed and silence this prompt permanently\n"
+                "• **Cancel** — keep current conversation\n\n"
+                f"_Text fallback: reply `{_p}approve`, `{_p}always`, or `{_p}cancel`._"
+            )
         return await self._request_slash_confirm(
             event=event,
             command=command,
@@ -23008,20 +23260,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _parts = []
                         if _want_iteration_detail:
                             _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
+                                _aops_runtime_text(
+                                    source.platform,
+                                    "iteration_detail",
+                                    "iteration {iteration}/{maximum}",
+                                    iteration=_a["api_call_count"],
+                                    maximum=_a["max_iterations"],
+                                )
                             )
                         _action = _a.get("current_tool") or _a.get("last_activity_desc")
                         if _action:
-                            _parts.append(str(_action))
+                            _parts.append(
+                                _aops_activity_label(source.platform, _action)
+                            )
                         if _parts:
-                            _status_detail = " — " + ", ".join(_parts)
+                            separator = (
+                                "，"
+                                if _gateway_platform_value(source.platform) == "aops"
+                                else ", "
+                            )
+                            _status_detail = " — " + separator.join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = (
-                    _generic_status_phrase("status")
-                    if _long_running_mode == "generic"
-                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
-                )
+                if _long_running_mode == "generic":
+                    _heartbeat_text = (
+                        _aops_runtime_text(
+                            source.platform,
+                            "still_working",
+                            _generic_status_phrase("status"),
+                        )
+                        if source.platform == Platform.AOPS
+                        else _generic_status_phrase("status")
+                    )
+                else:
+                    _heartbeat_text = _aops_runtime_text(
+                        source.platform,
+                        "long_running",
+                        "⏳ Working — {minutes} min{detail}",
+                        minutes=_elapsed_mins,
+                        detail=_status_detail,
+                    )
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
@@ -23167,10 +23445,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             try:
                                 await _warn_adapter.send(
                                     source.chat_id,
-                                    f"⚠️ No activity for {_elapsed_warn} min. "
-                                    f"If the agent does not respond soon, it will "
-                                    f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
+                                    _aops_runtime_text(
+                                        source.platform,
+                                        "inactivity_warning",
+                                        (
+                                            "⚠️ No activity for {elapsed} min. "
+                                            "If the agent does not respond soon, it will "
+                                            "be timed out in {remaining} min. "
+                                            "You can continue waiting or use /reset."
+                                        ),
+                                        elapsed=_elapsed_warn,
+                                        remaining=_remaining_mins,
+                                    ),
                                     metadata=_non_conversational_metadata(
                                         _active_status_thread_metadata(),
                                         platform=source.platform,

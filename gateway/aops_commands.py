@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from gateway.aops_i18n import aops_error, aops_t
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.aops_skillhub_bridge import execute_silent_skillhub_command
 from gateway.platforms.base import MessageEvent
@@ -520,16 +521,13 @@ def is_blocked(config: Any, command: str | None, raw_args: str = "", canonical: 
 
 
 def block_message(command: str | None) -> str:
-    label = f"/{command}" if command else "this command"
-    return f"Command `{label}` is blocked by AOPS config."
+    label = f"/{command}" if command else aops_t("command.this")
+    return aops_t("command.blocked", command=label)
 
 
 def unsupported_message(command: str | None) -> str:
-    label = f"/{command}" if command else "this command"
-    return (
-        f"Command `{label}` is not supported on AOPS. "
-        "Use `/help` or `/commands` to view the supported command set."
-    )
+    label = f"/{command}" if command else aops_t("command.this")
+    return aops_t("command.unsupported", command=label)
 
 
 def _tokens(raw_args: str) -> list[str]:
@@ -548,13 +546,17 @@ def _cron_schedule_flags(job: dict[str, Any]) -> dict[str, Any]:
     is_one_shot = bool(kind == "once")
     schedule_warning = None
     if kind == "once" and times is None:
-        schedule_warning = "once schedule with forever repeat is terminal after one run; convert schedule to an interval for recurring execution"
+        schedule_warning = aops_t("cron.one_shot_warning")
     if times is None:
-        repeat_text = "forever" if kind in {"interval", "cron"} else None
+        repeat_text = aops_t("cron.repeat_forever") if kind in {"interval", "cron"} else None
     elif times == 1:
-        repeat_text = "once"
+        repeat_text = aops_t("cron.repeat_once")
     else:
-        repeat_text = f"{completed}/{times}" if completed else f"{times} times"
+        repeat_text = (
+            aops_t("cron.repeat_progress", completed=completed, count=times)
+            if completed
+            else aops_t("cron.repeat_times", count=times)
+        )
     return {
         "scheduleKind": kind,
         "repeatText": repeat_text,
@@ -776,7 +778,7 @@ def _json_payload_after_action(raw_args: str, action: str) -> tuple[dict[str, An
     if not text:
         return None, {
             "code": "AOPS_INSTRUCTION_INVALID_JSON",
-            "message": "Expected JSON payload, for example {\"content\":\"...\"}.",
+            "message": aops_t("common.expected_json", example='{"content":"..."}'),
         }
     try:
         payload = json.loads(text)
@@ -785,7 +787,7 @@ def _json_payload_after_action(raw_args: str, action: str) -> tuple[dict[str, An
     if not isinstance(payload, dict):
         return None, {
             "code": "AOPS_INSTRUCTION_INVALID_JSON",
-            "message": "Payload must be a JSON object.",
+            "message": aops_t("common.json_object_required"),
         }
     return payload, None
 
@@ -820,7 +822,7 @@ def _instruction_command(kind: str, command_text: str, raw_args: str, args: list
                 "contentLength": len(content),
                 "updatedAtMs": _to_ms(datetime.fromtimestamp(path.stat().st_mtime)) if path.exists() else None,
                 "effectiveImmediately": True,
-                "message": f"Current {label} content.",
+                "message": aops_t("instruction.current", label=label),
             },
         )
         return LocalCommandResult(text=text, metadata={})
@@ -830,7 +832,7 @@ def _instruction_command(kind: str, command_text: str, raw_args: str, args: list
             command_text,
             type_prefix,
             "AOPS_INSTRUCTION_INVALID_JSON",
-            f"Usage: /{type_prefix} [get|set|append] {{json}}",
+            aops_t("common.usage", usage=f"/{type_prefix} [get|set|append] {{json}}"),
             path,
         )
         return LocalCommandResult(text=text, metadata={})
@@ -846,7 +848,7 @@ def _instruction_command(kind: str, command_text: str, raw_args: str, args: list
             command_text,
             type_prefix,
             "AOPS_INSTRUCTION_EMPTY_CONTENT",
-            "Payload field 'content' must be a non-empty string.",
+            aops_t("common.non_empty_content"),
             path,
         )
         return LocalCommandResult(text=text, metadata={})
@@ -890,7 +892,7 @@ def _instruction_command(kind: str, command_text: str, raw_args: str, args: list
             "updatedAtMs": now,
             "operation": action,
             "effectiveImmediately": True,
-            "message": f"Updated {label}. Future turns will reload the updated instruction file.",
+            "message": aops_t("instruction.updated", label=label),
         },
     )
     return LocalCommandResult(
@@ -961,7 +963,12 @@ def _busy_command(command_text: str, args: list[str]) -> LocalCommandResult:
                 "usage": "/busy [queue|steer|interrupt|status]",
             },
             ok=False,
-            error={"code": "AOPS_BUSY_INVALID_MODE", "message": f"Unsupported busy mode: {mode}"},
+            error=aops_error(
+                "AOPS_BUSY_INVALID_MODE",
+                "common.unsupported_value",
+                field="busy mode",
+                value=mode,
+            ),
         )
         return LocalCommandResult(text=text, metadata={})
     saved = _save_busy_input_mode(mode)
@@ -1080,12 +1087,18 @@ def _memory_response(
 def _memory_error(command_text: str, code: str, message: str) -> LocalCommandResult:
     data = _memory_status_data()
     data["effectiveImmediately"] = False
+    if code == "AOPS_MEMORY_READ_FAILED":
+        error = aops_error(code, "common.read_failed", raw_message=message)
+    elif code in {"AOPS_MEMORY_RESET_FAILED", "AOPS_MEMORY_CONFIG_WRITE_FAILED"}:
+        error = aops_error(code, "common.write_failed", raw_message=message)
+    else:
+        error = {"code": code, "message": message}
     return _memory_response(
         command_text,
         "memory.updated",
         data,
         ok=False,
-        error={"code": code, "message": message},
+        error=error,
     )
 
 
@@ -1114,7 +1127,11 @@ def _memory_content(command_text: str) -> LocalCommandResult:
                 "restartRequired": False,
             },
             ok=False,
-            error={"code": "AOPS_MEMORY_READ_FAILED", "message": str(exc)},
+            error=aops_error(
+                "AOPS_MEMORY_READ_FAILED",
+                "common.read_failed",
+                raw_message=str(exc),
+            ),
         )
     return _memory_response(
         command_text,
@@ -1154,13 +1171,21 @@ def _memory_command(command_text: str, args: list[str]) -> LocalCommandResult:
     action = args[0].lower().replace("-", "_")
     if action == "get":
         if len(args) not in {1, 2} or (len(args) == 2 and args[1].lower() != "memory"):
-            return _memory_error(command_text, "AOPS_MEMORY_INVALID_SUBCOMMAND", "Usage: /memory get [memory]")
+            return _memory_error(
+                command_text,
+                "AOPS_MEMORY_INVALID_SUBCOMMAND",
+                aops_t("common.usage", usage="/memory get [memory]"),
+            )
         return _memory_content(command_text)
 
     if action == "reset":
         target = args[1].lower() if len(args) > 1 else ""
         if target not in {"memory", "user", "all"} or len(args) > 2:
-            return _memory_error(command_text, "AOPS_MEMORY_INVALID_TARGET", "Usage: /memory reset <memory|user|all>")
+            return _memory_error(
+                command_text,
+                "AOPS_MEMORY_INVALID_TARGET",
+                aops_t("common.usage", usage="/memory reset <memory|user|all>"),
+            )
         memory_path, user_path, _state_path, _home = _memory_paths()
         paths = [memory_path, user_path] if target == "all" else [memory_path if target == "memory" else user_path]
         try:
@@ -1186,13 +1211,21 @@ def _memory_command(command_text: str, args: list[str]) -> LocalCommandResult:
         if len(args) == 1:
             return _memory_response(command_text, "memory.status", _memory_status_data())
         if len(args) != 2:
-            return _memory_error(command_text, "AOPS_MEMORY_INVALID_LIMIT", f"Usage: /memory {action} <positive integer>")
+            return _memory_error(
+                command_text,
+                "AOPS_MEMORY_INVALID_LIMIT",
+                aops_t("common.usage", usage=f"/memory {action} <positive integer>"),
+            )
         try:
             value = int(args[1], 10)
         except (TypeError, ValueError):
             value = -1
         if value <= 0 or value > _MEMORY_LIMIT_MAX or str(value) != str(args[1]).strip().lstrip("+"):
-            return _memory_error(command_text, "AOPS_MEMORY_INVALID_LIMIT", f"{label}预算必须是 1..{_MEMORY_LIMIT_MAX} 的正整数。")
+            return _memory_error(
+                command_text,
+                "AOPS_MEMORY_INVALID_LIMIT",
+                aops_t("memory.invalid_limit", label=label, maximum=_MEMORY_LIMIT_MAX),
+            )
         try:
             _memory_write_config({config_key: value})
         except Exception as exc:
@@ -1209,10 +1242,18 @@ def _memory_command(command_text: str, args: list[str]) -> LocalCommandResult:
 
     if action in {"enable", "disable"}:
         if len(args) != 2:
-            return _memory_error(command_text, "AOPS_MEMORY_INVALID_TARGET", f"Usage: /memory {action} <memory|user|all>")
+            return _memory_error(
+                command_text,
+                "AOPS_MEMORY_INVALID_TARGET",
+                aops_t("common.usage", usage=f"/memory {action} <memory|user|all>"),
+            )
         target = _MEMORY_TARGETS.get(args[1].lower())
         if target is None and args[1].lower() != "all":
-            return _memory_error(command_text, "AOPS_MEMORY_INVALID_TARGET", "Target must be memory, user, profile, or all.")
+            return _memory_error(
+                command_text,
+                "AOPS_MEMORY_INVALID_TARGET",
+                aops_t("memory.invalid_target"),
+            )
         value = action == "enable"
         updates = {}
         if args[1].lower() in {"memory", "all"}:
@@ -1259,9 +1300,17 @@ def _memory_command(command_text: str, args: list[str]) -> LocalCommandResult:
         if provider_action == "enable" and len(args) in {2, 3}:
             provider = args[2].strip() if len(args) == 3 else str(_memory_status_data()["provider"].get("lastProvider") or "").strip()
             if not provider:
-                return _memory_error(command_text, "AOPS_MEMORY_PROVIDER_REQUIRED", "Specify a provider, for example: /memory provider enable hindsight")
+                return _memory_error(
+                    command_text,
+                    "AOPS_MEMORY_PROVIDER_REQUIRED",
+                    aops_t("memory.provider_required"),
+                )
             if not _MEMORY_PROVIDER_RE.fullmatch(provider):
-                return _memory_error(command_text, "AOPS_MEMORY_PROVIDER_INVALID", "Provider name contains unsupported characters.")
+                return _memory_error(
+                    command_text,
+                    "AOPS_MEMORY_PROVIDER_INVALID",
+                    aops_t("memory.provider_invalid"),
+                )
             try:
                 _memory_write_config({"provider": provider})
                 _write_memory_provider_state(_memory_paths()[2], provider)
@@ -1275,9 +1324,20 @@ def _memory_command(command_text: str, args: list[str]) -> LocalCommandResult:
                 data,
                 effects={"invalidateAgentCache": True, "providerChanged": True, "reason": "aops_memory_provider_enabled"},
             )
-        return _memory_error(command_text, "AOPS_MEMORY_INVALID_SUBCOMMAND", "Usage: /memory provider <status|enable [name]|disable>")
+        return _memory_error(
+            command_text,
+            "AOPS_MEMORY_INVALID_SUBCOMMAND",
+            aops_t("common.usage", usage="/memory provider <status|enable [name]|disable>"),
+        )
 
-    return _memory_error(command_text, "AOPS_MEMORY_INVALID_SUBCOMMAND", "Usage: /memory [status|get|reset|memory_char_limit|user_char_limit|enable|disable|provider]")
+    return _memory_error(
+        command_text,
+        "AOPS_MEMORY_INVALID_SUBCOMMAND",
+        aops_t(
+            "common.usage",
+            usage="/memory [status|get|reset|memory_char_limit|user_char_limit|enable|disable|provider]",
+        ),
+    )
 
 
 def _event_center_command(
@@ -1391,7 +1451,10 @@ def _event_center_command(
         ok=False,
         error={
             "code": "AOPS_EVENT_CENTER_INVALID_SUBCOMMAND",
-            "message": "Usage: /event-center [status|use <eventId>|clear]",
+            "message": aops_t(
+                "common.usage",
+                usage="/event-center [status|use <eventId>|clear]",
+            ),
         },
     )
 
@@ -1469,7 +1532,11 @@ def _reasoning_command(command_text: str, args: list[str]) -> str:
             command=command_text,
             data={"allowed": ["none", "minimal", "low", "medium", "high", "xhigh", "show", "hide", "on", "off", "status"]},
             ok=False,
-            error={"code": "REASONING_USAGE", "message": "Usage: /reasoning [none|minimal|low|medium|high|xhigh|show|hide|status]"},
+            error=aops_error(
+                "REASONING_USAGE",
+                "common.usage",
+                usage="/reasoning [none|minimal|low|medium|high|xhigh|show|hide|status]",
+            ),
         )
     option = str(args[0] or "").strip().lower().replace("_", "-")
     if option in {"show", "on"}:
@@ -1531,7 +1598,12 @@ def _reasoning_command(command_text: str, args: list[str]) -> str:
             command=command_text,
             data={"allowed": ["none", "minimal", "low", "medium", "high", "xhigh", "show", "hide", "status"]},
             ok=False,
-            error={"code": "REASONING_INVALID_OPTION", "message": f"Unsupported reasoning option: {args[0]}"},
+            error=aops_error(
+                "REASONING_INVALID_OPTION",
+                "common.unsupported_value",
+                field="reasoning option",
+                value=args[0],
+            ),
         )
     agent = cfg.setdefault("agent", {})
     if not isinstance(agent, dict):
@@ -1889,7 +1961,11 @@ def _skills_command(command_text: str, args: list[str]) -> str:
             items=[],
             error={
                 "code": "SKILLS_USAGE",
-                "message": "Usage: /skills list | /skills enable <name> | /skills disable <name> | /skills set <name> <true|false> | /skills uninstall <name>",
+                "message": aops_t(
+                    "common.usage",
+                    usage="/skills list | /skills enable <name> | /skills disable <name> | "
+                    "/skills set <name> <true|false> | /skills uninstall <name>",
+                ),
             },
         )
     if len(args) < 2:
@@ -1898,7 +1974,7 @@ def _skills_command(command_text: str, args: list[str]) -> str:
             command=command_text,
             item_type="skill",
             items=[],
-            error={"code": "SKILL_NAME_REQUIRED", "message": "Skill name is required."},
+            error=aops_error("SKILL_NAME_REQUIRED", "skills.name_required"),
         )
 
     if action in {"uninstall", "remove"}:
@@ -1949,7 +2025,10 @@ def _skills_command(command_text: str, args: list[str]) -> str:
                 command=command_text,
                 item_type="skill",
                 items=[],
-                error={"code": "SKILL_UNINSTALL_FAILED", "message": message or f"Failed to uninstall `{target_ref}`."},
+                error={
+                    "code": "SKILL_UNINSTALL_FAILED",
+                    "message": message or aops_t("skills.uninstall_failed", name=target_ref),
+                },
             )
         try:
             items, context = _skill_items()
@@ -1970,7 +2049,12 @@ def _skills_command(command_text: str, args: list[str]) -> str:
                 items=[],
                 context=result.get("context") or context,
                 summary=_skills_summary(items),
-                error=result.get("error") or {"code": "SKILL_UNINSTALL_FAILED", "message": f"Failed to uninstall `{target_ref}`."},
+                error=result.get("error")
+                or aops_error(
+                    "SKILL_UNINSTALL_FAILED",
+                    "skills.uninstall_failed",
+                    name=target_ref,
+                ),
             )
         items_after, context_after = _skill_items()
         context_after.update({"agentId": "main", "workspaceDir": os.getcwd()})
@@ -1999,7 +2083,11 @@ def _skills_command(command_text: str, args: list[str]) -> str:
                 command=command_text,
                 item_type="skill",
                 items=[],
-                error={"code": "SKILL_SET_USAGE", "message": "Usage: /skills set <name> <true|false>"},
+                error=aops_error(
+                    "SKILL_SET_USAGE",
+                    "common.usage",
+                    usage="/skills set <name> <true|false>",
+                ),
             )
         requested_enabled = str(args[-1]).strip().lower() == "true"
         target_ref = " ".join(args[1:-1]).strip()
@@ -2034,7 +2122,11 @@ def _skills_command(command_text: str, args: list[str]) -> str:
             items=[],
             context=context,
             summary=_skills_summary(items),
-            error={"code": "SKILL_NOT_FOUND", "message": f"Skill `{target_ref}` not found."},
+            error=aops_error(
+                "SKILL_NOT_FOUND",
+                "skills.not_found",
+                name=target_ref,
+            ),
         )
 
     cfg = load_config()
@@ -2301,7 +2393,11 @@ def _toolsets_command(command_text: str, event: MessageEvent, args: list[str]) -
             type_="toolsets.updated",
             error={
                 "code": "TOOLSETS_USAGE",
-                "message": "Usage: /toolsets list | /toolsets enable <name> | /toolsets disable <name> | /toolsets set <name> <true|false>",
+                "message": aops_t(
+                    "common.usage",
+                    usage="/toolsets list | /toolsets enable <name> | /toolsets disable <name> | "
+                    "/toolsets set <name> <true|false>",
+                ),
             },
         )
 
@@ -2310,7 +2406,7 @@ def _toolsets_command(command_text: str, event: MessageEvent, args: list[str]) -
             command_text=command_text,
             event=event,
             type_="toolsets.updated",
-            error={"code": "TOOLSET_NAME_REQUIRED", "message": "Toolset name is required."},
+            error=aops_error("TOOLSET_NAME_REQUIRED", "toolsets.name_required"),
         )
 
     target = str(args[1] or "").strip().lower()
@@ -2321,7 +2417,11 @@ def _toolsets_command(command_text: str, event: MessageEvent, args: list[str]) -
                 command_text=command_text,
                 event=event,
                 type_="toolsets.updated",
-                error={"code": "TOOLSET_SET_USAGE", "message": "Usage: /toolsets set <name> <true|false>"},
+                error=aops_error(
+                    "TOOLSET_SET_USAGE",
+                    "common.usage",
+                    usage="/toolsets set <name> <true|false>",
+                ),
             )
         requested_enabled = str(args[2]).strip().lower() == "true"
     else:
@@ -2342,7 +2442,11 @@ def _toolsets_command(command_text: str, event: MessageEvent, args: list[str]) -
             command_text=command_text,
             event=event,
             type_="toolsets.updated",
-            error={"code": "TOOLSET_NOT_FOUND", "message": f"Toolset `{target}` not found."},
+            error=aops_error(
+                "TOOLSET_NOT_FOUND",
+                "toolsets.not_found",
+                name=target,
+            ),
         )
 
     cfg = load_config()
@@ -2373,7 +2477,7 @@ def _cron_channel_error(command_text: str, channel_value: Any) -> str:
         items=[],
         error={
             "code": "CRON_INVALID_CHANNEL",
-            "message": "Cron channel must be one of: tec01, anyi.",
+            "message": aops_t("cron.channel_invalid"),
             "details": {"channel": channel_value},
         },
     )
@@ -2723,7 +2827,7 @@ def _current_model_payload(event: MessageEvent | None = None) -> tuple[dict[str,
     if not endpoint["baseUrl"]:
         error = {
             "code": "MODEL_GATEWAY_NOT_CONFIGURED",
-            "message": "当前用户未配置模型网关 base_url，无法查询模型列表。",
+            "message": aops_t("model.gateway_missing"),
         }
     else:
         cache_ttl = 0.0
@@ -2755,7 +2859,7 @@ def _current_model_payload(event: MessageEvent | None = None) -> tuple[dict[str,
         else:
             error = {
                 "code": "MODEL_GATEWAY_FETCH_FAILED",
-                "message": "无法从当前模型网关获取模型列表。",
+                "message": aops_t("model.list_failed"),
                 "details": {
                     "probedUrl": probe.get("probed_url"),
                     "resolvedBaseUrl": probe.get("resolved_base_url"),
@@ -2920,7 +3024,11 @@ def _aops_model_use(command_text: str, event: MessageEvent, args: list[str]) -> 
                 command=command_text,
                 data={"allowedUsage": "/model use <provider> <model>"},
                 ok=False,
-                error={"code": "MODEL_USAGE", "message": "Usage: /model use <provider> <model>"},
+                error=aops_error(
+                    "MODEL_USAGE",
+                    "common.usage",
+                    usage="/model use <provider> <model>",
+                ),
             )
         explicit_provider = args[1]
         model_input = " ".join(args[2:]).strip()
@@ -2930,7 +3038,11 @@ def _aops_model_use(command_text: str, event: MessageEvent, args: list[str]) -> 
             command=command_text,
             data={"allowedUsage": "/model use <provider> <model>"},
             ok=False,
-            error={"code": "MODEL_USAGE", "message": "Usage: /model use <provider> <model>"},
+            error=aops_error(
+                "MODEL_USAGE",
+                "common.usage",
+                usage="/model use <provider> <model>",
+            ),
         )
 
     if not model_input or _is_reserved_model_token(model_input):
@@ -2939,7 +3051,11 @@ def _aops_model_use(command_text: str, event: MessageEvent, args: list[str]) -> 
             command=command_text,
             data={"allowedUsage": "/model use <provider> <model>"},
             ok=False,
-            error={"code": "MODEL_USAGE", "message": "Usage: /model use <provider> <model>"},
+            error=aops_error(
+                "MODEL_USAGE",
+                "common.usage",
+                usage="/model use <provider> <model>",
+            ),
         )
 
     cfg = load_config()
@@ -3091,7 +3207,10 @@ def _security_command(command_text: str, args: list[str]) -> str:
                 ok=False,
                 error={
                     "code": "SECURITY_TERMINAL_USAGE",
-                    "message": "Usage: /security terminal [status]",
+                    "message": aops_t(
+                        "common.usage",
+                        usage="/security terminal [status]",
+                    ),
                 },
             )
         return _single_response(
@@ -3121,7 +3240,11 @@ def _security_command(command_text: str, args: list[str]) -> str:
                 "allowedModes": ["off", "manual", "smart"],
             },
             ok=False,
-            error={"code": "SECURITY_USAGE", "message": "Usage: /security set <off|manual|smart>"},
+            error=aops_error(
+                "SECURITY_USAGE",
+                "common.usage",
+                usage="/security set <off|manual|smart>",
+            ),
         )
     requested = aliases.get(str(args[1]).strip().lower(), str(args[1]).strip().lower())
     if requested not in {"off", "manual", "smart"}:
@@ -3134,7 +3257,12 @@ def _security_command(command_text: str, args: list[str]) -> str:
                 "allowedModes": ["off", "manual", "smart"],
             },
             ok=False,
-            error={"code": "SECURITY_INVALID_MODE", "message": f"Unsupported security mode: {args[1]}"},
+            error=aops_error(
+                "SECURITY_INVALID_MODE",
+                "common.unsupported_value",
+                field="security mode",
+                value=args[1],
+            ),
         )
     approvals["mode"] = requested
     approvals["destructive_slash_confirm"] = requested != "off"
@@ -3538,7 +3666,7 @@ def _read_cron_history(command_text: str, args: list[str]) -> str:
     summary = {
         "task": _history_summary_item(job),
         "jobDeleted": job_deleted,
-        "message": "该定时任务当前不存在；根据历史记录判断，它可能是一次性任务，执行后已自动删除。" if job_deleted else None,
+        "message": aops_t("cron.deleted_history") if job_deleted else None,
     }
     return _list_response(
         type_="cron.history.list",
@@ -3564,13 +3692,24 @@ def _cron_single_error(command: str, type_: str, code: str, message: str, detail
 
 def _cron_decode_payload(command_text: str, raw_json: str, type_: str) -> dict[str, Any] | str:
     if not raw_json.strip():
-        return _cron_single_error(command_text, type_, "CRON_MISSING_PAYLOAD", "Expected a JSON object payload.")
+        return _cron_single_error(
+            command_text,
+            type_,
+            "CRON_MISSING_PAYLOAD",
+            aops_t("cron.payload_required"),
+        )
     try:
         payload = json.loads(raw_json)
     except json.JSONDecodeError as exc:
         return _cron_single_error(command_text, type_, "CRON_INVALID_JSON", str(exc), {"payload": raw_json})
     if not isinstance(payload, dict):
-        return _cron_single_error(command_text, type_, "CRON_INVALID_JSON", "Cron payload must be a JSON object.", {"payload": payload})
+        return _cron_single_error(
+            command_text,
+            type_,
+            "CRON_INVALID_JSON",
+            aops_t("cron.payload_object_required"),
+            {"payload": payload},
+        )
     return payload
 
 
@@ -3624,9 +3763,19 @@ def _cron_create(command_text: str, raw_args: str, event: MessageEvent | None = 
     prompt = str(payload.get("prompt") or "").strip()
     schedule = str(payload.get("schedule") or "").strip()
     if not prompt:
-        return _cron_single_error(command_text, "cron.created", "CRON_MISSING_PROMPT", "Cron create requires prompt.")
+        return _cron_single_error(
+            command_text,
+            "cron.created",
+            "CRON_MISSING_PROMPT",
+            aops_t("cron.prompt_required"),
+        )
     if not schedule:
-        return _cron_single_error(command_text, "cron.created", "CRON_MISSING_SCHEDULE", "Cron create requires schedule.")
+        return _cron_single_error(
+            command_text,
+            "cron.created",
+            "CRON_MISSING_SCHEDULE",
+            aops_t("cron.schedule_required"),
+        )
     origin = _cron_origin_from_event(event)
     if "channelId" in payload:
         try:
@@ -3651,9 +3800,9 @@ def _cron_create(command_text: str, raw_args: str, event: MessageEvent | None = 
         return _cron_single_error(command_text, "cron.created", "CRON_INVALID_SCHEDULE", str(exc))
     except Exception as exc:
         return _cron_single_error(command_text, "cron.created", "CRON_CREATE_FAILED", str(exc))
-    message = f"Created cron job `{job.get('name') or job.get('id')}`."
+    message = aops_t("cron.created", name=job.get("name") or job.get("id"))
     if trigger_now:
-        message += " Immediate trigger accepted."
+        message += f" {aops_t('cron.immediate_trigger_accepted')}"
         return _cron_task_result("cron.created", command_text, job, message=message, trigger_now=True)
     return _cron_task_response("cron.created", command_text, job, message=message)
 
@@ -3678,13 +3827,23 @@ def _cron_update(command_text: str, raw_args: str, event: MessageEvent | None = 
     rest = raw_args.strip()[len("update"):].strip()
     parts = rest.split(None, 1)
     if len(parts) < 2:
-        return _cron_single_error(command_text, "cron.updated", "CRON_UPDATE_USAGE", "Usage: /cron update <id|name> {json}")
+        return _cron_single_error(
+            command_text,
+            "cron.updated",
+            "CRON_UPDATE_USAGE",
+            aops_t("common.usage", usage="/cron update <id|name> {json}"),
+        )
     job_ref, raw_payload = parts
     resolved = _cron_resolve_ref(cron_jobs, command_text, "cron.updated", job_ref)
     if isinstance(resolved, str):
         return resolved
     if not resolved:
-        return _cron_single_error(command_text, "cron.updated", "CRON_JOB_NOT_FOUND", f"Cron job `{job_ref}` not found.")
+        return _cron_single_error(
+            command_text,
+            "cron.updated",
+            "CRON_JOB_NOT_FOUND",
+            aops_t("cron.not_found", name=job_ref),
+        )
     payload = _cron_decode_payload(command_text, raw_payload, "cron.updated")
     if isinstance(payload, str):
         return payload
@@ -3719,9 +3878,9 @@ def _cron_update(command_text: str, raw_args: str, event: MessageEvent | None = 
         return _cron_single_error(command_text, "cron.updated", "CRON_UPDATE_FAILED", str(exc))
     except Exception as exc:
         return _cron_single_error(command_text, "cron.updated", "CRON_UPDATE_FAILED", str(exc))
-    message = f"Updated cron job `{job.get('name') or job.get('id')}`."
+    message = aops_t("cron.updated", name=job.get("name") or job.get("id"))
     if trigger_now:
-        message += " Immediate trigger accepted."
+        message += f" {aops_t('cron.immediate_trigger_accepted')}"
         return _cron_task_result("cron.updated", command_text, job, message=message, trigger_now=True)
     return _cron_task_response("cron.updated", command_text, job, message=message)
 
@@ -3730,7 +3889,12 @@ def _cron_ref_action(command_text: str, args: list[str], *, action: str, type_: 
     from cron import jobs as cron_jobs
 
     if len(args) < 2:
-        return _cron_single_error(command_text, type_, f"CRON_{action.upper()}_MISSING_REF", f"Usage: /cron {action} <id|name>")
+        return _cron_single_error(
+            command_text,
+            type_,
+            f"CRON_{action.upper()}_MISSING_REF",
+            aops_t("common.usage", usage=f"/cron {action} <id|name>"),
+        )
     job_ref = args[1]
     try:
         if action == "pause":
@@ -3753,17 +3917,34 @@ def _cron_ref_action(command_text: str, args: list[str], *, action: str, type_: 
     except Exception as exc:
         return _cron_single_error(command_text, type_, f"CRON_{action.upper()}_FAILED", str(exc))
     if not job:
-        return _cron_single_error(command_text, type_, "CRON_JOB_NOT_FOUND", f"Cron job `{job_ref}` not found.")
+        return _cron_single_error(
+            command_text,
+            type_,
+            "CRON_JOB_NOT_FOUND",
+            aops_t("cron.not_found", name=job_ref),
+        )
     past = {"pause": "paused", "resume": "resumed", "trigger": "triggered"}.get(action, action)
     if action == "trigger":
         return _cron_task_result(
             type_,
             command_text,
             job,
-            message=f"Cron job `{job.get('name') or job.get('id')}` immediate trigger accepted.",
+            message=aops_t(
+                "cron.trigger_accepted",
+                name=job.get("name") or job.get("id"),
+            ),
             trigger_now=True,
         )
-    return _cron_task_response(type_, command_text, job, message=f"Cron job `{job.get('name') or job.get('id')}` {past}.")
+    return _cron_task_response(
+        type_,
+        command_text,
+        job,
+        message=aops_t(
+            "cron.action_completed",
+            name=job.get("name") or job.get("id"),
+            action=aops_t(f"cron.action_{past}"),
+        ),
+    )
 
 
 def _cron_remove(command_text: str, args: list[str]) -> str:
@@ -3781,7 +3962,7 @@ def _cron_remove(command_text: str, args: list[str]) -> str:
             ok=False,
             error={
                 "code": "CRON_REMOVE_MISSING_REF",
-                "message": "Usage: /cron remove <id|name>",
+                "message": aops_t("common.usage", usage="/cron remove <id|name>"),
             },
         )
 
@@ -3829,7 +4010,7 @@ def _cron_remove(command_text: str, args: list[str]) -> str:
             ok=False,
             error={
                 "code": "CRON_JOB_NOT_FOUND",
-                "message": f"Cron job `{job_ref}` not found.",
+                "message": aops_t("cron.not_found", name=job_ref),
             },
         )
 
@@ -3856,7 +4037,7 @@ def _cron_remove(command_text: str, args: list[str]) -> str:
             ok=False,
             error={
                 "code": "CRON_JOB_NOT_FOUND",
-                "message": f"Cron job `{job_ref}` not found.",
+                "message": aops_t("cron.not_found", name=job_ref),
             },
         )
 
@@ -3868,7 +4049,7 @@ def _cron_remove(command_text: str, args: list[str]) -> str:
             "task": summary,
             "channel": list((summary or {}).get("channel") or ["tec01"]),
             "removed": True,
-            "message": f"Removed cron job `{job.get('name') or job.get('id')}`.",
+            "message": aops_t("cron.removed", name=job.get("name") or job.get("id")),
         },
     )
 
@@ -4862,54 +5043,7 @@ def filter_help_lines(lines: Iterable[str], config: Any) -> list[str]:
 
 
 def aops_text_command_lines() -> list[str]:
-    return [
-        "`/profile` -- Show current profile name and home directory",
-        "`/profile delete` -- Preview permanent deletion of the current named profile",
-        "`/profile delete confirm <token>` -- Confirm profile deletion with a one-time token",
-        "`/skills` -- List installed skills",
-        "`/skills list` -- List installed skills",
-        "`/skills enable <name>` -- Enable an installed skill",
-        "`/skills disable <name>` -- Disable an installed skill",
-        "`/skills set <name> <true|false>` -- Enable or disable an installed skill",
-        "`/toolsets` -- List or update AOPS toolsets",
-        "`/toolsets list` -- List AOPS toolsets",
-        "`/toolsets enable <name>` -- Enable an AOPS toolset",
-        "`/toolsets disable <name>` -- Disable an AOPS toolset",
-        "`/toolsets set <name> <true|false>` -- Enable or disable an AOPS toolset",
-        "`/cron` -- Show scheduled tasks",
-        "`/cron list [channel]` -- Show scheduled tasks, optionally filtered by tec01 or anyi",
-        "`/cron create {json}` -- Create a scheduled task",
-        "`/cron update <id|name> {json}` -- Update a scheduled task",
-        "`/cron pause <id|name>` -- Pause a scheduled task",
-        "`/cron resume <id|name>` -- Resume a scheduled task",
-        "`/cron trigger <id|name>` -- Trigger a scheduled task immediately",
-        "`/cron remove <id|name>` -- Remove a scheduled task",
-        "`/cron history <id> [tsMs]` -- Show cron run history",
-        "`/cron history before <id> [tsMs]` -- Show cron history before an anchor",
-        "`/cron history after <id> <tsMs>` -- Show cron history after an anchor",
-        "`/soul` -- Show current SOUL.md instructions",
-        "`/soul set {json}` -- Replace SOUL.md instructions",
-        "`/soul append {json}` -- Append to SOUL.md instructions",
-        "`/user` -- Show current memories/USER.md instructions",
-        "`/user set {json}` -- Replace memories/USER.md instructions",
-        "`/user append {json}` -- Append to memories/USER.md instructions",
-        "`/busy [queue|steer|interrupt|status]` -- Show or switch busy input mode",
-        "`/memory` -- Show or manage memory settings",
-        "`/memory status` -- Show memory, user profile, budget, and provider status",
-        "`/memory get [memory]` -- Show the complete MEMORY.md content",
-        "`/memory reset <memory|user|all>` -- Reset local MEMORY.md and/or USER.md",
-        "`/memory memory_char_limit [chars]` -- Show or set MEMORY.md character budget",
-        "`/memory user_char_limit [chars]` -- Show or set USER.md character budget",
-        "`/memory enable <memory|user|all>` -- Enable built-in memory or user profile",
-        "`/memory disable <memory|user|all>` -- Disable built-in memory or user profile",
-        "`/memory provider <status|enable [name]|disable>` -- Manage external memory provider",
-        "`/event-center [status]` -- Show the current event-center context",
-        "`/event-center use <eventId>` -- Set event-center guidance for this AOPS channel",
-        "`/event-center clear` -- Clear event-center guidance for this AOPS channel",
-        "`/security` -- Show current approval policy",
-        "`/security terminal [status]` -- Show the current profile terminal command policy",
-        "`/security set <off|manual|smart>` -- Switch approval policy",
-    ]
+    return aops_t("help.command_lines").splitlines()
 
 
 def aops_skill_command_lines(config: Any) -> list[str]:

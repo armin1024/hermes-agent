@@ -15,6 +15,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from gateway.aops_i18n import aops_t
+
 _CONFIRMATION_TTL_SECONDS = 5 * 60
 _PENDING_LOCK = threading.RLock()
 _PENDING: dict[str, dict[str, Any]] = {}
@@ -122,9 +124,19 @@ def preview(command_text: str, event: Any):
     profile, profile_home = _profile_context()
     data = _base_data(profile, profile_home)
     if profile == "default":
-        return _error(command_text, "PROFILE_DEFAULT_PROTECTED", "The default profile cannot be deleted.", data)
+        return _error(
+            command_text,
+            "PROFILE_DEFAULT_PROTECTED",
+            aops_t("profile.default_protected"),
+            data,
+        )
     if not profile_home.is_dir():
-        return _error(command_text, "PROFILE_NOT_FOUND", f"Profile `{profile}` does not exist.", data)
+        return _error(
+            command_text,
+            "PROFILE_NOT_FOUND",
+            aops_t("profile.not_found", name=profile),
+            data,
+        )
 
     token = secrets.token_urlsafe(24)
     expires_at_ms = int((time.time() + _CONFIRMATION_TTL_SECONDS) * 1000)
@@ -133,7 +145,12 @@ def preview(command_text: str, event: Any):
     with _PENDING_LOCK:
         _cleanup_expired()
         if profile in _IN_PROGRESS:
-            return _error(command_text, "PROFILE_DELETE_IN_PROGRESS", f"Profile `{profile}` deletion is already in progress.", data)
+            return _error(
+                command_text,
+                "PROFILE_DELETE_IN_PROGRESS",
+                aops_t("profile.deletion_in_progress", name=profile),
+                data,
+            )
         for old_token, item in list(_PENDING.items()):
             if tuple(item.get("scope", ())) == scope:
                 _PENDING.pop(old_token, None)
@@ -180,18 +197,38 @@ def confirm(command_text: str, event: Any, token: str):
     data = _base_data(profile, profile_home)
     token = str(token or "").strip()
     if not token:
-        return _error(command_text, "PROFILE_DELETE_CONFIRMATION_REQUIRED", "A confirmation token is required.", data)
+        return _error(
+            command_text,
+            "PROFILE_DELETE_CONFIRMATION_REQUIRED",
+            aops_t("profile.confirmation_required"),
+            data,
+        )
     now_ms = int(time.time() * 1000)
     with _PENDING_LOCK:
         _cleanup_expired(now_ms / 1000)
         item = _PENDING.get(token)
         if item is None:
-            return _error(command_text, "PROFILE_DELETE_CONFIRMATION_INVALID", "The confirmation token is invalid or expired.", data)
+            return _error(
+                command_text,
+                "PROFILE_DELETE_CONFIRMATION_INVALID",
+                aops_t("profile.confirmation_invalid"),
+                data,
+            )
         if int(item.get("expiresAtMs", 0)) <= now_ms:
             _PENDING.pop(token, None)
-            return _error(command_text, "PROFILE_DELETE_CONFIRMATION_EXPIRED", "The confirmation token has expired.", data)
+            return _error(
+                command_text,
+                "PROFILE_DELETE_CONFIRMATION_EXPIRED",
+                aops_t("profile.confirmation_expired"),
+                data,
+            )
         if tuple(item.get("scope", ())) != _event_scope(event, profile):
-            return _error(command_text, "PROFILE_DELETE_CONFIRMATION_INVALID", "The confirmation token is bound to another AOPS session.", data)
+            return _error(
+                command_text,
+                "PROFILE_DELETE_CONFIRMATION_INVALID",
+                aops_t("profile.confirmation_wrong_session"),
+                data,
+            )
         _PENDING.pop(token, None)
         _IN_PROGRESS[profile] = time.time()
 
@@ -242,7 +279,7 @@ def handle(command_text: str, event: Any, args: list[str]):
     return _error(
         command_text,
         "PROFILE_DELETE_CONFIRMATION_REQUIRED",
-        "Usage: /profile delete, then /profile delete confirm <token>.",
+        aops_t("profile.delete_usage"),
         _base_data(*_profile_context()),
     )
 

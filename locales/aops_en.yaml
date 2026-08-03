@@ -1,0 +1,217 @@
+command:
+  this: "this command"
+  blocked: "Command `{command}` is blocked by AOPS config."
+  unsupported: "Command `{command}` is not supported on AOPS. Use `/help` or `/commands` to view the supported command set."
+common:
+  usage: "Usage: {usage}"
+  operation_failed: "The operation failed."
+  read_failed: "Failed to read the requested data."
+  write_failed: "Failed to save the requested change."
+  invalid_json: "The request contains invalid JSON."
+  json_object_required: "The payload must be a JSON object."
+  expected_json: "Expected a JSON payload, for example {example}."
+  non_empty_content: "Payload field `content` must be a non-empty string."
+  unsupported_value: "Unsupported {field}: {value}"
+instruction:
+  current: "Current {label} content."
+  updated: "Updated {label}. Future turns will reload the updated instruction file."
+memory:
+  invalid_limit: "{label} budget must be a positive integer from 1 to {maximum}."
+  invalid_target: "Target must be memory, user, profile, or all."
+  provider_required: "Specify a provider, for example: `/memory provider enable hindsight`."
+  provider_invalid: "Provider name contains unsupported characters."
+skills:
+  name_required: "Skill name is required."
+  not_found: "Skill `{name}` not found."
+  ambiguous: "Skill `{name}` matched multiple installed skills."
+  uninstall_failed: "Failed to uninstall skill `{name}`."
+  uninstalled: "Uninstalled local skill `{name}` from {path}."
+  list_rate_limited: "SkillHub rate limited the skills listing request. Please retry later."
+  install_rate_limited: "SkillHub rate limited the install request. Please retry later."
+  install_failed: "Failed to install skill `{name}`."
+  only_clawhub: "Only ClawHub commands are supported."
+  only_explore_json: "Only `clawhub explore --json` is supported."
+  install_slug_required: "A skill slug is required for installation."
+  uninstall_slug_required: "A skill slug is required for uninstallation."
+  unsupported_subcommand: "Unsupported ClawHub subcommand: {action}"
+  path_missing: "The matched skill has no SKILL.md path."
+  path_resolve_failed: "Unable to resolve the skill path."
+  root_delete_refused: "Refusing to remove the skills root directory."
+  outside_root_refused: "Refusing to remove a path outside the current profile skills directory."
+  metadata_delete_refused: "Refusing to remove SkillHub metadata directories."
+  symlink_delete_refused: "Refusing to remove a symlinked skill path: {path}"
+  directory_missing: "The matched skill directory does not exist."
+  skill_file_missing: "The matched directory does not contain SKILL.md."
+toolsets:
+  name_required: "Toolset name is required."
+  not_found: "Toolset `{name}` not found."
+profile:
+  default_protected: "The default profile cannot be deleted."
+  not_found: "Profile `{name}` does not exist."
+  deletion_in_progress: "Profile `{name}` deletion is already in progress."
+  confirmation_required: "A confirmation token is required."
+  confirmation_invalid: "The confirmation token is invalid or expired."
+  confirmation_expired: "The confirmation token has expired."
+  confirmation_wrong_session: "The confirmation token is bound to another AOPS session."
+  delete_usage: "Usage: `/profile delete`, then `/profile delete confirm <token>`."
+cron:
+  channel_invalid: "Cron channel must be one of: tec01, anyi."
+  payload_required: "Expected a JSON object payload."
+  payload_object_required: "Cron payload must be a JSON object."
+  prompt_required: "Cron create requires `prompt`."
+  schedule_required: "Cron create requires `schedule`."
+  not_found: "Cron job `{name}` not found."
+  created: "Created cron job `{name}`."
+  updated: "Updated cron job `{name}`."
+  removed: "Removed cron job `{name}`."
+  trigger_accepted: "Cron job `{name}` immediate trigger accepted."
+  action_completed: "Cron job `{name}` {action}."
+  action_paused: "paused"
+  action_resumed: "resumed"
+  action_triggered: "triggered"
+  immediate_trigger_accepted: "Immediate trigger accepted."
+  deleted_history: "This cron job no longer exists. Its history indicates that it may have been a one-shot job removed after execution."
+  history_anchor_not_found: "The requested history anchor was not found."
+  repeat_forever: "forever"
+  repeat_once: "once"
+  repeat_times: "{count} times"
+  repeat_progress: "{completed}/{count}"
+  one_shot_warning: "A once schedule with unlimited repeats is terminal after one run. Use an interval or cron schedule for recurring execution."
+model:
+  gateway_missing: "The current user has no model gateway `base_url`, so the model list cannot be queried."
+  list_failed: "Unable to retrieve the model list from the current model gateway."
+silent:
+  timeout: "The silent local command timed out after {seconds}s."
+  unsupported: "Unsupported silent command."
+attachment:
+  not_found: "The file does not exist or is no longer available."
+  path_denied: "This file path is not allowed for upload."
+  upload_dependency_missing: "The AOPS attachment upload dependency is unavailable."
+  upload_url_invalid: "The AOPS attachment upload URL is invalid."
+  upload_unauthorized: "The Bot Token is not authorized to upload attachments."
+  upload_failed: "The file upload failed."
+  upload_failed_http: "The file upload failed (HTTP {status})."
+  upload_client_failed: "Failed to initialize the attachment upload client."
+  invalid_response: "The attachment upload API returned an invalid response."
+  response_missing_file: "The attachment upload response is missing a file ID or download URL."
+  too_large: "The file exceeds the 50 MiB upload limit."
+  count_exceeded: "A single reply can upload at most 10 files."
+  total_too_large: "The total attachment size for one reply exceeds 100 MiB."
+delivery:
+  native_image_unsupported: "AOPS does not support native image delivery."
+  native_document_unsupported: "AOPS does not support native document delivery."
+  native_voice_unsupported: "AOPS does not support native voice delivery."
+  native_video_unsupported: "AOPS does not support native video delivery."
+slash_confirm:
+  prompt: "⚠️ **Confirm /{command}**\n\n{detail}\n\nChoose:\n• **Approve Once** — proceed this time only\n• **Always Approve** — proceed and silence this prompt permanently\n• **Cancel** — keep current conversation\n\n_Text fallback: reply `{prefix}approve`, `{prefix}always`, or `{prefix}cancel`._"
+  new_detail: "This starts a fresh session and discards the current conversation history."
+  undo_one_detail: "This removes the last user turn from history."
+  undo_many_detail: "This removes the last {count} user turns from history."
+  approve_once: "Approve Once"
+  approve_always: "Always Approve"
+  cancel: "Cancel"
+  description: "Slash command confirmation"
+  cancelled: "🟡 /{command} cancelled. Conversation unchanged."
+  always_followup: "\n\nℹ️ Future /clear, /new, /reset, and /undo commands will run without confirmation. Re-enable `approvals.destructive_slash_confirm: true` in config.yaml."
+  completed_fallback: "Operation completed."
+  original_delivery_failed: "⚠️ /{command} was handled, but the final response for the original request could not be delivered."
+  action_cancelled: "cancelled"
+  action_approved: "approved and executed"
+  action_result_returned: "{icon} /{command} {action}; the result was returned to the original request."
+runtime:
+  home_channel_missing: "📬 No home channel is set for {platform}. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType {command} to make this chat your home channel, or ignore to skip."
+  long_running: "⏳ Working — {minutes} min{detail}"
+  still_working: "⏳ Still working"
+  elapsed_detail: "{minutes} min elapsed"
+  iteration_detail: "iteration {iteration}/{maximum}"
+  running_detail: "running: {activity}"
+  activity_clarify: "clarify"
+  activity_api_call: "model request"
+  activity_initializing: "initializing"
+  activity_waiting_model: "waiting for model response"
+  activity_receiving: "receiving model response"
+  busy_steered: "⏩ Steered into current run{detail}. Your message arrives after the next tool call."
+  busy_subagent: "⏳ Subagent working{detail} — your message is queued for when it finishes (use /stop to cancel everything)."
+  busy_compressing: "⏳ Compressing context{detail} — your message is queued for when it finishes (use /stop to cancel everything)."
+  busy_queued: "⏳ Queued for the next turn{detail}. I'll respond once the current task finishes."
+  busy_interrupting: "⚡ Interrupting current task{detail}. I'll respond to your message shortly."
+  busy_hint_queue: "💡 First-time tip — I queued your message instead of interrupting. Send `/busy interrupt` to make new messages stop the current task immediately, or `/busy status` to check. This notice won't appear again."
+  busy_hint_steer: "💡 First-time tip — I steered your message into the current run; it will arrive after the next tool call instead of interrupting. Send `/busy interrupt` or `/busy queue` to change this, or `/busy status` to check. This notice won't appear again."
+  busy_hint_interrupt: "💡 First-time tip — I just interrupted my current task to answer you. Send `/busy queue` to queue follow-ups for after the current task instead, `/busy steer` to inject them mid-run without interrupting, or `/busy status` to check. This notice won't appear again."
+  queue_usage: "Usage: /queue <prompt>"
+  queue_next: "Queued for the next turn."
+  queue_next_count: "Queued for the next turn. ({depth} queued)"
+  steer_usage: "Usage: /steer <prompt>"
+  steer_agent_starting: "Agent still starting — /steer queued for the next turn."
+  steer_failed: "⚠️ Steer failed: {error}"
+  steer_queued: "⏩ Steer queued — arrives after the next tool call: '{preview}'"
+  steer_rejected: "Steer rejected (empty payload)."
+  steer_no_agent: "No active agent — /steer queued for the next turn."
+  model_agent_running: "Agent is running — wait or /stop first, then switch models."
+  runtime_agent_running: "Agent is running — wait or /stop first, then change runtime."
+  inactivity_warning: "⚠️ No activity for {elapsed} min. If the agent does not respond soon, it will be timed out in {remaining} min. You can continue waiting or use /reset."
+  reset_reason_suspended: "previous session was stopped or interrupted"
+  reset_reason_recovery_timeout: "gateway restart recovery timed out"
+  reset_reason_daily: "daily schedule at {hour}:00"
+  reset_reason_inactive: "inactive for {duration}"
+  auto_reset: "◐ Session automatically reset ({reason}). Conversation history cleared.\nUse /resume to browse and restore a previous session.\nAdjust reset timing in config.yaml under session_reset."
+  compression_aborted: "⚠️ Context compression aborted ({error}). No messages were dropped — conversation is unchanged. Run /compress to retry, /reset for a clean session, or check your auxiliary.compression model configuration."
+  compression_fallback: "ℹ️ Configured compression model `{model}` failed ({error}). Recovered using your main model — context is intact — but you may want to check `auxiliary.compression.model` in config.yaml."
+reset_info:
+  model: "◆ Model: `{model}`"
+  provider: "◆ Provider: {provider}"
+  context: "◆ Context: {context} tokens ({source})"
+  endpoint: "◆ Endpoint: {url}"
+  source_config: "config"
+  source_default: "default — set model.context_length in config to override"
+  source_detected: "detected"
+help:
+  local_header: "🧰 **AOPS Local Commands**"
+  skill_header: "⚡ **Skill Commands**:"
+  command_lines: |-
+    `/profile` -- Show current profile name and home directory
+    `/profile delete` -- Preview permanent deletion of the current named profile
+    `/profile delete confirm <token>` -- Confirm profile deletion with a one-time token
+    `/skills` -- List installed skills
+    `/skills list` -- List installed skills
+    `/skills enable <name>` -- Enable an installed skill
+    `/skills disable <name>` -- Disable an installed skill
+    `/skills set <name> <true|false>` -- Enable or disable an installed skill
+    `/toolsets` -- List or update AOPS toolsets
+    `/toolsets list` -- List AOPS toolsets
+    `/toolsets enable <name>` -- Enable an AOPS toolset
+    `/toolsets disable <name>` -- Disable an AOPS toolset
+    `/toolsets set <name> <true|false>` -- Enable or disable an AOPS toolset
+    `/cron` -- Show scheduled tasks
+    `/cron list [channel]` -- Show scheduled tasks, optionally filtered by tec01 or anyi
+    `/cron create {json}` -- Create a scheduled task
+    `/cron update <id|name> {json}` -- Update a scheduled task
+    `/cron pause <id|name>` -- Pause a scheduled task
+    `/cron resume <id|name>` -- Resume a scheduled task
+    `/cron trigger <id|name>` -- Trigger a scheduled task immediately
+    `/cron remove <id|name>` -- Remove a scheduled task
+    `/cron history <id> [tsMs]` -- Show cron run history
+    `/cron history before <id> [tsMs]` -- Show cron history before an anchor
+    `/cron history after <id> <tsMs>` -- Show cron history after an anchor
+    `/soul` -- Show current SOUL.md instructions
+    `/soul set {json}` -- Replace SOUL.md instructions
+    `/soul append {json}` -- Append to SOUL.md instructions
+    `/user` -- Show current memories/USER.md instructions
+    `/user set {json}` -- Replace memories/USER.md instructions
+    `/user append {json}` -- Append to memories/USER.md instructions
+    `/busy [queue|steer|interrupt|status]` -- Show or switch busy input mode
+    `/memory` -- Show or manage memory settings
+    `/memory status` -- Show memory, user profile, budget, and provider status
+    `/memory get [memory]` -- Show the complete MEMORY.md content
+    `/memory reset <memory|user|all>` -- Reset local MEMORY.md and/or USER.md
+    `/memory memory_char_limit [chars]` -- Show or set MEMORY.md character budget
+    `/memory user_char_limit [chars]` -- Show or set USER.md character budget
+    `/memory enable <memory|user|all>` -- Enable built-in memory or user profile
+    `/memory disable <memory|user|all>` -- Disable built-in memory or user profile
+    `/memory provider <status|enable [name]|disable>` -- Manage external memory provider
+    `/event-center [status]` -- Show the current event-center context
+    `/event-center use <eventId>` -- Set event-center guidance for this AOPS channel
+    `/event-center clear` -- Clear event-center guidance for this AOPS channel
+    `/security` -- Show current approval policy
+    `/security terminal [status]` -- Show the current profile terminal command policy
+    `/security set <off|manual|smart>` -- Switch approval policy

@@ -302,12 +302,16 @@ class GatewaySlashCommandsMixin:
         except Exception:
             pass
 
-        # Append a random tip to the reset message
-        try:
-            from hermes_cli.tips import get_random_tip
-            _tip_line = t("gateway.reset.tip", tip=get_random_tip())
-        except Exception:
-            _tip_line = ""
+        # AOPS/Tec01 favors a stable, concise reset response.  The shared tip
+        # corpus is CLI/Desktop-oriented and English-only, so do not append a
+        # random tip on AOPS.  Other platforms retain the official behavior.
+        _tip_line = ""
+        if source.platform != Platform.AOPS:
+            try:
+                from hermes_cli.tips import get_random_tip
+                _tip_line = t("gateway.reset.tip", tip=get_random_tip())
+            except Exception:
+                pass
 
         if session_info:
             return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")

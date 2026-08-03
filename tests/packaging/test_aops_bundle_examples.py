@@ -20,6 +20,16 @@ def test_aops_bundle_example_config_defaults_busy_input_mode_queue():
     script = Path("packaging/offline/build_aops_bundle.sh").read_text(encoding="utf-8")
     assert 'display:' in script
     assert 'busy_input_mode: queue' in script
+    assert 'language: zh' in script
+
+
+def test_aops_bundle_stages_locale_catalogs_as_data_files():
+    build_script = Path("packaging/offline/build_aops_bundle.sh").read_text(encoding="utf-8")
+    install_script = Path("packaging/offline/install_aops_offline.sh").read_text(encoding="utf-8")
+
+    assert '"locales/aops_en.yaml" "locales/aops_zh.yaml"' in build_script
+    assert '"$rel" == skills/* || "$rel" == locales/*' in install_script
+    assert 'docs/aops-i18n-deployment.md' in build_script
 
 
 def test_aops_offline_installer_self_checks_cache_layout():

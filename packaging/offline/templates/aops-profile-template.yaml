@@ -53,6 +53,7 @@ config:
       mode: off
     display:
       busy_input_mode: queue
+      language: zh
     checkpoints:
       enabled: true
     platforms:

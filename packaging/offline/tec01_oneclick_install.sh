@@ -1014,7 +1014,7 @@ write_default_template() {
       },
       "memory": {"provider": "hindsight"},
       "approvals": {"mode": "off"},
-      "display": {"busy_input_mode": "queue"},
+      "display": {"busy_input_mode": "queue", "language": "zh"},
       "checkpoints": {"enabled": true},
       "platforms": {
         "aops": {

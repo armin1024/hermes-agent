@@ -1,5 +1,23 @@
 # AOPS Channel Customizations
 
+## Static message language
+
+AOPS 静态用户文案复用 Hermes 的 `display.language` 语言选择，并使用
+`locales/aops_en.yaml`、`locales/aops_zh.yaml`。离线模板默认配置：
+
+```yaml
+display:
+  language: zh
+```
+
+模型回复、工具输出、协议字段和日志保持原样。新增 AOPS 用户文案需要通过
+`gateway.aops_i18n.aops_t()` 或 `aops_error()` 输出，并通过
+`scripts/audit_aops_i18n.py --fail-on-unlocalized` 审计。
+AOPS `/new`、`/reset` 的运行信息同样按该语言设置输出，并且不附加随机
+CLI Tip；其他平台的重置提示行为不变。
+AOPS 的主会话提醒、busy 状态、长任务心跳、无活动预警、自动重置和上下文压缩
+告警也通过同一词库输出；共享 Gateway 的非 AOPS 路径保持官方原文。
+
 > 当前 AOPS channel 的完整接口文档以 `docs/aops-channel-interface.md` 为准。本文保留为历史定制说明；后续功能更新必须同步更新主接口文档。
 
 本文档记录当前定制分支中的 AOPS channel 行为，方便后续内网部署、升级和排障。

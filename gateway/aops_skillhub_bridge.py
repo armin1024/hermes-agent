@@ -18,6 +18,7 @@ from typing import Any, Optional
 import httpx
 from rich.console import Console
 
+from gateway.aops_i18n import aops_t
 from gateway.platforms.base import MessageEvent
 
 
@@ -425,9 +426,9 @@ def _install_skill(slug: str) -> tuple[bool, dict[str, Any]]:
         payload["error"] = {
             "code": "SKILLHUB_RATE_LIMITED" if rate_limited else "INSTALL_FAILED",
             "message": (
-                "SkillHub rate limited the install request; please retry later."
+                aops_t("skills.install_rate_limited")
                 if rate_limited
-                else (message or f"Failed to install '{slug}'.")
+                else (message or aops_t("skills.install_failed", name=slug))
             ),
             "details": {"slug": slug},
         }
@@ -461,10 +462,18 @@ def _uninstall_skill(slug: str) -> tuple[bool, dict[str, Any]]:
             source = "local"
             removed_path = local.get("removedPath")
             local_message = str(local.get("message") or "").strip()
-            message = local_message or f"Uninstalled local skill '{slug}'."
+            message = local_message or aops_t(
+                "skills.uninstalled",
+                name=slug,
+                path=removed_path or "",
+            )
         else:
             err = local.get("error") if isinstance(local.get("error"), dict) else {}
-            message = str(err.get("message") or message or f"Failed to uninstall '{slug}'.")
+            message = str(
+                err.get("message")
+                or message
+                or aops_t("skills.uninstall_failed", name=slug)
+            )
     payload = {
         "ok": ok,
         "action": "uninstall",
@@ -476,7 +485,7 @@ def _uninstall_skill(slug: str) -> tuple[bool, dict[str, Any]]:
     if not ok:
         payload["error"] = {
             "code": "UNINSTALL_FAILED",
-            "message": message or f"Failed to uninstall '{slug}'.",
+            "message": message or aops_t("skills.uninstall_failed", name=slug),
             "details": {},
         }
     else:
@@ -492,12 +501,26 @@ def execute_silent_skillhub_command(event: MessageEvent) -> list[SkillHubBridgeR
     command = text[len("/bash "):].strip()
     parts = command.split()
     if len(parts) < 2 or parts[0] != "clawhub":
-        return [_error_payload(event, command, "UNSUPPORTED_COMMAND", "Only clawhub commands are supported.")]
+        return [
+            _error_payload(
+                event,
+                command,
+                "UNSUPPORTED_COMMAND",
+                aops_t("skills.only_clawhub"),
+            )
+        ]
 
     action = parts[1]
     if action == "explore":
         if parts[2:] != ["--json"]:
-            return [_error_payload(event, command, "INVALID_COMMAND", "Only `clawhub explore --json` is supported.")]
+            return [
+                _error_payload(
+                    event,
+                    command,
+                    "INVALID_COMMAND",
+                    aops_t("skills.only_explore_json"),
+                )
+            ]
         try:
             items = _list_market_items()
             return [
@@ -518,16 +541,31 @@ def execute_silent_skillhub_command(event: MessageEvent) -> list[SkillHubBridgeR
                 event,
                 command,
                 "SKILLHUB_RATE_LIMITED",
-                "SkillHub rate limited the skills listing request; please retry later.",
+                aops_t("skills.list_rate_limited"),
                 details={"retryAfterSeconds": exc.retry_after_seconds},
             )]
         except Exception as exc:
-            return [_error_payload(event, command, "EXPLORE_FAILED", str(exc))]
+            return [
+                _error_payload(
+                    event,
+                    command,
+                    "EXPLORE_FAILED",
+                    aops_t("common.operation_failed"),
+                    details={"rawMessage": str(exc)},
+                )
+            ]
 
     if action == "install":
         slug = parts[2] if len(parts) >= 3 else ""
         if not slug:
-            return [_error_payload(event, command, "INVALID_COMMAND", "Missing skill slug for install.")]
+            return [
+                _error_payload(
+                    event,
+                    command,
+                    "INVALID_COMMAND",
+                    aops_t("skills.install_slug_required"),
+                )
+            ]
         ok, body = _install_skill(slug)
         result = SkillHubBridgeResult(
             command=command,
@@ -545,7 +583,14 @@ def execute_silent_skillhub_command(event: MessageEvent) -> list[SkillHubBridgeR
     if action == "uninstall":
         slug = parts[2] if len(parts) >= 3 else ""
         if not slug:
-            return [_error_payload(event, command, "INVALID_COMMAND", "Missing skill slug for uninstall.")]
+            return [
+                _error_payload(
+                    event,
+                    command,
+                    "INVALID_COMMAND",
+                    aops_t("skills.uninstall_slug_required"),
+                )
+            ]
         ok, body = _uninstall_skill(slug)
         result = SkillHubBridgeResult(
             command=command,
@@ -560,4 +605,11 @@ def execute_silent_skillhub_command(event: MessageEvent) -> list[SkillHubBridgeR
         )
         return [result, _done_result(event, command)]
 
-    return [_error_payload(event, command, "UNSUPPORTED_COMMAND", f"Unsupported clawhub subcommand: {action}")]
+    return [
+        _error_payload(
+            event,
+            command,
+            "UNSUPPORTED_COMMAND",
+            aops_t("skills.unsupported_subcommand", action=action),
+        )
+    ]

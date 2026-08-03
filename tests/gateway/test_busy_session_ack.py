@@ -631,6 +631,56 @@ class TestBusySessionAck:
         assert "10 min" in content  # elapsed
 
     @pytest.mark.asyncio
+    async def test_aops_busy_ack_is_localized(self, monkeypatch):
+        """AOPS busy acknowledgements and activity labels use its catalog."""
+        import gateway.run as _gr
+        from agent import i18n
+        from gateway import aops_i18n
+
+        monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+        i18n.reset_language_cache()
+        aops_i18n.reset_aops_language_cache()
+        monkeypatch.setattr(
+            _gr,
+            "_load_gateway_config",
+            lambda: {
+                "display": {
+                    "platforms": {"aops": {"busy_ack_detail": True}},
+                },
+                "onboarding": {"seen": {"busy_input_prompt": True}},
+            },
+        )
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("aops")
+        event = _make_event(text="新消息")
+        event.source.platform = Platform.AOPS
+        sk = build_session_key(event.source)
+
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 3,
+            "max_iterations": 90,
+            "current_tool": "clarify",
+            "last_activity_ts": time.time(),
+            "last_activity_desc": "clarify",
+            "seconds_since_activity": 0.5,
+        }
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time() - 180
+        runner.adapters[event.source.platform] = adapter
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "消息已加入下一轮队列" in content
+        assert "已用时 3 分钟" in content
+        assert "迭代 3/90" in content
+        assert "等待补充信息" in content
+        assert "Queued for the next turn" not in content
+
+    @pytest.mark.asyncio
     async def test_telegram_omits_status_detail_by_default(self):
         """Telegram busy acks stay concise unless busy_ack_detail is enabled."""
         runner, sentinel = _make_runner()

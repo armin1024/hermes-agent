@@ -1,0 +1,217 @@
+command:
+  this: "此命令"
+  blocked: "命令 `{command}` 已被 AOPS 配置禁止。"
+  unsupported: "AOPS 不支持命令 `{command}`。请使用 `/help` 或 `/commands` 查看支持的命令。"
+common:
+  usage: "用法：{usage}"
+  operation_failed: "操作失败。"
+  read_failed: "读取请求的数据失败。"
+  write_failed: "保存请求的更改失败。"
+  invalid_json: "请求中的 JSON 无效。"
+  json_object_required: "请求内容必须是 JSON 对象。"
+  expected_json: "需要 JSON 请求内容，例如 {example}。"
+  non_empty_content: "字段 `content` 必须是非空字符串。"
+  unsupported_value: "不支持的{field}：{value}"
+instruction:
+  current: "当前 {label} 内容。"
+  updated: "已更新 {label}，后续新会话轮次将重新加载该指令文件。"
+memory:
+  invalid_limit: "{label}预算必须是 1 到 {maximum} 之间的正整数。"
+  invalid_target: "目标必须是 memory、user、profile 或 all。"
+  provider_required: "请指定记忆提供方，例如：`/memory provider enable hindsight`。"
+  provider_invalid: "记忆提供方名称包含不支持的字符。"
+skills:
+  name_required: "必须指定技能名称。"
+  not_found: "未找到技能 `{name}`。"
+  ambiguous: "技能 `{name}` 匹配到多个已安装技能。"
+  uninstall_failed: "卸载技能 `{name}` 失败。"
+  uninstalled: "已从 {path} 卸载本地技能 `{name}`。"
+  list_rate_limited: "SkillHub 对技能列表请求进行了限流，请稍后重试。"
+  install_rate_limited: "SkillHub 对技能安装请求进行了限流，请稍后重试。"
+  install_failed: "安装技能 `{name}` 失败。"
+  only_clawhub: "仅支持 ClawHub 命令。"
+  only_explore_json: "仅支持 `clawhub explore --json`。"
+  install_slug_required: "安装时必须指定技能标识。"
+  uninstall_slug_required: "卸载时必须指定技能标识。"
+  unsupported_subcommand: "不支持的 ClawHub 子命令：{action}"
+  path_missing: "匹配到的技能没有 SKILL.md 路径。"
+  path_resolve_failed: "无法解析技能路径。"
+  root_delete_refused: "拒绝删除 skills 根目录。"
+  outside_root_refused: "拒绝删除当前 profile skills 目录之外的路径。"
+  metadata_delete_refused: "拒绝删除 SkillHub 元数据目录。"
+  symlink_delete_refused: "拒绝删除符号链接技能路径：{path}"
+  directory_missing: "匹配到的技能目录不存在。"
+  skill_file_missing: "匹配到的目录中没有 SKILL.md。"
+toolsets:
+  name_required: "必须指定工具集名称。"
+  not_found: "未找到工具集 `{name}`。"
+profile:
+  default_protected: "不允许删除 default profile。"
+  not_found: "profile `{name}` 不存在。"
+  deletion_in_progress: "profile `{name}` 正在删除中。"
+  confirmation_required: "必须提供确认令牌。"
+  confirmation_invalid: "确认令牌无效或已过期。"
+  confirmation_expired: "确认令牌已过期。"
+  confirmation_wrong_session: "确认令牌属于另一个 AOPS 会话。"
+  delete_usage: "用法：先执行 `/profile delete`，再执行 `/profile delete confirm <token>`。"
+cron:
+  channel_invalid: "定时任务渠道只能是 tec01 或 anyi。"
+  payload_required: "需要提供 JSON 对象。"
+  payload_object_required: "定时任务请求内容必须是 JSON 对象。"
+  prompt_required: "创建定时任务时必须提供 `prompt`。"
+  schedule_required: "创建定时任务时必须提供 `schedule`。"
+  not_found: "未找到定时任务 `{name}`。"
+  created: "已创建定时任务 `{name}`。"
+  updated: "已更新定时任务 `{name}`。"
+  removed: "已删除定时任务 `{name}`。"
+  trigger_accepted: "已接受定时任务 `{name}` 的立即触发请求。"
+  action_completed: "定时任务 `{name}` 已{action}。"
+  action_paused: "暂停"
+  action_resumed: "恢复"
+  action_triggered: "触发"
+  immediate_trigger_accepted: "已接受立即触发请求。"
+  deleted_history: "该定时任务当前不存在；根据历史记录判断，它可能是一次性任务，执行后已自动删除。"
+  history_anchor_not_found: "未找到指定的历史记录锚点。"
+  repeat_forever: "永久"
+  repeat_once: "一次"
+  repeat_times: "{count} 次"
+  repeat_progress: "{completed}/{count}"
+  one_shot_warning: "单次调度即使配置为永久重复，也会在执行一次后结束；如需周期执行，请改用 interval 或 cron 调度。"
+model:
+  gateway_missing: "当前用户未配置模型网关 `base_url`，无法查询模型列表。"
+  list_failed: "无法从当前模型网关获取模型列表。"
+silent:
+  timeout: "静默本地命令在 {seconds} 秒后超时。"
+  unsupported: "不支持该静默命令。"
+attachment:
+  not_found: "文件不存在或已不可用。"
+  path_denied: "该文件路径不允许上传。"
+  upload_dependency_missing: "AOPS 附件上传依赖不可用。"
+  upload_url_invalid: "AOPS 附件上传地址无效。"
+  upload_unauthorized: "Bot Token 无权上传附件。"
+  upload_failed: "文件上传失败。"
+  upload_failed_http: "文件上传失败（HTTP {status}）。"
+  upload_client_failed: "文件上传客户端初始化失败。"
+  invalid_response: "附件上传接口返回无效结果。"
+  response_missing_file: "附件上传结果缺少文件标识或下载地址。"
+  too_large: "文件超过 50 MiB 上传限制。"
+  count_exceeded: "单条回复最多上传 10 个文件。"
+  total_too_large: "单条回复附件总大小超过 100 MiB。"
+delivery:
+  native_image_unsupported: "AOPS 不支持原生图片投递。"
+  native_document_unsupported: "AOPS 不支持原生文档投递。"
+  native_voice_unsupported: "AOPS 不支持原生语音投递。"
+  native_video_unsupported: "AOPS 不支持原生视频投递。"
+slash_confirm:
+  prompt: "⚠️ **确认 /{command}**\n\n{detail}\n\n请选择：\n• **仅本次允许** — 仅执行本次操作\n• **始终允许** — 执行本次操作，并永久不再显示此确认提示\n• **取消** — 保留当前会话，不执行操作\n\n_文本备用操作：回复 `{prefix}approve`、`{prefix}always` 或 `{prefix}cancel`。_"
+  new_detail: "这将创建一个全新会话，并丢弃当前会话历史记录。"
+  undo_one_detail: "这将从历史记录中移除上一轮用户对话。"
+  undo_many_detail: "这将从历史记录中移除最近 {count} 轮用户对话。"
+  approve_once: "执行本次"
+  approve_always: "始终执行"
+  cancel: "取消"
+  description: "Slash 指令确认"
+  cancelled: "🟡 已取消 /{command}，当前会话保持不变。"
+  always_followup: "\n\nℹ️ 后续 /clear、/new、/reset 和 /undo 将不再请求确认。如需恢复，请在 config.yaml 中设置 `approvals.destructive_slash_confirm: true`。"
+  completed_fallback: "操作已完成。"
+  original_delivery_failed: "⚠️ /{command} 已处理，但原请求的终态回传失败。"
+  action_cancelled: "已取消"
+  action_approved: "已批准并执行"
+  action_result_returned: "{icon} /{command} {action}；执行结果已返回原请求。"
+runtime:
+  home_channel_missing: "📬 当前未设置 {platform} 的主会话。Hermes 会将定时任务结果和跨平台消息投递到主会话。\n\n发送 {command} 可将当前会话设为主会话，也可以忽略此提示。"
+  long_running: "⏳ 处理中 — {minutes} 分钟{detail}"
+  still_working: "⏳ 仍在处理中"
+  elapsed_detail: "已用时 {minutes} 分钟"
+  iteration_detail: "迭代 {iteration}/{maximum}"
+  running_detail: "正在执行：{activity}"
+  activity_clarify: "等待补充信息"
+  activity_api_call: "请求模型"
+  activity_initializing: "正在初始化"
+  activity_waiting_model: "等待模型响应"
+  activity_receiving: "正在接收模型响应"
+  busy_steered: "⏩ 已将消息插入当前任务{detail}，将在下一次工具调用后处理。"
+  busy_subagent: "⏳ 子 Agent 正在工作{detail}，消息将在其完成后处理；可使用 /stop 取消全部任务。"
+  busy_compressing: "⏳ 正在压缩上下文{detail}，消息将在压缩完成后处理；可使用 /stop 取消全部任务。"
+  busy_queued: "⏳ 消息已加入下一轮队列{detail}，当前任务完成后会继续回复。"
+  busy_interrupting: "⚡ 正在中断当前任务{detail}，随后会处理你的消息。"
+  busy_hint_queue: "💡 首次提示：本条消息已排队，没有中断当前任务。可发送 `/busy interrupt` 让新消息立即中断当前任务，或发送 `/busy status` 查看当前模式；此提示仅显示一次。"
+  busy_hint_steer: "💡 首次提示：本条消息已插入当前任务，将在下一次工具调用后生效。可发送 `/busy interrupt` 或 `/busy queue` 切换模式，或发送 `/busy status` 查看当前模式；此提示仅显示一次。"
+  busy_hint_interrupt: "💡 首次提示：当前任务已被中断以处理新消息。可发送 `/busy queue` 将后续消息排到下一轮，发送 `/busy steer` 将消息插入当前任务，或发送 `/busy status` 查看当前模式；此提示仅显示一次。"
+  queue_usage: "用法：/queue <提示词>"
+  queue_next: "已加入下一轮队列。"
+  queue_next_count: "已加入下一轮队列（当前共 {depth} 条）。"
+  steer_usage: "用法：/steer <提示词>"
+  steer_agent_starting: "Agent 仍在启动，/steer 消息已加入下一轮队列。"
+  steer_failed: "⚠️ 插入消息失败：{error}"
+  steer_queued: "⏩ 消息已排队，将在下一次工具调用后插入：'{preview}'"
+  steer_rejected: "插入消息被拒绝：内容为空。"
+  steer_no_agent: "当前没有运行中的 Agent，/steer 消息已加入下一轮队列。"
+  model_agent_running: "Agent 正在运行，请等待完成或先执行 /stop，再切换模型。"
+  runtime_agent_running: "Agent 正在运行，请等待完成或先执行 /stop，再切换运行时。"
+  inactivity_warning: "⚠️ 已连续 {elapsed} 分钟没有活动。如果 Agent 仍未响应，将在 {remaining} 分钟后超时。你可以继续等待或使用 /reset。"
+  reset_reason_suspended: "上一会话已停止或中断"
+  reset_reason_recovery_timeout: "网关重启恢复超时"
+  reset_reason_daily: "每日 {hour}:00 定时重置"
+  reset_reason_inactive: "已空闲 {minutes} 分钟"
+  auto_reset: "◐ 会话已自动重置（{reason}），对话历史已清空。\n使用 /resume 可浏览并恢复之前的会话。\n可在 config.yaml 的 session_reset 中调整重置时间。"
+  compression_aborted: "⚠️ 上下文压缩已中止（{error}）。未删除任何消息，对话保持不变。可运行 /compress 重试、使用 /reset 开始新会话，或检查 auxiliary.compression 模型配置。"
+  compression_fallback: "ℹ️ 配置的压缩模型 `{model}` 调用失败（{error}）。已使用主模型恢复，上下文保持完整；建议检查 config.yaml 中的 `auxiliary.compression.model`。"
+reset_info:
+  model: "◆ 模型：`{model}`"
+  provider: "◆ 提供方：{provider}"
+  context: "◆ 上下文：{context} 令牌（{source}）"
+  endpoint: "◆ 服务地址：{url}"
+  source_config: "配置指定"
+  source_default: "默认值；可在配置中设置 model.context_length 进行覆盖"
+  source_detected: "自动检测"
+help:
+  local_header: "🧰 **AOPS 本地命令**"
+  skill_header: "⚡ **技能命令**："
+  command_lines: |-
+    `/profile` -- 查看当前 profile 名称和 home 目录
+    `/profile delete` -- 预览永久删除当前 named profile
+    `/profile delete confirm <token>` -- 使用一次性确认码删除 profile
+    `/skills` -- 列出已安装技能
+    `/skills list` -- 列出已安装技能
+    `/skills enable <name>` -- 启用已安装技能
+    `/skills disable <name>` -- 禁用已安装技能
+    `/skills set <name> <true|false>` -- 启用或禁用已安装技能
+    `/toolsets` -- 查看或更新 AOPS 工具集
+    `/toolsets list` -- 列出 AOPS 工具集
+    `/toolsets enable <name>` -- 启用 AOPS 工具集
+    `/toolsets disable <name>` -- 禁用 AOPS 工具集
+    `/toolsets set <name> <true|false>` -- 启用或禁用 AOPS 工具集
+    `/cron` -- 查看定时任务
+    `/cron list [channel]` -- 查看定时任务，可按 tec01 或 anyi 筛选
+    `/cron create {json}` -- 创建定时任务
+    `/cron update <id|name> {json}` -- 更新定时任务
+    `/cron pause <id|name>` -- 暂停定时任务
+    `/cron resume <id|name>` -- 恢复定时任务
+    `/cron trigger <id|name>` -- 立即触发定时任务
+    `/cron remove <id|name>` -- 删除定时任务
+    `/cron history <id> [tsMs]` -- 查看定时任务执行历史
+    `/cron history before <id> [tsMs]` -- 查看锚点之前的执行历史
+    `/cron history after <id> <tsMs>` -- 查看锚点之后的执行历史
+    `/soul` -- 查看当前 SOUL.md 指令
+    `/soul set {json}` -- 替换 SOUL.md 指令
+    `/soul append {json}` -- 追加 SOUL.md 指令
+    `/user` -- 查看当前 memories/USER.md 指令
+    `/user set {json}` -- 替换 memories/USER.md 指令
+    `/user append {json}` -- 追加 memories/USER.md 指令
+    `/busy [queue|steer|interrupt|status]` -- 查看或切换 busy 输入策略
+    `/memory` -- 查看或管理记忆设置
+    `/memory status` -- 查看记忆、用户画像、预算和 provider 状态
+    `/memory get [memory]` -- 查看完整 MEMORY.md 内容
+    `/memory reset <memory|user|all>` -- 重置本地 MEMORY.md 和/或 USER.md
+    `/memory memory_char_limit [chars]` -- 查看或设置 MEMORY.md 字符预算
+    `/memory user_char_limit [chars]` -- 查看或设置 USER.md 字符预算
+    `/memory enable <memory|user|all>` -- 开启内置记忆或用户画像
+    `/memory disable <memory|user|all>` -- 关闭内置记忆或用户画像
+    `/memory provider <status|enable [name]|disable>` -- 管理外部 memory provider
+    `/event-center [status]` -- 查看当前事件中心上下文
+    `/event-center use <eventId>` -- 为当前 AOPS channel 设置事件中心指导信息
+    `/event-center clear` -- 清除当前 AOPS channel 的事件中心指导信息
+    `/security` -- 查看当前审批策略
+    `/security terminal [status]` -- 查看当前 profile 的终端命令策略
+    `/security set <off|manual|smart>` -- 切换审批策略

@@ -106,6 +106,19 @@ def _approval_displays(actions):
     return [action["display"] for action in actions]
 
 
+@pytest.fixture
+def zh_aops_language(monkeypatch):
+    from agent import i18n
+    from gateway import aops_i18n
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+    i18n.reset_language_cache()
+    aops_i18n.reset_aops_language_cache()
+    yield
+    i18n.reset_language_cache()
+    aops_i18n.reset_aops_language_cache()
+
+
 class _RunningAgent:
     def __init__(self):
         self.interrupts = []
@@ -3475,7 +3488,7 @@ async def test_send_exec_approval_without_permanent_uses_session_action():
 
 
 @pytest.mark.asyncio
-async def test_send_slash_confirm_puts_approval_actions_in_content():
+async def test_send_slash_confirm_puts_approval_actions_in_content(zh_aops_language):
     adapter = AopsAdapter(PlatformConfig(enabled=True, token="tok", extra={"base_url": "https://aops.example.com"}))
     adapter.send_reply_event = AsyncMock(return_value=SendResult(success=True))
 
@@ -5758,6 +5771,7 @@ async def test_aops_cron_history_before_without_anchor_only_normalizes_page(monk
 async def test_aops_cron_history_explains_deleted_one_shot_with_history(monkeypatch, tmp_path):
     import cron.jobs as cron_jobs
 
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
     monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr(cron_jobs, "HISTORY_FILE", tmp_path / "cron" / "history.jsonl")
@@ -6563,7 +6577,7 @@ async def test_aops_cli_only_command_is_rejected():
 
 
 @pytest.mark.asyncio
-async def test_aops_new_uses_actions_slash_confirm(monkeypatch):
+async def test_aops_new_uses_actions_slash_confirm(monkeypatch, zh_aops_language):
     from tools import slash_confirm as slash_confirm
 
     runner = _make_runner(extra={"dm_policy": "open"})
@@ -6587,7 +6601,9 @@ async def test_aops_new_uses_actions_slash_confirm(monkeypatch):
     assert approval["approvalKind"] == "slash"
     assert _approval_commands(approval["allowedActions"]) == ["/approve", "/always", "/cancel"]
     assert _approval_displays(approval["allowedActions"]) == ["执行本次", "始终执行", "取消"]
-    assert "Confirm /new" in approval["message"]
+    assert "确认 /new" in approval["message"]
+    assert "这将创建一个全新会话" in approval["message"]
+    assert "Approve Once" not in approval["message"]
     pending = slash_confirm.get_pending(session_key)
     assert pending is not None
     assert pending["context"]["reply_to_id"] == "msg-1"
@@ -6596,7 +6612,9 @@ async def test_aops_new_uses_actions_slash_confirm(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_aops_slash_confirm_resolution_closes_original_and_approval_messages():
+async def test_aops_slash_confirm_resolution_closes_original_and_approval_messages(
+    zh_aops_language,
+):
     from tools import slash_confirm
 
     runner = _make_runner(extra={"dm_policy": "open"})

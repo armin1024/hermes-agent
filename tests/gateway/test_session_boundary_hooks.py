@@ -68,7 +68,7 @@ def _make_runner():
     runner._session_db = None
     runner._agent_cache_lock = None
     runner._is_user_authorized = lambda _source: True
-    runner._format_session_info = lambda: ""
+    runner._format_session_info = lambda **_kwargs: ""
 
     return runner
 
@@ -176,6 +176,37 @@ async def test_hook_error_does_not_break_reset(mock_invoke_hook):
 
     # Should still return a success message despite hook errors
     assert "Session reset" in result or "New session" in result
+
+
+@pytest.mark.asyncio
+async def test_aops_reset_does_not_select_random_tip():
+    runner = _make_runner()
+    source = SessionSource(
+        platform=Platform.AOPS,
+        user_id="u1",
+        chat_id="conv-1",
+        user_name="tester",
+        chat_type="dm",
+    )
+    event = MessageEvent(text="/new", source=source, message_id="aops-new-1")
+
+    with patch("hermes_cli.tips.get_random_tip") as get_random_tip:
+        result = await runner._handle_reset_command(event)
+
+    get_random_tip.assert_not_called()
+    assert "✦ Tip:" not in result
+    assert "✦ 提示：" not in result
+
+
+@pytest.mark.asyncio
+async def test_non_aops_reset_keeps_random_tip():
+    runner = _make_runner()
+
+    with patch("hermes_cli.tips.get_random_tip", return_value="pinned reset tip") as get_random_tip:
+        result = await runner._handle_reset_command(_make_event("/new"))
+
+    get_random_tip.assert_called_once_with()
+    assert "pinned reset tip" in result
 
 
 @pytest.mark.asyncio
