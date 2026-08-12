@@ -23,8 +23,7 @@ profile:
   setActive: false
 
 skills:
-  preinstall:
-    - builtin:ocr-and-documents
+  preinstall: []
 
 config:
   env:

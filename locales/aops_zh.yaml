@@ -21,6 +21,12 @@ memory:
   provider_required: "请指定记忆提供方，例如：`/memory provider enable hindsight`。"
   provider_invalid: "记忆提供方名称包含不支持的字符。"
 skills:
+  invalid_source: "不支持的技能来源 `{source}`；可用值为 all、user_created、agent_generated、skillhub、builtin。"
+  source:
+    user_created: "用户创建"
+    agent_generated: "Agent 自动总结生成"
+    skillhub: "SkillHub 技能市场"
+    builtin: "Hermes 内置"
   name_required: "必须指定技能名称。"
   not_found: "未找到技能 `{name}`。"
   ambiguous: "技能 `{name}` 匹配到多个已安装技能。"
@@ -42,6 +48,10 @@ skills:
   symlink_delete_refused: "拒绝删除符号链接技能路径：{path}"
   directory_missing: "匹配到的技能目录不存在。"
   skill_file_missing: "匹配到的目录中没有 SKILL.md。"
+learn:
+  ack_sources: "正在根据你提供的内容学习并整理技能…"
+  ack_conversation: "正在根据当前会话总结并整理技能…"
+  start_failed: "无法启动技能学习，请稍后重试。"
 toolsets:
   name_required: "必须指定工具集名称。"
   not_found: "未找到工具集 `{name}`。"
@@ -177,6 +187,7 @@ help:
     `/skills enable <name>` -- 启用已安装技能
     `/skills disable <name>` -- 禁用已安装技能
     `/skills set <name> <true|false>` -- 启用或禁用已安装技能
+    `/learn [学习内容]` -- 从当前对话、文件、目录、URL 或说明中总结并创建技能
     `/toolsets` -- 查看或更新 AOPS 工具集
     `/toolsets list` -- 列出 AOPS 工具集
     `/toolsets enable <name>` -- 启用 AOPS 工具集

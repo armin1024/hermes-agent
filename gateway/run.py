@@ -2658,8 +2658,8 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
     return (
         f"[The user sent a document: '{display_name}'. It is saved at: {agent_path}. "
         f"Its text is not inlined here (it's a binary format such as PDF or DOCX). "
-        f"To read it, extract the document's text yourself — for example with the "
-        f"terminal tool or the ocr-and-documents skill — before answering, instead "
+        f"To read it, extract the document's text yourself — for example with an "
+        f"available document tool or the terminal tool — before answering, instead "
         f"of asking the user to paste the contents.]"
     )
 
@@ -12375,11 +12375,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from agent.learn_prompt import build_learn_prompt
 
             _learn_req = event.get_command_args().strip()
-            _ack = (
-                "Learning a skill from what you described…"
-                if _learn_req
-                else "Learning a skill from this conversation…"
-            )
+            if source.platform == Platform.AOPS:
+                from gateway.aops_i18n import aops_t
+
+                _ack = aops_t(
+                    "learn.ack_sources" if _learn_req else "learn.ack_conversation"
+                )
+            else:
+                _ack = (
+                    "Learning a skill from what you described…"
+                    if _learn_req
+                    else "Learning a skill from this conversation…"
+                )
             try:
                 adapter = self._adapter_for_source(source)
                 if adapter:
@@ -12391,6 +12398,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.text = build_learn_prompt(_learn_req)
                 # fall through to agent processing
             except Exception:
+                if source.platform == Platform.AOPS:
+                    from gateway.aops_i18n import aops_t
+
+                    return aops_t("learn.start_failed")
                 return "Could not start /learn — please try again."
 
         if canonical == "fast":

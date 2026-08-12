@@ -3925,6 +3925,94 @@ async def test_aops_skills_local_command_returns_list_json(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_aops_skills_sources_filters_and_skillhub_modified(monkeypatch, tmp_path):
+    import agent.skill_commands as skill_commands
+    import tools.skill_inventory as skill_inventory
+    import tools.skills_tool as skills_tool
+    from tools.skills_guard import content_hash
+
+    skills_root = tmp_path / "skills"
+    paths = {}
+    for dirname, name in (
+        ("user-skill", "User Skill"),
+        ("agent-skill", "Agent Skill"),
+        ("hub-skill", "Hub Skill"),
+        ("builtin-skill", "Builtin Skill"),
+    ):
+        skill_dir = skills_root / dirname
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: test\n---\n# {name}\n",
+            encoding="utf-8",
+        )
+        paths[name] = skill_dir
+
+    hub_entry = {
+        "source": "clawhub",
+        "identifier": "hub-skill",
+        "install_path": "hub-skill",
+        "files": ["SKILL.md"],
+        "content_hash": content_hash(paths["Hub Skill"]),
+        "installed_at": "2026-08-01T10:00:00+00:00",
+        "updated_at": "2026-08-01T10:00:00+00:00",
+    }
+    context = {
+        "hub": {"Hub Skill": hub_entry},
+        "bundled": {"Builtin Skill"},
+        "usage": {
+            "Agent Skill": {
+                "created_by": "agent",
+                "creation_origin": "background_review",
+            },
+            "User Skill": {
+                "created_by": "user",
+                "creation_origin": "user_request",
+            },
+        },
+    }
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
+    monkeypatch.setattr(skill_inventory, "load_source_context", lambda: context)
+    monkeypatch.setattr(skill_commands, "scan_skill_commands", lambda: {})
+    monkeypatch.setattr(skill_commands, "get_skill_commands", lambda: {})
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+    result = await runner._handle_message(_make_aops_event("/skills list"))
+    payload = json.loads(result)
+    by_name = {item["name"]: item for item in payload["items"]}
+    assert by_name["User Skill"]["source"] == "user_created"
+    assert by_name["Agent Skill"]["source"] == "agent_generated"
+    assert by_name["Builtin Skill"]["source"] == "builtin"
+    assert by_name["Hub Skill"]["source"] == "skillhub"
+    assert by_name["Hub Skill"]["modified"] is False
+    assert by_name["Hub Skill"]["integrity"]["status"] == "pristine"
+    assert payload["summary"]["sources"] == {
+        "user_created": 1,
+        "agent_generated": 1,
+        "skillhub": 1,
+        "builtin": 1,
+    }
+
+    for source, expected_name in (
+        ("user_created", "User Skill"),
+        ("agent_generated", "Agent Skill"),
+        ("skillhub", "Hub Skill"),
+        ("builtin", "Builtin Skill"),
+    ):
+        filtered = json.loads(
+            await runner._handle_message(_make_aops_event(f"/skills list {source}"))
+        )
+        assert filtered["filter"] == {"source": source}
+        assert [item["name"] for item in filtered["items"]] == [expected_name]
+        assert filtered["summary"]["sources"][source] == 1
+
+    invalid = json.loads(
+        await runner._handle_message(_make_aops_event("/skills list invalid"))
+    )
+    assert invalid["ok"] is False
+    assert invalid["error"]["code"] == "SKILLS_INVALID_SOURCE"
+
+
+@pytest.mark.asyncio
 async def test_aops_skills_set_updates_dashboard_disabled_config(monkeypatch, tmp_path):
     import agent.skill_commands as skill_commands
     import hermes_cli.config as hermes_config
@@ -6493,10 +6581,19 @@ async def test_aops_help_includes_toolsets_command():
     assert set_child["usage"] == "/toolsets set <name> <true|false>"
 
     skills_node = next(item for item in payload["items"] if item["fullCommand"] == "/skills")
+    skills_list_child = next(child for child in skills_node["children"] if child["command"] == "list")
     skills_enable_child = next(child for child in skills_node["children"] if child["command"] == "enable")
     skills_disable_child = next(child for child in skills_node["children"] if child["command"] == "disable")
     skills_set_child = next(child for child in skills_node["children"] if child["command"] == "set")
     assert skills_enable_child["usage"] == "/skills enable <name>"
+    assert skills_list_child["usage"] == "/skills list [source]"
+    assert [choice["value"] for choice in skills_list_child["completions"][0]["choices"]] == [
+        "all",
+        "user_created",
+        "agent_generated",
+        "skillhub",
+        "builtin",
+    ]
     assert skills_disable_child["usage"] == "/skills disable <name>"
     assert skills_set_child["usage"] == "/skills set <name> <true|false>"
     assert set_child["completions"][1]["choices"] == [
@@ -7283,6 +7380,46 @@ async def test_aops_dynamic_skill_command_is_supported_and_invokes_agent(monkeyp
     result = await runner._handle_message(_make_aops_event("/test-skill do the thing"))
 
     assert result == "skill:/test-skill::do the thing"
+
+
+@pytest.mark.asyncio
+async def test_aops_learn_is_supported_and_rewrites_to_agent_prompt():
+    from gateway import aops_commands
+
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    async def _capture(event, source, quick_key, run_generation):
+        return event.text
+
+    runner._handle_message_with_agent = _capture
+
+    result = await runner._handle_message(
+        _make_aops_event("/learn 把刚才的部署流程总结成技能")
+    )
+
+    assert aops_commands.is_supported_command("learn") is True
+    assert result.startswith("[/learn] The user wants you to learn a reusable skill")
+    assert "把刚才的部署流程总结成技能" in result
+
+
+@pytest.mark.asyncio
+async def test_aops_help_includes_learn_command():
+    runner = _make_runner(extra={"dm_policy": "open"})
+
+    result = await runner._handle_message(_make_aops_event("/help"))
+    payload = json.loads(result)
+    learn = next(item for item in payload["items"] if item["fullCommand"] == "/learn")
+
+    assert learn["usage"] == "/learn [what to learn from]"
+    assert learn["executable"] is True
+    assert learn["completions"] == [
+        {
+            "name": "source",
+            "description": "要总结为技能的说明、文件、目录或 URL；留空时学习当前会话。",
+            "required": False,
+            "choices": [],
+        }
+    ]
 
 
 @pytest.mark.asyncio

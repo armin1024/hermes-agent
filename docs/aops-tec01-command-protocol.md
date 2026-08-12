@@ -467,3 +467,13 @@ Profile 删除采用两阶段 AOPS 指令：
 ```
 
 仅当前 named profile 可删除，`default` 永远受保护；删除通过一次性确认码授权，不需要额外的 AOPS slash admin 配置。完整响应、确认码绑定、错误码和本地/远端数据语义见：[AOPS Profile 删除接口](aops-profile-delete-interface.md)。
+
+## 11. Skills 来源与完整性协议
+
+`/skills list [source]` 的 `source` 可选值为 `all`、`user_created`、`agent_generated`、`skillhub`、`builtin`。不传或传 `all` 返回全部；其他值按包含来源过滤，非法值返回 `SKILLS_INVALID_SOURCE`。
+
+每个 `items[]` 都返回 `source`、本地化 `sourceLabel`、`sourceMetadata`、`modified` 和 `integrity`。用户手工放入以及用户在一轮或多轮交互后明确要求 Agent/Subagent 总结生成的技能统一为 `user_created`；后台 review 或 Curator 自主生成的技能为 `agent_generated`。
+
+`/learn [学习内容]` 是可执行的 AOPS common 指令：无参数时学习当前会话，也可传入文件、目录、URL 或说明；执行过程和最终结果遵循普通 Agent 流式回复协议。
+
+SkillHub 技能使用安装时 `.hub/lock.json` 的 `content_hash/files/install_path` 做本地比较：`pristine` 对应 `modified=false`，偏离安装快照对应 `modified=true`，历史 lock 不完整或读取失败对应 `modified=null/status=unknown`。该检查不访问 SkillHub API，不表示市场存在新版本，也不能判断修改者身份。

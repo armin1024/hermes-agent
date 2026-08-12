@@ -1,8 +1,7 @@
 """Bounded PDF text extraction and page rendering for Hermes.
 
-This module deliberately is not a model tool.  ``read_file`` and the bundled
-``ocr-and-documents`` skill share it so PDF support does not add another schema
-to every model request.
+This module deliberately is not a separate model tool. ``read_file`` uses it
+so PDF support does not add another schema to every model request.
 """
 
 from __future__ import annotations

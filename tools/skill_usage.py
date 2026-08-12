@@ -484,6 +484,7 @@ def _is_curator_managed_record(record: Any) -> bool:
 def _empty_record() -> Dict[str, Any]:
     return {
         "created_by": None,
+        "creation_origin": None,
         "use_count": 0,
         "view_count": 0,
         "last_used_at": None,
@@ -643,7 +644,7 @@ def bump_patch(skill_name: str) -> None:
     _mutate(skill_name, _apply)
 
 
-def mark_agent_created(skill_name: str) -> None:
+def mark_agent_created(skill_name: str, creation_origin: Optional[str] = None) -> None:
     """Opt a skill created by skill_manage into curator management.
 
     Viewing or invoking a manually authored skill may still create telemetry,
@@ -651,7 +652,23 @@ def mark_agent_created(skill_name: str) -> None:
     """
     def _apply(rec: Dict[str, Any]) -> None:
         rec["created_by"] = "agent"
+        rec["creation_origin"] = creation_origin or "background_review"
     _mutate(skill_name, _apply, require_curation_eligible=True)
+
+
+def mark_user_created(skill_name: str) -> None:
+    """Record a foreground, user-directed skill creation.
+
+    User-authored files and skills explicitly requested from a main agent,
+    subagent, gateway, cron, or CLI turn share the ``user_created`` public
+    source classification.  The marker is still useful for distinguishing new
+    foreground creates from legacy/manual local files in diagnostics; both are
+    intentionally presented as the same source to AOPS callers.
+    """
+    def _apply(rec: Dict[str, Any]) -> None:
+        rec["created_by"] = "user"
+        rec["creation_origin"] = "user_request"
+    _mutate(skill_name, _apply)
 
 
 def set_state(skill_name: str, state: str) -> None:

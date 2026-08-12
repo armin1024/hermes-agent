@@ -146,7 +146,6 @@ try:
 
     stage = "import_pdf_runtime"
     import pymupdf
-    from hermes_constants import get_bundled_skills_dir
     import tools.pdf_extraction as pdf_extraction_mod
 
     stage = "import_cron_modules"
@@ -174,7 +173,6 @@ legacy = [
 
 missing = [str(path) for path in expected if not path.is_dir()]
 created_legacy = [str(path) for path in legacy if path.exists()]
-pdf_skill = get_bundled_skills_dir() / "productivity" / "ocr-and-documents" / "SKILL.md"
 
 stage = "load_aops_env"
 (home / ".env").write_text(
@@ -194,14 +192,13 @@ print(f"cron.jobs={cron_jobs_mod.__file__}")
 print(f"cron.scheduler={cron_scheduler_mod.__file__}")
 print(f"tools.pdf_extraction={pdf_extraction_mod.__file__}")
 print(f"pymupdf_version={getattr(pymupdf, '__version__', 'unknown')}")
-print(f"pdf_skill={pdf_skill}")
 print(f"selfcheck_home={home}")
 print("selfcheck_mode=aops-overlay-light")
 print(f"aops_aiohttp_available={AIOHTTP_AVAILABLE}")
 print("hindsight_client_available=True")
 print(f"aops_env_loaded={bool(aops_token and aops_url)}")
 
-if missing or created_legacy or not pdf_skill.is_file() or not AIOHTTP_AVAILABLE or not aops_token or not aops_url:
+if missing or created_legacy or not AIOHTTP_AVAILABLE or not aops_token or not aops_url:
     if missing:
         print("missing expected cache dirs:", ", ".join(missing), file=sys.stderr)
     if created_legacy:
@@ -211,8 +208,6 @@ if missing or created_legacy or not pdf_skill.is_file() or not AIOHTTP_AVAILABLE
             "AOPS runtime dependency is missing: aiohttp is not importable",
             file=sys.stderr,
         )
-    if not pdf_skill.is_file():
-        print("AOPS PDF skill is missing from the installed bundle", file=sys.stderr)
     if not aops_token or not aops_url:
         print(
             "AOPS env mapping failed: AOPS_BOT_TOKEN/AOPS_BOT_URL were not readable",

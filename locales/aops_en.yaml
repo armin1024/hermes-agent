@@ -21,6 +21,12 @@ memory:
   provider_required: "Specify a provider, for example: `/memory provider enable hindsight`."
   provider_invalid: "Provider name contains unsupported characters."
 skills:
+  invalid_source: "Unsupported skill source `{source}`; choose all, user_created, agent_generated, skillhub, or builtin."
+  source:
+    user_created: "User created"
+    agent_generated: "Agent generated"
+    skillhub: "SkillHub marketplace"
+    builtin: "Hermes builtin"
   name_required: "Skill name is required."
   not_found: "Skill `{name}` not found."
   ambiguous: "Skill `{name}` matched multiple installed skills."
@@ -42,6 +48,10 @@ skills:
   symlink_delete_refused: "Refusing to remove a symlinked skill path: {path}"
   directory_missing: "The matched skill directory does not exist."
   skill_file_missing: "The matched directory does not contain SKILL.md."
+learn:
+  ack_sources: "Learning and authoring a skill from what you provided…"
+  ack_conversation: "Learning and authoring a skill from this conversation…"
+  start_failed: "Could not start skill learning. Please try again."
 toolsets:
   name_required: "Toolset name is required."
   not_found: "Toolset `{name}` not found."
@@ -177,6 +187,7 @@ help:
     `/skills enable <name>` -- Enable an installed skill
     `/skills disable <name>` -- Disable an installed skill
     `/skills set <name> <true|false>` -- Enable or disable an installed skill
+    `/learn [source or instructions]` -- Create a skill from this conversation, files, directories, URLs, or notes
     `/toolsets` -- List or update AOPS toolsets
     `/toolsets list` -- List AOPS toolsets
     `/toolsets enable <name>` -- Enable an AOPS toolset

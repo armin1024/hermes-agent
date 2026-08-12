@@ -215,19 +215,6 @@ while IFS= read -r rel; do
   printf '%s\n' "$rel" >> "$MANIFEST_PATH"
 done < "$RUNTIME_FILE_LIST"
 
-# The AOPS profile intentionally disables the full bundled skill library, but
-# PDF attachment handling depends on this one audited skill. Stage it as
-# packaged data and install it explicitly from the profile template.
-PDF_SKILL_DIR="skills/productivity/ocr-and-documents"
-while IFS= read -r rel; do
-  [[ -n "$rel" ]] || continue
-  src="$REPO_ROOT/$rel"
-  dst="$BUNDLE_DIR/overlay/$rel"
-  mkdir -p "$(dirname "$dst")"
-  cp "$src" "$dst"
-  printf '%s\n' "$rel" >> "$MANIFEST_PATH"
-done < <(find "$REPO_ROOT/$PDF_SKILL_DIR" -type f ! -path '*/__pycache__/*' -print | sed "s#^$REPO_ROOT/##" | sort)
-
 "$PYTHON_BIN" "$SCRIPT_DIR/web_dist_overlay.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
 "$PYTHON_BIN" "$SCRIPT_DIR/verify_overlay_imports.py" "$REPO_ROOT" "$BUNDLE_DIR" "$MANIFEST_PATH"
 
@@ -282,6 +269,7 @@ cp "$REPO_ROOT/docs/aops-tec01-command-protocol.md" "$BUNDLE_DIR/docs/aops-tec01
 cp "$REPO_ROOT/docs/aops-memory-management-interface.md" "$BUNDLE_DIR/docs/aops-memory-management-interface.md"
 cp "$REPO_ROOT/docs/aops-profile-delete-interface.md" "$BUNDLE_DIR/docs/aops-profile-delete-interface.md"
 cp "$REPO_ROOT/docs/aops-event-center-interface.md" "$BUNDLE_DIR/docs/aops-event-center-interface.md"
+cp "$REPO_ROOT/docs/aops-skills-source-interface.md" "$BUNDLE_DIR/docs/aops-skills-source-interface.md"
 cp "$REPO_ROOT/docs/aops-terminal-command-policy.md" "$BUNDLE_DIR/docs/aops-terminal-command-policy.md"
 cp "$REPO_ROOT/docs/aops-i18n-audit.md" "$BUNDLE_DIR/docs/aops-i18n-audit.md"
 cp "$REPO_ROOT/docs/aops-i18n-deployment.md" "$BUNDLE_DIR/docs/aops-i18n-deployment.md"

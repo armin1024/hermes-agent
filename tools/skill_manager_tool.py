@@ -1414,16 +1414,23 @@ def skill_manage(
             pass
         # Curator telemetry: bump patch_count on edit/patch/write_file (the actions
         # that mutate an existing skill's guidance), drop the record on delete.
-        # Only mark a skill as agent-created when the background self-improvement
-        # review fork creates it — foreground `skill_manage(create)` calls are
-        # user-directed, and those skills belong to the user (the curator must
-        # not touch them). Best-effort; telemetry failures never break the tool.
+        # Preserve creation provenance.  Background self-improvement creates
+        # are curator-managed; foreground main/subagent/cron/CLI creates are
+        # user-directed and must remain off-limits to the curator. Best-effort;
+        # telemetry failures never break the tool.
         try:
-            from tools.skill_usage import bump_patch, forget, mark_agent_created
+            from tools.skill_usage import (
+                bump_patch,
+                forget,
+                mark_agent_created,
+                mark_user_created,
+            )
             from tools.skill_provenance import is_background_review
             if action == "create":
                 if is_background_review():
-                    mark_agent_created(name)
+                    mark_agent_created(name, creation_origin="background_review")
+                else:
+                    mark_user_created(name)
             elif action in {"patch", "edit", "write_file", "remove_file"}:
                 bump_patch(name)
             elif action == "delete":

@@ -246,7 +246,9 @@ CLAWHUB_REGISTRY=http://clawhub.internal
 AOPS 本地命令入口继续支持 `/skills`、`/skills list`、`/cron` 等结构化结果。
 
 - `/profile delete` 先返回当前 named profile 的删除预览和一次性确认码；`/profile delete confirm <token>` 确认后由独立 worker 停止服务并永久清理本地 profile。`default` 永远不可删除，删除不需要额外的 AOPS slash admin 配置。完整协议见 `docs/aops-profile-delete-interface.md`。
-- `/skills` 和 `/skills list` 会刷新 skill command 缓存后返回，避免新安装技能缺少 `command`。
+- `/skills` 和 `/skills list [all|user_created|agent_generated|skillhub|builtin]` 会刷新 skill command 缓存后返回，避免新安装技能缺少 `command`，并为每个技能返回稳定的 `source`。用户要求 Agent 总结生成及手工本地技能统一为 `user_created`；后台 review/Curator 自主生成的技能为 `agent_generated`。
+- `/learn [学习内容]` 复用官方 Gateway 学习流程，可从当前对话、文件、目录、URL 或说明中总结并创建当前 profile 的技能；用户主动执行 `/learn` 创建的技能归类为 `user_created`。
+- SkillHub 技能列表会用 `.hub/lock.json` 的安装哈希与本地目录进行离线比较，返回 `modified` 和 `integrity`；该检查不访问 SkillHub 服务，也不表示市场是否存在新版本。
 - `/skills uninstall <name>` / `/skills remove <name>` 先尝试 hub 卸载；若目标不是 hub-installed，则安全删除当前 profile 的本地技能目录。
 - `/soul get|set|append` 读写当前 profile 的 `SOUL.md`；`/user get|set|append` 读写当前 profile 的 `memories/USER.md`。写入入口使用 threat-pattern 扫描，命中注入/泄露模式会拒绝写入；成功写入后驱逐 idle agent cache，后续新 turn 立即加载新指令。
 - `/busy` 与 `/busy status` 返回当前 busy 输入策略；`/busy queue|steer|interrupt` 写入 `config.yaml display.busy_input_mode`，并立即同步 runner 与 adapter 内存态。

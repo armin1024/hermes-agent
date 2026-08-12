@@ -989,7 +989,7 @@ write_default_template() {
     "setActive": false
   },
   "skills": {
-    "preinstall": ["builtin:ocr-and-documents"]
+    "preinstall": []
   },
   "config": {
     "env": {
@@ -3167,8 +3167,6 @@ if raw is None:
 if not isinstance(raw, list):
     raise SystemExit('skills.preinstall must be a list')
 slugs = [str(item).strip() for item in raw if str(item or '').strip()]
-if 'builtin:ocr-and-documents' not in slugs:
-    slugs.insert(0, 'builtin:ocr-and-documents')
 
 installed = []
 builtin_slugs = [slug.split(':', 1)[1] for slug in slugs if slug.startswith('builtin:')]
@@ -3176,8 +3174,11 @@ remote_slugs = [slug for slug in slugs if not slug.startswith('builtin:')]
 
 if builtin_slugs:
     from hermes_constants import get_bundled_skills_dir
+    from tools.skills_sync import _dir_hash, _read_manifest, _write_manifest
 
     bundled_root = get_bundled_skills_dir()
+    bundled_manifest = _read_manifest()
+    bundled_manifest_changed = False
     for skill_name in builtin_slugs:
         matches = [
             skill_md.parent
@@ -3197,6 +3198,12 @@ if builtin_slugs:
         destination = profile_dir / 'skills' / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(source, destination, dirs_exist_ok=True)
+        # AOPS installs only an audited subset of the official bundled skills,
+        # rather than running the full bundled sync.  Preserve the same origin
+        # manifest so inventory/curator code can still identify this directory
+        # as builtin instead of falling through to legacy local/user_created.
+        bundled_manifest[skill_name] = _dir_hash(destination)
+        bundled_manifest_changed = True
         installed.append({
             'skill': 'builtin:' + skill_name,
             'status': 'success',
@@ -3204,6 +3211,8 @@ if builtin_slugs:
             'path': str(destination),
             'output': 'Installed from the audited AOPS offline bundle.',
         })
+    if bundled_manifest_changed:
+        _write_manifest(bundled_manifest)
 
 if remote_slugs:
     from rich.console import Console

@@ -610,14 +610,28 @@ skills:
     - draft-notes
 ```
 
-`/skills list` 返回示例：
+支持按来源过滤：
+
+```text
+/skills list
+/skills list user_created
+/skills list agent_generated
+/skills list skillhub
+/skills list builtin
+```
+
+用户明确要求 Hermes 在一轮或多轮对话后总结出的技能属于 `user_created`；只有后台 self-improvement 或 Curator 在没有用户创建要求时自主生成的技能属于 `agent_generated`。
+
+AOPS 支持 `/learn [学习内容]`。不带参数时从当前会话总结技能；也可指定文件、目录、URL 或操作说明。该命令进入普通 Agent turn 并通过 `skill_manage` 保存到当前 profile。
+
+`/skills list skillhub` 返回示例：
 
 ```json
 {
   "schemaVersion": "local-command-list.v1",
   "type": "skills.list",
   "ok": true,
-  "command": "/skills list",
+  "command": "/skills list skillhub",
   "itemType": "skill",
   "total": 1,
   "count": 1,
@@ -631,8 +645,16 @@ skills:
   "summary": {
     "enabled": 1,
     "disabled": 0,
-    "categories": 1
+    "categories": 1,
+    "sources": {
+      "user_created": 0,
+      "agent_generated": 0,
+      "skillhub": 1,
+      "builtin": 0
+    },
+    "modifiedSkillHub": 1
   },
+  "filter": {"source": "skillhub"},
   "items": [
     {
       "id": "ops/restart-service",
@@ -644,7 +666,23 @@ skills:
       "disabled": false,
       "homepage": "https://example.com/restart-service",
       "command": "/restart-service",
-      "path": "/home/user/.hermes/skills/ops/restart-service/SKILL.md"
+      "path": "/home/user/.hermes/skills/ops/restart-service/SKILL.md",
+      "source": "skillhub",
+      "sourceLabel": "SkillHub 技能市场",
+      "modified": true,
+      "sourceMetadata": {
+        "market": "clawhub",
+        "identifier": "restart-service",
+        "installedAtMs": 1785800000000,
+        "updatedAtMs": 1785800000000
+      },
+      "integrity": {
+        "status": "modified",
+        "installedHash": "sha256:abc123",
+        "currentHash": "sha256:def456",
+        "reason": "content_changed",
+        "checkedAtMs": 1785801000000
+      }
     }
   ],
   "error": null
@@ -663,6 +701,8 @@ skills:
 ```
 
 技能启停无需重启 gateway；后续新用户 query/new turn 会重新读取 `skills.disabled` 并生效，已运行中的 agent turn 不热替换。
+
+SkillHub `modified` 仅表示本地目录与安装快照不同：`false` 为 `pristine`，`true` 为 `modified`，无法可靠检测时为 `null/unknown`。检测只读取本地 lock 和文件，不请求市场接口；它不能判断具体由用户、Agent 还是外部程序修改，也不表示市场存在更新。
 
 ## 审批接口
 

@@ -63,6 +63,7 @@ _AOPS_NATIVE_COMMANDS = {
     "curator",
     "toolsets",
     "skills",
+    "learn",
     "memory",
     "event-center",
 }
@@ -111,6 +112,7 @@ _DESCRIPTION_ZH = {
     "curator": "后台技能维护（状态、运行、固定、归档）。",
     "toolsets": "查看或切换当前 profile 的 AOPS 工具集。",
     "skills": "列出已安装技能。",
+    "learn": "从当前对话、文件、目录、URL 或说明中总结并创建可复用技能。",
     "cron": "查看定时任务。",
     "soul": "查看或编辑当前 profile 的 SOUL.md 指令。",
     "user": "查看或编辑当前 profile 的 memories/USER.md 指令。",
@@ -196,6 +198,13 @@ def _param(
 
 _USAGE_COMPLETIONS = {
     "title": [_param("name", "会话标题。", required=False)],
+    "learn": [
+        _param(
+            "source",
+            "要总结为技能的说明、文件、目录或 URL；留空时学习当前会话。",
+            required=False,
+        )
+    ],
     "branch": [_param("name", "新分支会话名称。", required=False)],
     "compress": [_param("focus", "压缩时关注的话题。", required=False)],
     "rollback": [_param("number", "检查点编号。", required=False)],
@@ -601,7 +610,7 @@ def _aops_skill_commands(config: Any) -> dict[str, dict[str, Any]]:
 def _is_supported_custom_shape(canonical: str, raw_args: str) -> bool:
     args = _tokens(raw_args)
     if canonical == "skills":
-        if not args or args == ["list"]:
+        if not args or args[:1] == ["list"]:
             return True
         if args[:1] in (["enable"], ["disable"]):
             return len(args) >= 2
@@ -1848,10 +1857,26 @@ def _skill_ref_key(value: Any) -> str:
 
 
 def _skills_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+    sources = {
+        "user_created": 0,
+        "agent_generated": 0,
+        "skillhub": 0,
+        "builtin": 0,
+    }
+    for item in items:
+        source = str(item.get("source") or "")
+        if source in sources:
+            sources[source] += 1
     return {
         "enabled": sum(1 for item in items if item.get("enabled") is True),
         "disabled": sum(1 for item in items if item.get("disabled") is True),
         "categories": len({item.get("category") or "uncategorized" for item in items}),
+        "sources": sources,
+        "modifiedSkillHub": sum(
+            1
+            for item in items
+            if item.get("source") == "skillhub" and item.get("modified") is True
+        ),
     }
 
 
@@ -1861,8 +1886,10 @@ def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from hermes_cli.config import load_config
     from hermes_cli.skills_config import get_disabled_skills
     from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform
+    from tools.skill_inventory import classify_skill, load_source_context
 
-    skills_root = SKILLS_DIR
+    skills_root = Path(SKILLS_DIR)
+    source_context = load_source_context()
     items: list[dict[str, Any]] = []
     disabled = get_disabled_skills(load_config())
     command_by_path: dict[str, str] = {}
@@ -1909,20 +1936,21 @@ def _skill_items() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 or _skill_command_slug(skill_md.parent.name)
                 or None
             )
-            items.append(
-                {
-                    "id": item_id,
-                    "name": name,
-                    "description": description,
-                    "descriptionZh": _skill_description_zh(name, frontmatter, description),
-                    "category": category,
-                    "enabled": enabled,
-                    "disabled": not enabled,
-                    "homepage": frontmatter.get("homepage") or frontmatter.get("url") or None,
-                    "command": command,
-                    "path": str(skill_md),
-                }
-            )
+            item = {
+                "id": item_id,
+                "name": name,
+                "description": description,
+                "descriptionZh": _skill_description_zh(name, frontmatter, description),
+                "category": category,
+                "enabled": enabled,
+                "disabled": not enabled,
+                "homepage": frontmatter.get("homepage") or frontmatter.get("url") or None,
+                "command": command,
+                "path": str(skill_md),
+            }
+            item.update(classify_skill(name, skill_md.parent, skills_root, source_context))
+            item["sourceLabel"] = aops_t(f"skills.source.{item['source']}")
+            items.append(item)
     items.sort(key=lambda item: (str(item.get("name") or "").lower(), str(item.get("id") or "")))
     return items, {"skillsRoot": str(skills_root)}
 
@@ -1933,8 +1961,28 @@ def _skills_command(command_text: str, args: list[str]) -> str:
 
     action = str(args[0] if args else "list").strip().lower().replace("_", "-")
     if action in {"", "list"}:
+        source_filter = str(args[1] if len(args) >= 2 else "all").strip().lower()
+        valid_sources = {"all", "user_created", "agent_generated", "skillhub", "builtin"}
+        if len(args) > 2 or source_filter not in valid_sources:
+            return _list_response(
+                type_="skills.list",
+                command=command_text,
+                item_type="skill",
+                items=[],
+                error={
+                    "code": "SKILLS_INVALID_SOURCE",
+                    "message": aops_t(
+                        "skills.invalid_source",
+                        source=source_filter,
+                    ),
+                    "details": {"allowed": sorted(valid_sources)},
+                },
+                extra={"filter": {"source": source_filter}},
+            )
         try:
             items, context = _skill_items()
+            if source_filter != "all":
+                items = [item for item in items if item.get("source") == source_filter]
             context.update({"agentId": "main", "workspaceDir": os.getcwd()})
             return _list_response(
                 type_="skills.list",
@@ -1943,6 +1991,7 @@ def _skills_command(command_text: str, args: list[str]) -> str:
                 items=items,
                 context=context,
                 summary=_skills_summary(items),
+                extra={"filter": {"source": source_filter}},
             )
         except Exception as exc:
             return _list_response(
@@ -1951,6 +2000,7 @@ def _skills_command(command_text: str, args: list[str]) -> str:
                 item_type="skill",
                 items=[],
                 error={"code": "SKILLS_READ_FAILED", "message": str(exc)},
+                extra={"filter": {"source": source_filter}},
             )
 
     if action not in {"enable", "disable", "set", "uninstall", "remove"}:
@@ -4245,8 +4295,14 @@ def _build_official_nodes(config: Any) -> list[HelpNode]:
                 full_command=full_command,
                 description=_DESCRIPTION_ZH.get(cmd.name, cmd.description),
                 dangerous=_dangerous(config, full_command),
-                usage="/profile" if cmd.name == "profile" else _usage_for_command(cmd.name, cmd.args_hint),
-                executable=("<" not in cmd.args_hint),
+                usage=(
+                    "/profile"
+                    if cmd.name == "profile"
+                    else "/learn [what to learn from]"
+                    if cmd.name == "learn"
+                    else _usage_for_command(cmd.name, cmd.args_hint)
+                ),
+                executable=(cmd.name == "learn" or "<" not in cmd.args_hint),
                 completions=list(_USAGE_COMPLETIONS.get(cmd.name, [])),
                 children=children,
             )
@@ -4341,10 +4397,24 @@ def _skills_node(config: Any) -> HelpNode:
                 type_="custom",
                 command="list",
                 full_command=child_full,
-                description="列出已安装技能。",
+                description="列出已安装技能，可按创建或安装来源过滤。",
                 dangerous=_dangerous(config, child_full),
-                usage=child_full,
+                usage="/skills list [source]",
                 executable=True,
+                completions=[
+                    _param(
+                        "source",
+                        "可选技能来源。",
+                        required=False,
+                        choices=[
+                            _choice("all", "全部技能。"),
+                            _choice("user_created", "用户创建或用户要求生成的技能。"),
+                            _choice("agent_generated", "Agent 后台自动总结生成的技能。"),
+                            _choice("skillhub", "SkillHub 技能市场安装的技能。"),
+                            _choice("builtin", "Hermes 内置技能。"),
+                        ],
+                    )
+                ],
             ),
             _node(
                 type_="custom",

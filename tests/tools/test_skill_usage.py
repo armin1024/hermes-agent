@@ -595,6 +595,21 @@ def test_manual_skill_with_usage_is_not_curator_managed(skills_home):
     assert "manual-skill" not in {r["name"] for r in agent_created_report()}
 
 
+def test_user_requested_skill_is_not_curator_managed(skills_home):
+    from tools.skill_usage import (
+        agent_created_report,
+        list_agent_created_skill_names,
+        mark_user_created,
+    )
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "user-skill")
+
+    mark_user_created("user-skill")
+
+    assert "user-skill" not in list_agent_created_skill_names()
+    assert "user-skill" not in {r["name"] for r in agent_created_report()}
+
+
 def test_agent_created_report_excludes_bundled_and_hub(skills_home):
     from tools.skill_usage import agent_created_report, mark_agent_created
     skills_dir = skills_home / "skills"
