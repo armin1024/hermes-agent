@@ -13,6 +13,7 @@ FORCE_UPGRADE=false
 APPLY_CONFIG_ONLY=false
 PRESERVE_CONFIG=false
 CONFIG_PAYLOAD=""
+SHARED_RELEASE_BUILD=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,6 +41,10 @@ while [[ $# -gt 0 ]]; do
       CONFIG_PAYLOAD="$2"
       shift 2
       ;;
+    --shared-release-build)
+      SHARED_RELEASE_BUILD=true
+      shift
+      ;;
     -h|--help)
       cat <<'EOF'
 Usage: bash install.sh [INSTALL_DIR] [--link] [--init-config] [--upgrade] [--preserve-config] [--config-payload FILE]
@@ -54,6 +59,8 @@ Flags:
   --preserve-config  Preserve existing ~/.hermes config files; payload still patches explicit fields
   --apply-config     Only apply --config-payload with the installed venv, then exit
   --config-payload   tec01 task JSON used to patch .env/config.yaml and preinstall skills
+  --shared-release-build
+                     Build an immutable host-level runtime; skip user launchers/links
 EOF
       exit 0
       ;;
@@ -334,6 +341,7 @@ while IFS= read -r rel; do
 done < "$OVERLAY_MANIFEST"
 
 info "Step 5/6: generating launchers"
+if [[ "$SHARED_RELEASE_BUILD" == false ]]; then
 cat > "$INSTALL_DIR/hermes" <<EOF
 #!/usr/bin/env bash
 export AOPS_MIGRATE_LEGACY_CLIENT_ID="\${AOPS_MIGRATE_LEGACY_CLIENT_ID:-$([[ "$UPGRADE_MODE" == true ]] && echo 1 || echo 0)}"
@@ -372,6 +380,10 @@ if [[ "$LINK_BIN" == true ]]; then
   ln -sf "$INSTALL_DIR/hermes-gateway" "$HOME/.local/bin/hermes-gateway"
 else
   info "Step 6/6: skipping ~/.local/bin symlinks"
+fi
+else
+  info "Step 5/6: shared release build skips user-specific launchers"
+  info "Step 6/6: shared release build skips user-specific symlinks"
 fi
 
 if [[ "$INIT_CONFIG" == true ]]; then

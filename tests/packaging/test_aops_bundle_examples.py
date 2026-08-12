@@ -71,6 +71,8 @@ def test_aops_offline_installer_supports_tec01_payload():
     assert "--apply-config" in script
     assert "--upgrade" in script
     assert "--preserve-config" in script
+    assert "--shared-release-build" in script
+    assert "shared release build skips user-specific launchers" in script
     assert "python\" -m hermes_cli.remote_config apply --payload" in script
 
 
@@ -149,6 +151,21 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "controlled_gateway_lifecycle" in script
     assert "skip SIGUSR1 restart" in script
     assert "--bundle-cache-dir DIR" in script
+    assert "--runtime-layout per-user|shared" in script
+    assert "--shared-runtime-root DIR" in script
+    assert "build_shared_release" in script
+    assert "activate_shared_runtime" in script
+    assert "rollback_shared_runtime" in script
+    assert "shared-runtime-summary.json" in script
+    assert "binding.json" in script
+    assert "shared runtime layout requires bundle.sha256 to be a 64-character SHA256" in script
+    assert "24 * 60 * 60" in script
+    assert "Existing per-user runtime requires one-time migration to shared layout" in script
+    assert "shared runtime layout requires root" in script
+    assert "HERMES_SERVICE_PYTHON_PATH" in script
+    assert "ready[:3]" in script
+    assert 'referenced = set()' in script
+    assert 'write_shared_user_shim "$install_real" "$binding" "$SHARED_PREVIOUS_RELEASE"' in script
     assert "HERMES_BUNDLE_CACHE_DIR" in script
     assert "install-timings.json" in script
     assert "[TIMING] stage=%s durationMs=%s" in script
@@ -267,11 +284,45 @@ def test_tec01_multiuser_update_caches_inputs_reports_timings_and_limits_paralle
     assert 'process_profile "$user" "default" "$env_path"' in script
     assert 'process_profile "$user" "$profile"' not in script
     assert '--bundle-cache-dir "$UPDATE_BUNDLE_CACHE_DIR"' in script
+    assert 'RUNTIME_LAYOUT="${HERMES_RUNTIME_LAYOUT:-shared}"' in script
+    assert '--runtime-layout "$UPDATE_RUNTIME_LAYOUT"' in script
+    assert '--shared-runtime-root "$UPDATE_SHARED_RUNTIME_ROOT"' in script
     assert "run_user_worker" in script
     assert "merge_worker_results" in script
     assert "durationMs" in script
     assert "totalDurationMs" in script
     assert 'if [[ "$JOBS" -eq 1 ]]' in script
+
+
+def test_shared_runtime_cleanup_keeps_latest_three_and_all_referenced(tmp_path):
+    script = Path("packaging/offline/tec01_oneclick_install.sh").read_text(encoding="utf-8")
+    cleaner = tmp_path / "cleaner.py"
+    cleaner.write_text(_embedded_python(script, "cleanup_shared_releases"), encoding="utf-8")
+    root = tmp_path / "runtime"
+    releases = root / "releases"
+    bindings = root / "bindings"
+    releases.mkdir(parents=True)
+    bindings.mkdir()
+    names = ["old-referenced", "old-unreferenced", "new-1", "new-2", "new-3"]
+    for index, name in enumerate(names):
+        release = releases / name
+        release.mkdir()
+        (release / ".complete").touch()
+        os.utime(release, (index + 1, index + 1))
+    binding = bindings / "oma"
+    binding.mkdir()
+    (binding / "current").symlink_to(releases / "old-referenced")
+
+    subprocess.run([sys.executable, str(cleaner), str(root)], check=True)
+
+    assert (releases / "old-referenced").exists()
+    assert not (releases / "old-unreferenced").exists()
+    assert all((releases / name).exists() for name in ("new-1", "new-2", "new-3"))
+
+
+def test_shared_runtime_deployment_doc_is_staged():
+    build = Path("packaging/offline/build_aops_bundle.sh").read_text(encoding="utf-8")
+    assert "docs/aops-shared-runtime-deployment.md" in build
 
 
 @pytest.mark.parametrize("overwrite_all", [False, True])

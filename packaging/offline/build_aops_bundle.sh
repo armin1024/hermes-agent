@@ -273,6 +273,7 @@ cp "$REPO_ROOT/docs/aops-skills-source-interface.md" "$BUNDLE_DIR/docs/aops-skil
 cp "$REPO_ROOT/docs/aops-terminal-command-policy.md" "$BUNDLE_DIR/docs/aops-terminal-command-policy.md"
 cp "$REPO_ROOT/docs/aops-i18n-audit.md" "$BUNDLE_DIR/docs/aops-i18n-audit.md"
 cp "$REPO_ROOT/docs/aops-i18n-deployment.md" "$BUNDLE_DIR/docs/aops-i18n-deployment.md"
+cp "$REPO_ROOT/docs/aops-shared-runtime-deployment.md" "$BUNDLE_DIR/docs/aops-shared-runtime-deployment.md"
 
 CONTENT_SHA="$(
   cd "$BUNDLE_DIR"

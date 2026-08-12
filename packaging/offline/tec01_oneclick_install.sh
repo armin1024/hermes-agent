@@ -18,6 +18,8 @@ TASK_ID="${TASK_ID:-}"
 WORK_DIR="${WORK_DIR:-}"
 BUNDLE_CACHE_DIR="${HERMES_BUNDLE_CACHE_DIR:-}"
 HERMES_DATA_ROOT="${HERMES_DATA_ROOT:-/data/hermes-users}"
+RUNTIME_LAYOUT="${HERMES_RUNTIME_LAYOUT:-per-user}"
+SHARED_RUNTIME_ROOT="${HERMES_SHARED_RUNTIME_ROOT:-/data/hermes-tec01/runtime}"
 SYNC_OTHER_PROFILES_CLI=""
 TEMPLATE_FILE=""
 TEMPLATE_URL=""
@@ -36,6 +38,16 @@ STORAGE_TARGET_MOUNT=""
 STORAGE_TARGET_FS=""
 STORAGE_CREATED_GUARDS=()
 STORAGE_ROLLBACK_ARMED=false
+RESOLVED_BUNDLE_PATH=""
+SHARED_RELEASE_REUSED=false
+SHARED_BINDING_CHANGED=false
+SHARED_PREVIOUS_RELEASE=""
+SHARED_CURRENT_RELEASE=""
+SHARED_LEGACY_BACKUP=""
+SHARED_CONFIG_SNAPSHOT=""
+SHARED_ROLLBACK_ARMED=false
+SHARED_RUNTIME_SUMMARY_JSON=""
+SHARED_RUNNING_UNITS_FILE=""
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -90,6 +102,11 @@ Options:
   --hermes-data-root DIR
                         Physical root for Hermes runtime/profile data
                         (default: /data/hermes-users).
+  --runtime-layout per-user|shared
+                        Runtime layout. Shared mode requires root.
+  --shared-runtime-root DIR
+                        Root-owned release/binding store used by shared mode
+                        (default: /data/hermes-tec01/runtime).
   --sync-other-profiles true|false
                         Apply explicit overwrite fields to all existing profiles.
   --report-url URL      Optional task result report endpoint.
@@ -123,6 +140,16 @@ while [[ $# -gt 0 ]]; do
     --hermes-data-root)
       [[ $# -ge 2 ]] || fail "--hermes-data-root requires an absolute path"
       HERMES_DATA_ROOT="$2"
+      shift 2
+      ;;
+    --runtime-layout)
+      [[ $# -ge 2 ]] || fail "--runtime-layout requires per-user or shared"
+      RUNTIME_LAYOUT="$2"
+      shift 2
+      ;;
+    --shared-runtime-root)
+      [[ $# -ge 2 ]] || fail "--shared-runtime-root requires an absolute path"
+      SHARED_RUNTIME_ROOT="$2"
       shift 2
       ;;
     --sync-other-profiles)
@@ -249,6 +276,10 @@ on_exit() {
     warn "Installer interrupted during Hermes storage migration; rolling back"
     rollback_storage_cutover || true
   fi
+  if [[ "$exit_code" -ne 0 && "${SHARED_ROLLBACK_ARMED:-false}" == true ]] && declare -F rollback_shared_runtime >/dev/null 2>&1; then
+    warn "Shared runtime activation failed; restoring the previous runtime and configuration"
+    rollback_shared_runtime || true
+  fi
   finish_timings "$exit_code"
   if [[ -n "$BUNDLE_CACHE_LOCK_DIR" ]]; then
     rmdir "$BUNDLE_CACHE_LOCK_DIR" 2>/dev/null || true
@@ -290,6 +321,7 @@ download_bundle() {
 
   if [[ -z "$BUNDLE_CACHE_DIR" ]]; then
     download "$url" "$dst"
+    RESOLVED_BUNDLE_PATH="$dst"
     return 0
   fi
 
@@ -333,14 +365,349 @@ download_bundle() {
     mv -f "$tmp_file" "$cache_file"
     log "Cached bundle: $cache_file"
   fi
-
-  cp "$cache_file" "$dst"
+  if [[ "$RUNTIME_LAYOUT" == shared ]]; then
+    RESOLVED_BUNDLE_PATH="$cache_file"
+  else
+    cp "$cache_file" "$dst"
+    RESOLVED_BUNDLE_PATH="$dst"
+  fi
   if command -v flock >/dev/null 2>&1; then
     flock -u 8 2>/dev/null || true
     exec 8>&-
   elif [[ -n "$lock_dir" ]]; then
     rmdir "$lock_dir" 2>/dev/null || true
     BUNDLE_CACHE_LOCK_DIR=""
+  fi
+}
+
+shared_runtime_release_path() {
+  printf '%s/releases/%s\n' "$SHARED_RUNTIME_ROOT" "$1"
+}
+
+shared_runtime_binding_path() {
+  printf '%s/bindings/%s\n' "$SHARED_RUNTIME_ROOT" "$TARGET_USER"
+}
+
+shared_runtime_release_ready() {
+  local release
+  release="$(shared_runtime_release_path "$1")"
+  [[ -f "$release/.complete" && -x "$release/venv/bin/python" ]] || return 1
+  "$release/venv/bin/python" -c 'import hermes_cli, gateway.platforms.aops' >/dev/null 2>&1
+}
+
+prepare_shared_runtime_root() {
+  [[ "$(id -u)" -eq 0 ]] || fail "shared runtime layout requires root; run the installer with sudo"
+  [[ "$SHARED_RUNTIME_ROOT" == /* ]] || fail "--shared-runtime-root must be an absolute path"
+  [[ "$SHARED_RUNTIME_ROOT" != / ]] || fail "--shared-runtime-root cannot be /"
+  mkdir -p "$SHARED_RUNTIME_ROOT"/{releases,bindings,staging,locks,cache/bundles}
+  chown root:root "$SHARED_RUNTIME_ROOT" "$SHARED_RUNTIME_ROOT"/{releases,bindings,staging,locks,cache,cache/bundles}
+  chmod 755 "$SHARED_RUNTIME_ROOT" "$SHARED_RUNTIME_ROOT"/{releases,bindings,staging,locks,cache,cache/bundles}
+  if [[ -z "$BUNDLE_CACHE_DIR" ]]; then
+    BUNDLE_CACHE_DIR="$SHARED_RUNTIME_ROOT/cache/bundles"
+  fi
+}
+
+build_shared_release() {
+  local bundle_tgz="$1"
+  local sha="$2"
+  local release lock_file extract_dir bundle_dir
+  release="$(shared_runtime_release_path "$sha")"
+  lock_file="$SHARED_RUNTIME_ROOT/locks/release-$sha.lock"
+  exec 7>"$lock_file"
+  flock 7
+  if shared_runtime_release_ready "$sha"; then
+    SHARED_RELEASE_REUSED=true
+    log "Using existing shared Hermes release: $release"
+    flock -u 7
+    exec 7>&-
+    return 0
+  fi
+
+  rm -rf --one-file-system "$release"
+  mkdir -p "$release"
+  extract_dir="$SHARED_RUNTIME_ROOT/staging/$sha-$$"
+  rm -rf "$extract_dir"
+  mkdir -p "$extract_dir"
+  tar -xzf "$bundle_tgz" -C "$extract_dir"
+  bundle_dir="$(find "$extract_dir" -maxdepth 1 -type d -name 'offline-bundle-*' | head -n 1)"
+  [[ -n "$bundle_dir" && -x "$bundle_dir/install.sh" ]] || {
+    rm -rf "$extract_dir" "$release"
+    flock -u 7
+    exec 7>&-
+    fail "shared runtime bundle install.sh not found"
+  }
+  log "Building shared Hermes release: $release"
+  if ! HOME=/root bash "$bundle_dir/install.sh" "$release" --shared-release-build; then
+    rm -rf "$extract_dir" "$release"
+    flock -u 7
+    exec 7>&-
+    fail "shared Hermes release build failed"
+  fi
+  python3 - "$release/release-manifest.json" "$sha" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({
+    "bundleSha256": sys.argv[2],
+    "createdAt": datetime.now(timezone.utc).isoformat(),
+    "layoutVersion": 1,
+}, indent=2) + "\n", encoding="utf-8")
+PY
+  touch "$release/.complete"
+  chown -R root:root "$release"
+  chmod -R a-w "$release"
+  find "$release" -type d -exec chmod a+rx {} +
+  find "$release" -type f -perm /111 -exec chmod a+rx {} +
+  rm -rf "$extract_dir"
+  SHARED_RELEASE_REUSED=false
+  flock -u 7
+  exec 7>&-
+}
+
+snapshot_shared_runtime_config() {
+  SHARED_CONFIG_SNAPSHOT="$WORK_DIR/shared-runtime-config-snapshot"
+  python3 - "$TARGET_HOME/.hermes" "$SHARED_CONFIG_SNAPSHOT" <<'PY'
+import json, shutil, sys
+from pathlib import Path
+root, out = map(Path, sys.argv[1:])
+out.mkdir(parents=True, exist_ok=True)
+profiles = [("default", root)]
+profiles_root = root / "profiles"
+if profiles_root.is_dir():
+    profiles.extend((path.name, path) for path in profiles_root.iterdir() if path.is_dir())
+relative = [Path(".env"), Path("config.yaml"), Path("hindsight/config.json"), Path("aops-memory-state.json")]
+manifest = []
+for name, base in profiles:
+    for rel in relative:
+        src = base / rel
+        key = Path(name) / rel
+        manifest.append({"profile": name, "relative": str(rel), "existed": src.is_file()})
+        if src.is_file():
+            dst = out / key
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+(out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+restore_shared_runtime_config() {
+  [[ -n "$SHARED_CONFIG_SNAPSHOT" && -f "$SHARED_CONFIG_SNAPSHOT/manifest.json" ]] || return 0
+  python3 - "$TARGET_HOME/.hermes" "$SHARED_CONFIG_SNAPSHOT" <<'PY'
+import json, shutil, sys
+from pathlib import Path
+root, snap = map(Path, sys.argv[1:])
+for item in json.loads((snap / "manifest.json").read_text(encoding="utf-8")):
+    base = root if item["profile"] == "default" else root / "profiles" / item["profile"]
+    dst = base / item["relative"]
+    src = snap / item["profile"] / item["relative"]
+    if item["existed"]:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    elif dst.exists() or dst.is_symlink():
+        dst.unlink()
+PY
+}
+
+write_shared_user_shim() {
+  local install_real="$1"
+  local binding="$2"
+  local stamp_release="${3:-$SHARED_CURRENT_RELEASE}"
+  mkdir -p "$install_real"
+  rm -rf "$install_real/venv" "$install_real/python311" "$install_real/source-overlay"
+  ln -s "$binding/current/venv" "$install_real/venv"
+  ln -s "$binding/current/python311" "$install_real/python311"
+  ln -s "$binding/current/source-overlay" "$install_real/source-overlay"
+  cat > "$install_real/hermes" <<EOF
+#!/usr/bin/env bash
+exec "$TARGET_HOME/hermes-agent/venv/bin/python" -m hermes_cli.main "\$@"
+EOF
+  cat > "$install_real/hermes-gateway" <<EOF
+#!/usr/bin/env bash
+exec "$TARGET_HOME/hermes-agent/venv/bin/python" -m hermes_cli.main gateway "\$@"
+EOF
+  cat > "$install_real/hermes-dashboard" <<EOF
+#!/usr/bin/env bash
+HOST="\${HERMES_DASHBOARD_HOST:-0.0.0.0}"
+PORT="\${HERMES_DASHBOARD_PORT:-9119}"
+exec "$TARGET_HOME/hermes-agent/venv/bin/python" -m hermes_cli.main dashboard --host "\$HOST" --port "\$PORT" --no-open "\$@"
+EOF
+  cat > "$install_real/hermes-shell" <<EOF
+#!/usr/bin/env bash
+source "$TARGET_HOME/hermes-agent/venv/bin/activate"
+exec "\$SHELL"
+EOF
+  chmod 755 "$install_real/hermes" "$install_real/hermes-gateway" "$install_real/hermes-dashboard" "$install_real/hermes-shell"
+  printf '%s\n' "$stamp_release" > "$install_real/.aops_bundle_sha256"
+  cat > "$install_real/.hermes-shared-runtime.json" <<EOF
+{"layout":"shared","release":"$stamp_release","binding":"$binding/current"}
+EOF
+  chown -h root:root "$install_real/venv" "$install_real/python311" "$install_real/source-overlay"
+  chown root:root "$install_real/hermes" "$install_real/hermes-gateway" "$install_real/hermes-dashboard" "$install_real/hermes-shell" "$install_real/.aops_bundle_sha256" "$install_real/.hermes-shared-runtime.json"
+  chmod 755 "$install_real"
+  chmod 644 "$install_real/.aops_bundle_sha256" "$install_real/.hermes-shared-runtime.json"
+  run_as_target "mkdir -p '$TARGET_HOME/.local/bin'; ln -sfn '$TARGET_HOME/hermes-agent/hermes' '$TARGET_HOME/.local/bin/hermes'; ln -sfn '$TARGET_HOME/hermes-agent/hermes-gateway' '$TARGET_HOME/.local/bin/hermes-gateway'; ln -sfn '$TARGET_HOME/hermes-agent/hermes-dashboard' '$TARGET_HOME/.local/bin/hermes-dashboard'"
+}
+
+activate_shared_runtime() {
+  local sha="$1"
+  local release binding current_link install_real tmp_link
+  release="$(shared_runtime_release_path "$sha")"
+  binding="$(shared_runtime_binding_path)"
+  current_link="$binding/current"
+  SHARED_RUNNING_UNITS_FILE="$WORK_DIR/shared-runtime-running-units.txt"
+  storage_capture_running_gateway_units "$SHARED_RUNNING_UNITS_FILE"
+  mkdir -p "$binding"
+  chown root:root "$binding"
+  chmod 755 "$binding"
+  if [[ -L "$current_link" ]]; then
+    SHARED_PREVIOUS_RELEASE="$(basename "$(readlink -f "$current_link")")"
+  fi
+  SHARED_CURRENT_RELEASE="$sha"
+  [[ "$SHARED_PREVIOUS_RELEASE" != "$sha" ]] || SHARED_BINDING_CHANGED=false
+  if [[ "$SHARED_PREVIOUS_RELEASE" != "$sha" ]]; then
+    tmp_link="$binding/.current.$$"
+    ln -s "$release" "$tmp_link"
+    mv -Tf "$tmp_link" "$current_link"
+    SHARED_BINDING_CHANGED=true
+  fi
+  python3 - "$binding/binding.json" "$TARGET_USER" "$sha" "$SHARED_PREVIOUS_RELEASE" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+path, user, current, previous = sys.argv[1:]
+Path(path).write_text(json.dumps({
+    "user": user,
+    "currentRelease": current,
+    "previousRelease": previous or None,
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+}, indent=2) + "\n", encoding="utf-8")
+PY
+  chown root:root "$binding/binding.json"
+  chmod 644 "$binding/binding.json"
+
+  install_real="$(readlink -f "$INSTALL_DIR" 2>/dev/null || printf '%s' "$INSTALL_DIR")"
+  if [[ -e "$install_real" && ! -f "$install_real/.hermes-shared-runtime.json" ]]; then
+    SHARED_LEGACY_BACKUP="${install_real}.per-user-backup.$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    mv "$install_real" "$SHARED_LEGACY_BACKUP"
+  elif [[ -L "$INSTALL_DIR" && ! -e "$install_real" ]]; then
+    mkdir -p "$install_real"
+  fi
+  write_shared_user_shim "$install_real" "$binding"
+  snapshot_shared_runtime_config
+  SHARED_ROLLBACK_ARMED=true
+}
+
+rollback_shared_runtime() {
+  local binding install_real tmp_link
+  binding="$(shared_runtime_binding_path)"
+  install_real="$(readlink -f "$INSTALL_DIR" 2>/dev/null || printf '%s' "$INSTALL_DIR")"
+  restore_shared_runtime_config || true
+  if [[ -n "$SHARED_PREVIOUS_RELEASE" ]] && shared_runtime_release_ready "$SHARED_PREVIOUS_RELEASE"; then
+    tmp_link="$binding/.current.rollback.$$"
+    ln -s "$(shared_runtime_release_path "$SHARED_PREVIOUS_RELEASE")" "$tmp_link"
+    mv -Tf "$tmp_link" "$binding/current"
+    write_shared_user_shim "$install_real" "$binding" "$SHARED_PREVIOUS_RELEASE"
+    python3 - "$binding/binding.json" "$TARGET_USER" "$SHARED_PREVIOUS_RELEASE" "$SHARED_CURRENT_RELEASE" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+path, user, current, rolled_back = sys.argv[1:]
+Path(path).write_text(json.dumps({
+    "user": user,
+    "currentRelease": current,
+    "rolledBackFrom": rolled_back or None,
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+}, indent=2) + "\n", encoding="utf-8")
+PY
+  elif [[ -n "$SHARED_LEGACY_BACKUP" && -d "$SHARED_LEGACY_BACKUP" ]]; then
+    rm -rf "$install_real"
+    mv "$SHARED_LEGACY_BACKUP" "$install_real"
+    SHARED_LEGACY_BACKUP=""
+  else
+    rm -rf "$install_real"
+    rm -f "$(shared_runtime_binding_path)/current"
+    rm -f "$(shared_runtime_binding_path)/binding.json"
+  fi
+  shared_restart_gateway_units_best_effort
+  write_shared_runtime_summary true
+  SHARED_ROLLBACK_ARMED=false
+}
+
+shared_restart_gateway_units_best_effort() {
+  local uid runtime_dir unit unit_path
+  uid="$(id -u "$TARGET_USER")"
+  runtime_dir="/run/user/$uid"
+  [[ -S "$runtime_dir/bus" ]] || return 0
+  [[ -n "$SHARED_RUNNING_UNITS_FILE" && -f "$SHARED_RUNNING_UNITS_FILE" ]] || return 0
+  shopt -s nullglob
+  for unit_path in "$TARGET_HOME/.config/systemd/user/hermes-gateway"*.service; do
+    unit="$(basename "$unit_path")"
+    if ! grep -Fqx "$unit" "$SHARED_RUNNING_UNITS_FILE"; then
+      run_as_target "XDG_RUNTIME_DIR=$(shell_quote "$runtime_dir") DBUS_SESSION_BUS_ADDRESS=$(shell_quote "unix:path=$runtime_dir/bus") timeout 90 systemctl --user stop $(shell_quote "$unit")" >/dev/null 2>&1 || true
+    fi
+  done
+  shopt -u nullglob
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    run_as_target "XDG_RUNTIME_DIR=$(shell_quote "$runtime_dir") DBUS_SESSION_BUS_ADDRESS=$(shell_quote "unix:path=$runtime_dir/bus") timeout 90 systemctl --user restart $(shell_quote "$unit")" >/dev/null 2>&1 || true
+  done < "$SHARED_RUNNING_UNITS_FILE"
+}
+
+write_shared_runtime_summary() {
+  local rolled_back="${1:-false}"
+  [[ -n "$SHARED_RUNTIME_SUMMARY_JSON" ]] || return 0
+  python3 - "$SHARED_RUNTIME_SUMMARY_JSON" "$SHARED_CURRENT_RELEASE" "$SHARED_PREVIOUS_RELEASE" "$SHARED_RELEASE_REUSED" "$SHARED_BINDING_CHANGED" "$rolled_back" "$SHARED_RUNTIME_ROOT" <<'PY'
+import json, sys
+from pathlib import Path
+path, current, previous, reused, changed, rolled_back, root = sys.argv[1:]
+Path(path).write_text(json.dumps({
+    "runtimeLayout": "shared",
+    "runtimeRelease": current or None,
+    "previousRelease": previous or None,
+    "runtimeReused": reused.lower() == "true",
+    "bindingChanged": changed.lower() == "true",
+    "rollbackPerformed": rolled_back.lower() == "true",
+    "sharedRuntimeRoot": root,
+}, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+cleanup_shared_releases() {
+  python3 - "$SHARED_RUNTIME_ROOT" <<'PY'
+import os, shutil, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+releases = root / "releases"
+referenced = set()
+for current in (root / "bindings").glob("*/current"):
+    try: referenced.add(current.resolve())
+    except OSError: pass
+ready = [p for p in releases.iterdir() if p.is_dir() and (p / ".complete").is_file()]
+ready.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+protected = set(ready[:3]) | referenced
+for path in ready:
+    if path not in protected:
+        shutil.rmtree(path)
+staging = root / "staging"
+if staging.is_dir():
+    import time
+    cutoff = time.time() - 24 * 60 * 60
+    for path in staging.iterdir():
+        try:
+            if path.stat().st_mtime < cutoff:
+                shutil.rmtree(path) if path.is_dir() else path.unlink()
+        except OSError:
+            pass
+PY
+}
+
+commit_shared_runtime() {
+  cleanup_shared_releases
+  write_shared_runtime_summary false
+  SHARED_ROLLBACK_ARMED=false
+  if [[ -n "$SHARED_LEGACY_BACKUP" && -d "$SHARED_LEGACY_BACKUP" ]]; then
+    rm -rf --one-file-system "$SHARED_LEGACY_BACKUP"
+    log "Removed migrated per-user runtime backup"
   fi
 }
 
@@ -2235,7 +2602,11 @@ ensure_gateway_service_installed() {
   if json_bool options.installGatewayService true; then
     begin_stage "gateway_install_service"
     log "Ensuring Hermes gateway service is installed for $TARGET_USER profile $profile"
-    run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; hermes $profile_arg gateway install --force --no-start-now --start-on-login"
+    if [[ "$RUNTIME_LAYOUT" == shared ]]; then
+      run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; export HERMES_SERVICE_PYTHON_PATH=$(shell_quote "$TARGET_HOME/hermes-agent/venv/bin/python"); hermes $profile_arg gateway install --force --no-start-now --start-on-login"
+    else
+      run_as_target "export PATH=\"\$HOME/.local/bin:\$PATH\"; hermes $profile_arg gateway install --force --no-start-now --start-on-login"
+    fi
     storage_install_mount_guards || fail "Failed to install Hermes data mount guard for profile $profile"
   fi
   begin_stage "gateway_${action}"
@@ -2871,7 +3242,9 @@ restart_other_running_profiles_after_upgrade() {
   log "Restarting other running Hermes profile gateways after runtime upgrade"
   local selector="$WORK_DIR/select-running-profiles.py"
   write_gateway_profile_selector "$selector"
-  run_as_target "CURRENT_PROFILE=$(shell_quote "$PROFILE_NAME") SUMMARY_JSON=$(shell_quote "${RESTART_SUMMARY_JSON:-}") python3 $(shell_quote "$selector")" | while IFS= read -r other_profile; do
+  local failures_file="$WORK_DIR/shared-runtime-other-profile-failures.txt"
+  : > "$failures_file"
+  while IFS= read -r other_profile; do
     [[ -n "$other_profile" ]] || continue
     case "$other_profile" in
       ::skip::*)
@@ -2888,8 +3261,15 @@ restart_other_running_profiles_after_upgrade() {
     other_lazy_result="$WORK_DIR/gateway-lazy-installs-other.json"
     ensure_gateway_lazy_installs_disabled_for_profile "$other_profile" > "$other_lazy_result" || true
     record_lazy_installs_change_if_needed "$other_profile" "$other_lazy_result"
-    controlled_gateway_lifecycle "$other_profile" "restart" 120 false || true
-  done
+    if ! controlled_gateway_lifecycle "$other_profile" "restart" 120 false; then
+      if [[ "$RUNTIME_LAYOUT" == shared ]]; then
+        printf '%s\n' "$other_profile" >> "$failures_file"
+      fi
+    fi
+  done < <(run_as_target "CURRENT_PROFILE=$(shell_quote "$PROFILE_NAME") SUMMARY_JSON=$(shell_quote "${RESTART_SUMMARY_JSON:-}") python3 $(shell_quote "$selector")")
+  if [[ "$RUNTIME_LAYOUT" == shared && -s "$failures_file" ]]; then
+    fail "One or more previously running profile gateways failed after shared runtime switch: $(paste -sd, "$failures_file")"
+  fi
 }
 
 restart_other_profiles_after_owner_bank_sync() {
@@ -3533,6 +3913,14 @@ PY
 
 need_cmd python3
 need_cmd tar
+case "$RUNTIME_LAYOUT" in
+  per-user|shared) ;;
+  *) fail "--runtime-layout must be per-user or shared" ;;
+esac
+if [[ "$RUNTIME_LAYOUT" == shared ]]; then
+  need_cmd flock
+  prepare_shared_runtime_root
+fi
 if [[ -n "$BUNDLE_CACHE_DIR" && "$BUNDLE_CACHE_DIR" != /* ]]; then
   fail "--bundle-cache-dir must be an absolute path"
 fi
@@ -3638,6 +4026,7 @@ PREINSTALL_RESULT_JSON="$WORK_DIR/skills-preinstall-result.json"
 SKILLS_RESULT_JSON="$WORK_DIR/skills-install-result.json"
 RESTART_SUMMARY_JSON="$WORK_DIR/restart-summary.json"
 PROFILE_SYNC_SUMMARY_JSON="$WORK_DIR/profile-sync-summary.json"
+SHARED_RUNTIME_SUMMARY_JSON="$WORK_DIR/shared-runtime-summary.json"
 python3 - "$RESTART_SUMMARY_JSON" <<'PY'
 import json
 import sys
@@ -3732,6 +4121,10 @@ RUNTIME_CHANGED=false
 BUNDLE_STAMP="$INSTALL_DIR/.aops_bundle_sha256"
 BUNDLE_URL="$(json_get bundle.url)"
 BUNDLE_SHA="$(json_get bundle.sha256)"
+if [[ "$RUNTIME_LAYOUT" == shared ]]; then
+  [[ "$BUNDLE_SHA" =~ ^[0-9a-fA-F]{64}$ ]] || fail "shared runtime layout requires bundle.sha256 to be a 64-character SHA256"
+  BUNDLE_SHA="${BUNDLE_SHA,,}"
+fi
 if [[ -x "$INSTALL_DIR/hermes" && -x "$INSTALL_DIR/venv/bin/python" ]] && remote_config_supports_profile; then
   HERMES_INSTALLED=true
 fi
@@ -3739,6 +4132,9 @@ fi
 RUNTIME_UPDATE_NEEDED=false
 if [[ "$HERMES_INSTALLED" == false ]]; then
   RUNTIME_UPDATE_NEEDED=true
+elif [[ "$RUNTIME_LAYOUT" == shared && ! -f "$INSTALL_DIR/.hermes-shared-runtime.json" ]]; then
+  RUNTIME_UPDATE_NEEDED=true
+  log "Existing per-user runtime requires one-time migration to shared layout"
 else
   if [[ -n "$BUNDLE_SHA" && "$BUNDLE_SHA" != "<sha256>" ]]; then
     INSTALLED_BUNDLE_SHA=""
@@ -3766,32 +4162,50 @@ if [[ "$RUNTIME_UPDATE_NEEDED" == true ]]; then
   BUNDLE_TGZ="$WORK_DIR/hermes-offline-bundle.tar.gz"
   log "Downloading bundle"
   download_bundle "$BUNDLE_URL" "$BUNDLE_SHA" "$BUNDLE_TGZ"
-  chmod 600 "$BUNDLE_TGZ"
-  if [[ "$(id -u)" -eq 0 ]]; then
-    chown "$TARGET_USER":"$TARGET_USER" "$BUNDLE_TGZ"
+  BUNDLE_SOURCE="${RESOLVED_BUNDLE_PATH:-$BUNDLE_TGZ}"
+  [[ -f "$BUNDLE_SOURCE" ]] || fail "resolved bundle file not found: $BUNDLE_SOURCE"
+  chmod 600 "$BUNDLE_SOURCE"
+  if [[ "$RUNTIME_LAYOUT" == per-user && "$(id -u)" -eq 0 ]]; then
+    chown "$TARGET_USER":"$TARGET_USER" "$BUNDLE_SOURCE"
   fi
 
   begin_stage "verify_bundle"
-  actual_sha="$(sha256_file "$BUNDLE_TGZ")"
+  actual_sha="$(sha256_file "$BUNDLE_SOURCE")"
   [[ "$actual_sha" == "$BUNDLE_SHA" ]] || fail "sha256 mismatch: expected $BUNDLE_SHA got $actual_sha"
 
-  begin_stage "extract_bundle"
-  ensure_target_private_dir "$WORK_DIR/extracted"
-  run_as_target "tar -xzf '$BUNDLE_TGZ' -C '$WORK_DIR/extracted'"
-  BUNDLE_DIR="$(find "$WORK_DIR/extracted" -maxdepth 1 -type d -name 'offline-bundle-*' | head -n 1)"
-  [[ -n "$BUNDLE_DIR" && -f "$BUNDLE_DIR/install.sh" ]] || fail "bundle install.sh not found"
-  chmod +x "$BUNDLE_DIR/install.sh"
-
-  begin_stage "install_or_upgrade"
-  if [[ -x "$INSTALL_DIR/hermes" || -d "$INSTALL_DIR/venv" || -d "$INSTALL_DIR/source-overlay" ]]; then
-    log "Upgrading Hermes runtime for $TARGET_USER"
-    run_as_target "cd '$BUNDLE_DIR' && bash install.sh '$INSTALL_DIR' --link --upgrade --preserve-config"
+  if [[ "$RUNTIME_LAYOUT" == shared ]]; then
+    begin_stage "build_shared_release"
+    build_shared_release "$BUNDLE_SOURCE" "$BUNDLE_SHA"
+    begin_stage "activate_user_release"
+    activate_shared_runtime "$BUNDLE_SHA"
   else
-    log "Installing Hermes runtime for $TARGET_USER"
-    run_as_target "cd '$BUNDLE_DIR' && bash install.sh '$INSTALL_DIR' --link"
+    begin_stage "extract_bundle"
+    ensure_target_private_dir "$WORK_DIR/extracted"
+    run_as_target "tar -xzf '$BUNDLE_SOURCE' -C '$WORK_DIR/extracted'"
+    BUNDLE_DIR="$(find "$WORK_DIR/extracted" -maxdepth 1 -type d -name 'offline-bundle-*' | head -n 1)"
+    [[ -n "$BUNDLE_DIR" && -f "$BUNDLE_DIR/install.sh" ]] || fail "bundle install.sh not found"
+    chmod +x "$BUNDLE_DIR/install.sh"
+
+    begin_stage "install_or_upgrade"
+    if [[ -x "$INSTALL_DIR/hermes" || -d "$INSTALL_DIR/venv" || -d "$INSTALL_DIR/source-overlay" ]]; then
+      log "Upgrading Hermes runtime for $TARGET_USER"
+      run_as_target "cd '$BUNDLE_DIR' && bash install.sh '$INSTALL_DIR' --link --upgrade --preserve-config"
+    else
+      log "Installing Hermes runtime for $TARGET_USER"
+      run_as_target "cd '$BUNDLE_DIR' && bash install.sh '$INSTALL_DIR' --link"
+    fi
+    run_as_target "printf '%s\n' $(shell_quote "$BUNDLE_SHA") > $(shell_quote "$BUNDLE_STAMP")"
   fi
   RUNTIME_CHANGED=true
-  run_as_target "printf '%s\n' $(shell_quote "$BUNDLE_SHA") > $(shell_quote "$BUNDLE_STAMP")"
+elif [[ "$RUNTIME_LAYOUT" == shared ]]; then
+  # An existing shared installation may already point at the requested release.
+  # Reconcile the binding/shim without rebuilding the release.
+  if shared_runtime_release_ready "$BUNDLE_SHA"; then
+    begin_stage "activate_user_release"
+    activate_shared_runtime "$BUNDLE_SHA"
+  else
+    fail "shared runtime release is missing even though the user bundle stamp matches: $BUNDLE_SHA"
+  fi
 fi
 
 begin_stage "apply_profile_config"
@@ -3957,6 +4371,11 @@ if [[ "$SYNC_OTHER_PROFILES" == true ]]; then
   if [[ "$(profile_sync_has_failures)" == "true" ]]; then
     fail "One or more profiles failed during synchronized update"
   fi
+fi
+if [[ "$RUNTIME_LAYOUT" == shared ]]; then
+  begin_stage "commit_shared_runtime"
+  commit_shared_runtime
+  log "Shared runtime active: release=$SHARED_CURRENT_RELEASE reused=$SHARED_RELEASE_REUSED bindingChanged=$SHARED_BINDING_CHANGED previousRelease=${SHARED_PREVIOUS_RELEASE:-none}"
 fi
 report_result "success" "$STAGE" "Hermes profile $PROFILE_NAME $PROFILE_ACTION completed for $TARGET_USER"
 log "Hermes profile $PROFILE_NAME $PROFILE_ACTION completed for $TARGET_USER"

@@ -420,6 +420,18 @@ class TestRequireServiceInstalled:
 
 
 class TestGeneratedSystemdUnits:
+    def test_user_unit_honors_managed_stable_python_path(self, tmp_path, monkeypatch):
+        python_path = tmp_path / "hermes-agent" / "venv" / "bin" / "python"
+        python_path.parent.mkdir(parents=True)
+        python_path.write_text("#!/bin/sh\n", encoding="utf-8")
+        python_path.chmod(0o755)
+        monkeypatch.setenv("HERMES_SERVICE_PYTHON_PATH", str(python_path))
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        assert f"ExecStart={python_path} -m hermes_cli.main" in unit
+        assert f"ExecStopPost=-{python_path} -m gateway.cgroup_cleanup" in unit
+
     def _expected_timeout_stop_sec(self) -> str:
         timeout = int(max(60, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT + 30))
         return f"TimeoutStopSec={timeout}"

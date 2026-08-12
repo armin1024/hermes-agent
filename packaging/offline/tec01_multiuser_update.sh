@@ -17,6 +17,8 @@ TIMEOUT_SECONDS="${HERMES_MULTIUSER_TIMEOUT:-900}"
 JOBS="${HERMES_MULTIUSER_JOBS:-1}"
 HERMES_DATA_ROOT="${HERMES_DATA_ROOT:-/data/hermes-users}"
 BUNDLE_CACHE_DIR="${HERMES_BUNDLE_CACHE_DIR:-/data/hermes-tec01/cache/bundles}"
+RUNTIME_LAYOUT="${HERMES_RUNTIME_LAYOUT:-shared}"
+SHARED_RUNTIME_ROOT="${HERMES_SHARED_RUNTIME_ROOT:-/data/hermes-tec01/runtime}"
 LOG_DIR="${HERMES_MULTIUSER_LOG_DIR:-/data/hermes-tec01/logs/multiuser}"
 LOCK_FILE="${HERMES_MULTIUSER_LOCK_FILE:-/var/lock/hermes-tec01-multiuser-update.lock}"
 DRY_RUN=false
@@ -57,12 +59,18 @@ Options:
                         Physical Hermes user-data root (default: /data/hermes-users).
   --bundle-cache-dir DIR
                         Shared verified bundle cache.
+  --runtime-layout per-user|shared
+                        Runtime layout passed to the installer (default: shared).
+  --shared-runtime-root DIR
+                        Root-owned shared release store
+                        (default: /data/hermes-tec01/runtime).
   --log-dir DIR         Root-only log directory.
   --help                Show this help.
 
 Environment equivalents:
   HERMES_INSTALLER_URL, HERMES_TEMPLATE_URL, HERMES_BUNDLE_URL,
   HERMES_BUNDLE_SHA256, HERMES_BUNDLE_CACHE_DIR, AOPS_BOT_URL,
+  HERMES_RUNTIME_LAYOUT, HERMES_SHARED_RUNTIME_ROOT,
   HERMES_DATA_ROOT, HERMES_MULTIUSER_TIMEOUT, HERMES_MULTIUSER_JOBS,
   HERMES_MULTIUSER_LOG_DIR, HERMES_MULTIUSER_LOCK_FILE
 EOF
@@ -204,6 +212,16 @@ while [[ $# -gt 0 ]]; do
       BUNDLE_CACHE_DIR="$2"
       shift 2
       ;;
+    --runtime-layout)
+      [[ $# -ge 2 ]] || fail "--runtime-layout requires per-user or shared"
+      RUNTIME_LAYOUT="$2"
+      shift 2
+      ;;
+    --shared-runtime-root)
+      [[ $# -ge 2 ]] || fail "--shared-runtime-root requires an absolute path"
+      SHARED_RUNTIME_ROOT="$2"
+      shift 2
+      ;;
     --log-dir)
       [[ $# -ge 2 ]] || fail "--log-dir requires a value"
       LOG_DIR="$2"
@@ -256,6 +274,11 @@ fi
 HERMES_DATA_ROOT="$(realpath -m "$HERMES_DATA_ROOT")"
 [[ "$HERMES_DATA_ROOT" != / ]] || fail "--hermes-data-root cannot be /"
 [[ -n "$BUNDLE_CACHE_DIR" && "$BUNDLE_CACHE_DIR" == /* ]] || fail "--bundle-cache-dir must be an absolute path"
+case "$RUNTIME_LAYOUT" in
+  per-user|shared) ;;
+  *) fail "--runtime-layout must be per-user or shared" ;;
+esac
+[[ "$SHARED_RUNTIME_ROOT" == /* && "$SHARED_RUNTIME_ROOT" != / ]] || fail "--shared-runtime-root must be an absolute non-root path"
 
 validate_batch_data_mount
 
@@ -270,16 +293,19 @@ SKIPPED_FILE="$RUN_DIR/skipped.tsv"
 FAILED_FILE="$RUN_DIR/failed.tsv"
 USER_RESULTS_FILE="$RUN_DIR/users.tsv"
 STORAGE_RESULTS_FILE="$RUN_DIR/storage.tsv"
+RUNTIME_RESULTS_FILE="$RUN_DIR/runtime.tsv"
 MASTER_UPDATED_FILE="$UPDATED_FILE"
 MASTER_SKIPPED_FILE="$SKIPPED_FILE"
 MASTER_FAILED_FILE="$FAILED_FILE"
 MASTER_USER_RESULTS_FILE="$USER_RESULTS_FILE"
 MASTER_STORAGE_RESULTS_FILE="$STORAGE_RESULTS_FILE"
+MASTER_RUNTIME_RESULTS_FILE="$RUNTIME_RESULTS_FILE"
 : > "$UPDATED_FILE"
 : > "$SKIPPED_FILE"
 : > "$FAILED_FILE"
 : > "$USER_RESULTS_FILE"
 : > "$STORAGE_RESULTS_FILE"
+: > "$RUNTIME_RESULTS_FILE"
 EXTRA_SET_FILE="$RUN_DIR/extra-set-args"
 : > "$EXTRA_SET_FILE"
 if ((${#EXTRA_SET_ARGS[@]} > 0)); then
@@ -488,6 +514,8 @@ process_profile() {
   export UPDATE_EXTRA_SET_FILE="$EXTRA_SET_FILE"
   export UPDATE_TEMPLATE_FILE="$CACHED_TEMPLATE"
   export UPDATE_BUNDLE_CACHE_DIR="$BUNDLE_CACHE_DIR"
+  export UPDATE_RUNTIME_LAYOUT="$RUNTIME_LAYOUT"
+  export UPDATE_SHARED_RUNTIME_ROOT="$SHARED_RUNTIME_ROOT"
   export UPDATE_HERMES_DATA_ROOT="$HERMES_DATA_ROOT"
   task_id="multiuser-$RUN_ID"
   export UPDATE_TASK_ID="$task_id"
@@ -497,7 +525,7 @@ process_profile() {
   # SIGTERM. SIGKILL is only used if the rollback itself does not complete.
   timeout --foreground --kill-after=300s "$TIMEOUT_SECONDS" bash -c '
     set -o pipefail
-    args=(--sync-other-profiles true --hermes-data-root "$UPDATE_HERMES_DATA_ROOT" --task-id "$UPDATE_TASK_ID" --set "targetUser=$UPDATE_USER" --set "env.AOPS_BOT_TOKEN=$UPDATE_TOKEN")
+    args=(--sync-other-profiles true --runtime-layout "$UPDATE_RUNTIME_LAYOUT" --shared-runtime-root "$UPDATE_SHARED_RUNTIME_ROOT" --hermes-data-root "$UPDATE_HERMES_DATA_ROOT" --task-id "$UPDATE_TASK_ID" --set "targetUser=$UPDATE_USER" --set "env.AOPS_BOT_TOKEN=$UPDATE_TOKEN")
     if [[ -n "$UPDATE_TEMPLATE_FILE" ]]; then
       args+=(--template-file "$UPDATE_TEMPLATE_FILE")
     fi
@@ -547,6 +575,7 @@ PY
   profile_home="$(dirname "$env_path")"
   sync_summary="$profile_home/tec01-install/$task_id/profile-sync-summary.json"
   storage_summary="$profile_home/tec01-install/$task_id/storage-summary.json"
+  runtime_summary="$profile_home/tec01-install/$task_id/shared-runtime-summary.json"
   if [[ -f "$storage_summary" ]]; then
     python3 - "$storage_summary" "$STORAGE_RESULTS_FILE" "$user" <<'PY'
 import json
@@ -570,7 +599,29 @@ with Path(output_path).open("a", encoding="utf-8") as handle:
     handle.write("\t".join(values) + "\n")
 PY
   fi
-  unset UPDATE_USER UPDATE_TOKEN UPDATE_AOPS_URL UPDATE_INSTALLER_FILE UPDATE_TIMEOUT UPDATE_EXTRA_SET_FILE UPDATE_TEMPLATE_FILE UPDATE_BUNDLE_CACHE_DIR UPDATE_HERMES_DATA_ROOT UPDATE_TASK_ID
+  if [[ -f "$runtime_summary" ]]; then
+    python3 - "$runtime_summary" "$RUNTIME_RESULTS_FILE" "$user" <<'PY'
+import json, sys
+from pathlib import Path
+summary_path, output_path, user = sys.argv[1:]
+try:
+    data = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+except Exception:
+    data = {}
+values = [
+    user,
+    str(data.get("runtimeLayout") or "shared"),
+    str(data.get("runtimeRelease") or ""),
+    str(data.get("previousRelease") or ""),
+    str(bool(data.get("runtimeReused"))).lower(),
+    str(bool(data.get("bindingChanged"))).lower(),
+    str(bool(data.get("rollbackPerformed"))).lower(),
+]
+with Path(output_path).open("a", encoding="utf-8") as handle:
+    handle.write("\t".join(values) + "\n")
+PY
+  fi
+  unset UPDATE_USER UPDATE_TOKEN UPDATE_AOPS_URL UPDATE_INSTALLER_FILE UPDATE_TIMEOUT UPDATE_EXTRA_SET_FILE UPDATE_TEMPLATE_FILE UPDATE_BUNDLE_CACHE_DIR UPDATE_RUNTIME_LAYOUT UPDATE_SHARED_RUNTIME_ROOT UPDATE_HERMES_DATA_ROOT UPDATE_TASK_ID
 
   if [[ "$status" -eq 0 ]]; then
     if [[ -f "$sync_summary" ]]; then
@@ -677,10 +728,12 @@ run_user_worker() {
   SKIPPED_FILE="$worker_dir/skipped.tsv"
   FAILED_FILE="$worker_dir/failed.tsv"
   STORAGE_RESULTS_FILE="$worker_dir/storage.tsv"
+  RUNTIME_RESULTS_FILE="$worker_dir/runtime.tsv"
   : > "$UPDATED_FILE"
   : > "$SKIPPED_FILE"
   : > "$FAILED_FILE"
   : > "$STORAGE_RESULTS_FILE"
+  : > "$RUNTIME_RESULTS_FILE"
   SCANNED_USERS=0
   ELIGIBLE_USERS=0
   ELIGIBLE_PROFILES=0
@@ -713,6 +766,7 @@ merge_worker_results() {
   FAILED_FILE="$MASTER_FAILED_FILE"
   USER_RESULTS_FILE="$MASTER_USER_RESULTS_FILE"
   STORAGE_RESULTS_FILE="$MASTER_STORAGE_RESULTS_FILE"
+  RUNTIME_RESULTS_FILE="$MASTER_RUNTIME_RESULTS_FILE"
   SCANNED_USERS=0
   ELIGIBLE_USERS=0
   ELIGIBLE_PROFILES=0
@@ -721,6 +775,7 @@ merge_worker_results() {
   : > "$FAILED_FILE"
   : > "$USER_RESULTS_FILE"
   : > "$STORAGE_RESULTS_FILE"
+  : > "$RUNTIME_RESULTS_FILE"
   for worker in "$RUN_DIR"/workers/*; do
     [[ -d "$worker" ]] || continue
     if [[ -f "$worker/updated.tsv" ]]; then
@@ -734,6 +789,9 @@ merge_worker_results() {
     fi
     if [[ -f "$worker/storage.tsv" ]]; then
       cat "$worker/storage.tsv" >> "$STORAGE_RESULTS_FILE"
+    fi
+    if [[ -f "$worker/runtime.tsv" ]]; then
+      cat "$worker/runtime.tsv" >> "$RUNTIME_RESULTS_FILE"
     fi
     meta="$worker/meta.tsv"
     [[ -f "$meta" ]] || continue
@@ -749,15 +807,16 @@ write_summary() {
   local summary_path="$LOG_DIR/summary-$RUN_ID.json"
   local total_duration_ms
   total_duration_ms=$(($(now_ms) - RUN_START_MS))
-  python3 - "$summary_path" "$UPDATED_FILE" "$SKIPPED_FILE" "$FAILED_FILE" "$USER_RESULTS_FILE" "$STORAGE_RESULTS_FILE" "$SCANNED_USERS" "$ELIGIBLE_USERS" "$ELIGIBLE_PROFILES" "$DRY_RUN" "$RUN_STARTED_AT" "$total_duration_ms" "$JOBS" "$HERMES_DATA_ROOT" <<'PY'
+  python3 - "$summary_path" "$UPDATED_FILE" "$SKIPPED_FILE" "$FAILED_FILE" "$USER_RESULTS_FILE" "$STORAGE_RESULTS_FILE" "$RUNTIME_RESULTS_FILE" "$SCANNED_USERS" "$ELIGIBLE_USERS" "$ELIGIBLE_PROFILES" "$DRY_RUN" "$RUN_STARTED_AT" "$total_duration_ms" "$JOBS" "$HERMES_DATA_ROOT" "$RUNTIME_LAYOUT" "$SHARED_RUNTIME_ROOT" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 (
-    summary_path, updated_path, skipped_path, failed_path, users_path, storage_path,
+    summary_path, updated_path, skipped_path, failed_path, users_path, storage_path, runtime_path,
     scanned, eligible, eligible_profiles, dry_run, started_at, total_duration_ms, jobs, data_root,
+    runtime_layout, shared_runtime_root,
 ) = sys.argv[1:]
 
 def lines(path):
@@ -818,6 +877,20 @@ for line in lines(storage_path):
         "durationMs": int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 0,
     }
 
+runtime_by_user = {}
+for line in lines(runtime_path):
+    if not line:
+        continue
+    parts = line.split("\t")
+    runtime_by_user[parts[0]] = {
+        "runtimeLayout": parts[1] if len(parts) > 1 else runtime_layout,
+        "runtimeRelease": parts[2] if len(parts) > 2 and parts[2] else None,
+        "previousRelease": parts[3] if len(parts) > 3 and parts[3] else None,
+        "runtimeReused": len(parts) > 4 and parts[4] == "true",
+        "bindingChanged": len(parts) > 5 and parts[5] == "true",
+        "rollbackPerformed": len(parts) > 6 and parts[6] == "true",
+    }
+
 users = []
 for line in lines(users_path):
     if not line:
@@ -832,6 +905,8 @@ for line in lines(users_path):
     }
     if parts[0] in storage_by_user:
         user_result["storage"] = storage_by_user[parts[0]]
+    if parts[0] in runtime_by_user:
+        user_result["runtime"] = runtime_by_user[parts[0]]
     users.append(user_result)
 
 finished_at = datetime.now(timezone.utc).isoformat()
@@ -844,6 +919,8 @@ result = {
     "totalDurationMs": int(total_duration_ms),
     "jobs": int(jobs),
     "hermesDataRoot": data_root,
+    "runtimeLayout": runtime_layout,
+    "sharedRuntimeRoot": shared_runtime_root if runtime_layout == "shared" else None,
     "scannedUsers": int(scanned),
     "eligibleUsers": int(eligible),
     "eligibleProfiles": int(eligible_profiles),

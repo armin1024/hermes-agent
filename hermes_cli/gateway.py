@@ -2523,6 +2523,15 @@ def _detect_venv_dir() -> Path | None:
 
 
 def get_python_path() -> str:
+    managed_path = os.environ.get("HERMES_SERVICE_PYTHON_PATH", "").strip()
+    if managed_path:
+        path = Path(managed_path).expanduser()
+        if path.is_absolute() and path.exists() and os.access(path, os.X_OK):
+            return str(path)
+        logger.warning(
+            "Ignoring invalid HERMES_SERVICE_PYTHON_PATH=%s",
+            managed_path,
+        )
     venv = _detect_venv_dir()
     if venv is not None:
         if is_windows():
