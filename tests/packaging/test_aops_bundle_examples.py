@@ -151,10 +151,23 @@ def test_aops_bundle_includes_tec01_oneclick_script():
     assert "controlled_gateway_lifecycle" in script
     assert "skip SIGUSR1 restart" in script
     assert "--bundle-cache-dir DIR" in script
+    assert 'RUNTIME_LAYOUT="${HERMES_RUNTIME_LAYOUT:-shared}"' in script
     assert "--runtime-layout per-user|shared" in script
     assert "--shared-runtime-root DIR" in script
     assert "build_shared_release" in script
     assert "activate_shared_runtime" in script
+    assert "validate_shared_runtime_target_access" in script
+    assert "validate_shared_release_for_target" in script
+    assert "validate_shared_user_shim" in script
+    assert "normalize_shared_release_permissions" in script
+    assert 'find "$release" -type f -exec chmod a+r,a-w {} +' in script
+    assert "validate_target_hermes_path_access" in script
+    assert "use a host-level data root such as /data/hermes-users" in script
+    assert 'paths=("$TARGET_HOME/.hermes")' in script
+    assert 'if [[ "$RUNTIME_LAYOUT" == per-user ]]' in script
+    assert "Detached legacy shared-runtime shim from Hermes data root" in script
+    assert 'logical_paths=("$TARGET_HOME/.hermes")' in script
+    assert "every parent directory must grant traverse permission" in script
     assert "rollback_shared_runtime" in script
     assert "shared-runtime-summary.json" in script
     assert "binding.json" in script

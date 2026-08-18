@@ -18,7 +18,7 @@ TASK_ID="${TASK_ID:-}"
 WORK_DIR="${WORK_DIR:-}"
 BUNDLE_CACHE_DIR="${HERMES_BUNDLE_CACHE_DIR:-}"
 HERMES_DATA_ROOT="${HERMES_DATA_ROOT:-/data/hermes-users}"
-RUNTIME_LAYOUT="${HERMES_RUNTIME_LAYOUT:-per-user}"
+RUNTIME_LAYOUT="${HERMES_RUNTIME_LAYOUT:-shared}"
 SHARED_RUNTIME_ROOT="${HERMES_SHARED_RUNTIME_ROOT:-/data/hermes-tec01/runtime}"
 SYNC_OTHER_PROFILES_CLI=""
 TEMPLATE_FILE=""
@@ -103,7 +103,7 @@ Options:
                         Physical root for Hermes runtime/profile data
                         (default: /data/hermes-users).
   --runtime-layout per-user|shared
-                        Runtime layout. Shared mode requires root.
+                        Runtime layout (default: shared). Shared mode requires root.
   --shared-runtime-root DIR
                         Root-owned release/binding store used by shared mode
                         (default: /data/hermes-tec01/runtime).
@@ -395,16 +395,113 @@ shared_runtime_release_ready() {
   "$release/venv/bin/python" -c 'import hermes_cli, gateway.platforms.aops' >/dev/null 2>&1
 }
 
+normalize_shared_release_permissions() {
+  local release="$1"
+  [[ -d "$release" ]] || return 1
+  # Releases are root-owned and immutable, but every target user must be able
+  # to read Python/venv metadata and imported modules. Files created under the
+  # installer's umask 077 (notably venv/pyvenv.cfg) otherwise remain 0400 and
+  # pass the root-only readiness check while failing for real gateway users.
+  chown -R root:root "$release"
+  find "$release" -type d -exec chmod a+rx,a-w {} +
+  find "$release" -type f -exec chmod a+r,a-w {} +
+  find "$release" -type f -perm /111 -exec chmod a+rx,a-w {} +
+}
+
 prepare_shared_runtime_root() {
+  local cursor parent
+  local -a created_parents=()
   [[ "$(id -u)" -eq 0 ]] || fail "shared runtime layout requires root; run the installer with sudo"
   [[ "$SHARED_RUNTIME_ROOT" == /* ]] || fail "--shared-runtime-root must be an absolute path"
   [[ "$SHARED_RUNTIME_ROOT" != / ]] || fail "--shared-runtime-root cannot be /"
+
+  # The installer runs with umask 077. Track and normalize every directory we
+  # create here; otherwise an intermediate path such as /data/hermes-tec01 can
+  # become mode 0700, which lets root validate the release but prevents target
+  # users from traversing to the shared Python runtime.
+  cursor="$SHARED_RUNTIME_ROOT"
+  while [[ ! -e "$cursor" ]]; do
+    created_parents+=("$cursor")
+    parent="$(dirname "$cursor")"
+    [[ "$parent" != "$cursor" ]] || break
+    cursor="$parent"
+  done
+  [[ -d "$cursor" ]] || fail "Shared runtime ancestor is not a directory: $cursor"
+  mkdir -p "$SHARED_RUNTIME_ROOT"
+  for cursor in "${created_parents[@]}"; do
+    chown root:root "$cursor"
+    chmod 755 "$cursor"
+  done
+  # Repair the parent created by older versions for the standard Tec01 layout.
+  parent="$(dirname "$SHARED_RUNTIME_ROOT")"
+  if [[ "$(basename "$parent")" == "hermes-tec01" && "$(stat -c %u "$parent")" == 0 ]]; then
+    chmod 755 "$parent"
+  fi
   mkdir -p "$SHARED_RUNTIME_ROOT"/{releases,bindings,staging,locks,cache/bundles}
   chown root:root "$SHARED_RUNTIME_ROOT" "$SHARED_RUNTIME_ROOT"/{releases,bindings,staging,locks,cache,cache/bundles}
   chmod 755 "$SHARED_RUNTIME_ROOT" "$SHARED_RUNTIME_ROOT"/{releases,bindings,staging,locks,cache,cache/bundles}
   if [[ -z "$BUNDLE_CACHE_DIR" ]]; then
     BUNDLE_CACHE_DIR="$SHARED_RUNTIME_ROOT/cache/bundles"
   fi
+}
+
+validate_shared_runtime_target_access() {
+  [[ "$RUNTIME_LAYOUT" == shared ]] || return 0
+  if ! run_as_target "test -r $(shell_quote "$SHARED_RUNTIME_ROOT") && test -x $(shell_quote "$SHARED_RUNTIME_ROOT")"; then
+    warn "Target user $TARGET_USER cannot traverse the shared runtime path: $SHARED_RUNTIME_ROOT"
+    if command -v namei >/dev/null 2>&1; then
+      namei -l "$SHARED_RUNTIME_ROOT" >&2 || true
+    fi
+    fail "Shared runtime path is not accessible to target user $TARGET_USER; every parent directory must grant traverse permission"
+  fi
+}
+
+validate_shared_release_for_target() {
+  local release python
+  [[ "$RUNTIME_LAYOUT" == shared ]] || return 0
+  release="$(shared_runtime_release_path "$1")"
+  normalize_shared_release_permissions "$release" || fail "Could not normalize shared release permissions: $release"
+  python="$release/venv/bin/python"
+  if ! run_as_target "test -x $(shell_quote "$python") && $(shell_quote "$python") -c 'import hermes_cli, gateway.platforms.aops' >/dev/null"; then
+    warn "Shared release exists but is not executable by target user $TARGET_USER: $release"
+    if command -v namei >/dev/null 2>&1; then
+      namei -l "$python" >&2 || true
+    fi
+    fail "Shared Hermes release is not accessible to target user $TARGET_USER"
+  fi
+}
+
+validate_shared_user_shim() {
+  local python="$TARGET_HOME/hermes-agent/venv/bin/python"
+  [[ "$RUNTIME_LAYOUT" == shared ]] || return 0
+  if ! run_as_target "test -x $(shell_quote "$python") && $(shell_quote "$python") -c 'import hermes_cli, gateway.platforms.aops' >/dev/null"; then
+    warn "Shared runtime compatibility path is not executable by target user $TARGET_USER: $python"
+    if command -v namei >/dev/null 2>&1; then
+      namei -l "$python" >&2 || true
+    fi
+    fail "Shared runtime compatibility path activation failed for target user $TARGET_USER"
+  fi
+}
+
+validate_target_hermes_path_access() {
+  local path
+  local -a paths=("$TARGET_HOME/.hermes")
+  # In shared mode ~/hermes-agent is a compatibility shim created later by
+  # activate_shared_runtime(). Requiring it during storage preflight rejects a
+  # valid fresh install. Per-user mode creates/maps it during storage setup and
+  # can validate it here.
+  if [[ "$RUNTIME_LAYOUT" == per-user ]]; then
+    paths=("$TARGET_HOME/hermes-agent" "$TARGET_HOME/.hermes")
+  fi
+  for path in "${paths[@]}"; do
+    if ! run_as_target "test -d $(shell_quote "$path") && test -r $(shell_quote "$path") && test -x $(shell_quote "$path")"; then
+      warn "Hermes path is not accessible to target user $TARGET_USER: $path"
+      if command -v namei >/dev/null 2>&1; then
+        namei -l "$path" >&2 || true
+      fi
+      fail "Hermes data mapping is not accessible to target user $TARGET_USER; use a host-level data root such as /data/hermes-users instead of a private user home"
+    fi
+  done
 }
 
 build_shared_release() {
@@ -416,6 +513,7 @@ build_shared_release() {
   exec 7>"$lock_file"
   flock 7
   if shared_runtime_release_ready "$sha"; then
+    normalize_shared_release_permissions "$release" || fail "Could not normalize shared release permissions: $release"
     SHARED_RELEASE_REUSED=true
     log "Using existing shared Hermes release: $release"
     flock -u 7
@@ -454,10 +552,7 @@ Path(sys.argv[1]).write_text(json.dumps({
 }, indent=2) + "\n", encoding="utf-8")
 PY
   touch "$release/.complete"
-  chown -R root:root "$release"
-  chmod -R a-w "$release"
-  find "$release" -type d -exec chmod a+rx {} +
-  find "$release" -type f -perm /111 -exec chmod a+rx {} +
+  normalize_shared_release_permissions "$release"
   rm -rf "$extract_dir"
   SHARED_RELEASE_REUSED=false
   flock -u 7
@@ -552,6 +647,7 @@ activate_shared_runtime() {
   local sha="$1"
   local release binding current_link install_real tmp_link
   release="$(shared_runtime_release_path "$sha")"
+  validate_shared_release_for_target "$sha"
   binding="$(shared_runtime_binding_path)"
   current_link="$binding/current"
   SHARED_RUNNING_UNITS_FILE="$WORK_DIR/shared-runtime-running-units.txt"
@@ -593,6 +689,7 @@ PY
     mkdir -p "$install_real"
   fi
   write_shared_user_shim "$install_real" "$binding"
+  validate_shared_user_shim
   snapshot_shared_runtime_config
   SHARED_ROLLBACK_ARMED=true
 }
@@ -1055,10 +1152,10 @@ storage_remove_created_mount_guards() {
 
 ensure_hermes_data_layout() {
   local started source_fs="" target_base marker status="mapped" bytes=0
-  local logical name target mount_target required=0 migrate=0 root_device
+  local logical name target mount_target required=0 migrate=0 root_device runtime_target
   local migrated_csv="" units_file backup_runtime="" backup_home="" marker_existed=false
   local verify_profile_inventory=false
-  local -a migrate_sources=() migrate_targets=() new_logicals=() new_targets=() created_links=()
+  local -a logical_paths=() migrate_sources=() migrate_targets=() new_logicals=() new_targets=() created_links=()
   started="$(now_ms)"
   STORAGE_STARTED_MS="$started"
   STORAGE_MANAGED=false
@@ -1076,7 +1173,30 @@ ensure_hermes_data_layout() {
   target_uid="$(id -u "$TARGET_USER")"
   root_device="$(stat -Lc %d /)"
 
-  for logical in "$TARGET_HOME/hermes-agent" "$TARGET_HOME/.hermes"; do
+  if [[ "$RUNTIME_LAYOUT" == shared ]]; then
+    # Shared mode keeps a tiny compatibility shim at ~/hermes-agent. It is not
+    # mutable user data and must not be placed below HERMES_DATA_ROOT. Older
+    # installers mapped it there; detach that managed link before recreating
+    # the shim so access to the shared release does not depend on data-root
+    # parent-directory permissions.
+    if [[ -L "$TARGET_HOME/hermes-agent" ]]; then
+      runtime_target="$(readlink -f "$TARGET_HOME/hermes-agent" 2>/dev/null || true)"
+      if [[ "$runtime_target" == "$target_base/hermes-agent" ]]; then
+        rm -f "$TARGET_HOME/hermes-agent"
+        mkdir -p "$TARGET_HOME/hermes-agent"
+        chown "$TARGET_USER":"$TARGET_USER" "$TARGET_HOME/hermes-agent"
+        chmod 755 "$TARGET_HOME/hermes-agent"
+        log "Detached legacy shared-runtime shim from Hermes data root: $runtime_target"
+      else
+        fail "Unexpected Hermes runtime symlink in shared mode: $TARGET_HOME/hermes-agent -> $runtime_target"
+      fi
+    fi
+    logical_paths=("$TARGET_HOME/.hermes")
+  else
+    logical_paths=("$TARGET_HOME/hermes-agent" "$TARGET_HOME/.hermes")
+  fi
+
+  for logical in "${logical_paths[@]}"; do
     name="$(basename "$logical")"
     target="$target_base/$name"
     if [[ -L "$logical" ]]; then
@@ -1283,7 +1403,7 @@ ensure_hermes_data_layout() {
   STORAGE_MANAGED=true
 
   begin_stage "storage_verify"
-  for logical in "$TARGET_HOME/hermes-agent" "$TARGET_HOME/.hermes"; do
+  for logical in "${logical_paths[@]}"; do
     if [[ -L "$logical" ]]; then
       target="$target_base/$(basename "$logical")"
       [[ "$(readlink -f "$logical")" == "$target" && -d "$target" ]] || {
@@ -3992,8 +4112,10 @@ fi
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 [[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]] || fail "Could not resolve HOME for $TARGET_USER"
 INSTALL_DIR="$TARGET_HOME/hermes-agent"
+validate_shared_runtime_target_access
 begin_stage "storage_preflight"
 ensure_hermes_data_layout
+validate_target_hermes_path_access
 ensure_target_private_dir "$TARGET_HOME/.hermes"
 ensure_target_private_dir "$TARGET_HOME/.hermes/tec01-install"
 enable_linger_if_possible

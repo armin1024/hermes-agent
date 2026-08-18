@@ -30,10 +30,19 @@
 
 ## 单用户安装或灰度更新
 
+一键安装脚本和批量更新脚本均默认启用共享 Runtime。使用默认目录时，无需显式传入 `--runtime-layout shared` 或 `--shared-runtime-root`：
+
 ```bash
 sudo bash install-oneclick.sh \
-  --runtime-layout shared \
-  --shared-runtime-root /data/hermes-tec01/runtime \
+  --set targetUser=oma \
+  --set env.AOPS_BOT_TOKEN='<token>'
+```
+
+默认共享目录为 `/data/hermes-tec01/runtime`；目录不存在时脚本会自动创建。需要保留旧的用户独立 Runtime 时，显式指定：
+
+```bash
+sudo bash install-oneclick.sh \
+  --runtime-layout per-user \
   --set targetUser=oma \
   --set env.AOPS_BOT_TOKEN='<token>'
 ```
@@ -42,7 +51,7 @@ sudo bash install-oneclick.sh \
 
 ## 批量更新
 
-批量脚本默认启用共享模式：
+批量脚本同样默认启用共享模式：
 
 ```bash
 sudo bash tec01_multiuser_update.sh \
